@@ -1170,6 +1170,28 @@ public sealed class ScanCoordinator
         return written;
     }
 
+    /// <summary>
+    /// Which pass an incoming file belongs to: emoji sheets, then ordinary images, then animations.
+    /// </summary>
+    /// <remarks>
+    /// A ready-made GIF is judged against the animation the archive's own sheet produces, so that
+    /// sheet has to be archived before the GIF's turn comes. One alphabetical run gave the opposite
+    /// order every time - ".gif" sorts before ".png", so a sheet and its own GIF arriving together
+    /// always had the GIF examined first, with nothing in the archive to match it. It was filed as
+    /// unique, the sheet followed and was animated, and the archive ended up holding the same
+    /// animation twice. Sheets go first now, and every animation waits until they are all done.
+    /// Files within a pass keep their alphabetical order.
+    /// </remarks>
+    private static int ScanPass(string path)
+    {
+        if (AtlasAnimationWriter.IsAnimation(path))
+        {
+            return 2;
+        }
+
+        return EmojiAtlasName.TryParse(path, out _) ? 0 : 1;
+    }
+
     private static SourceSnapshot CreateSourceSnapshotSafe(string sourceRoot)
     {
         try
@@ -1177,7 +1199,8 @@ public sealed class ScanCoordinator
             var allPaths = PathBoundary.EnumerateFilesWithoutReparsePoints(sourceRoot);
             var paths = allPaths
                 .Where(path => ArchiveIndexer.SupportedExtensions.Contains(Path.GetExtension(path)))
-                .Order(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(ScanPass)
+                .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             return new SourceSnapshot(paths, allPaths.Count - paths.Length, null);
         }
@@ -1244,7 +1267,8 @@ public sealed class ScanCoordinator
             return new SourceSnapshot(
                 supported
                     .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Order(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(ScanPass)
+                    .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)
                     .ToArray(),
                 unsupported,
                 null);

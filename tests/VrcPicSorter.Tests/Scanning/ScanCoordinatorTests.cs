@@ -1056,6 +1056,51 @@ public sealed class ScanCoordinatorTests
     }
 
     [Fact]
+    public async Task SheetsAreScannedBeforeReadyMadeGifs()
+    {
+        using var directory = new TestDirectory();
+        var configuredSource = directory.GetPath("configured");
+        var manualSource = directory.GetPath("manual");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(configuredSource);
+        Directory.CreateDirectory(manualSource);
+        Directory.CreateDirectory(archiveRoot);
+
+        // Same emoji, both copies arriving together. Alphabetically the GIF comes first, which is
+        // the wrong way round: it is judged against the animation the sheet produces, so the sheet
+        // has to be archived before the GIF's turn comes.
+        const string sheetName = "player_x_4frames_10fps_linearloopStyle.png";
+        const string gifName = "player_x_4frames_10fps_linearloopStyle.gif";
+        const string stillName = "aaa-ordinary-still.png";
+        WriteSheet(Path.Combine(manualSource, sheetName));
+        using var still = ImageFixtureFactory.CreatePattern(seed: 61);
+        await still.SaveAsPngAsync(Path.Combine(manualSource, stillName));
+        using var frame = ImageFixtureFactory.CreatePattern(seed: 60, width: 64, height: 64);
+        await ImageFixtureFactory.SaveGifAsync(
+            directory,
+            Path.Combine("manual", gifName),
+            [frame, frame],
+            [100, 100]);
+        using var store = FileRouterTests.CreateStore(directory, configuredSource, archiveRoot);
+        var coordinator = CreateCoordinator(store);
+        var reading = new RecordingProgress<ScanProgress>();
+
+        await coordinator.ScanFolderAsync(manualSource, VrcImageCategory.Emoji, reading, null);
+
+        var order = reading.Values
+            .Select(value => value.FileName)
+            .Where(name => !string.IsNullOrEmpty(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var sheetAt = Array.FindIndex(order, name => string.Equals(name, sheetName, StringComparison.OrdinalIgnoreCase));
+        var stillAt = Array.FindIndex(order, name => string.Equals(name, stillName, StringComparison.OrdinalIgnoreCase));
+        var gifAt = Array.FindIndex(order, name => string.Equals(name, gifName, StringComparison.OrdinalIgnoreCase));
+        Assert.True(sheetAt >= 0 && stillAt >= 0 && gifAt >= 0, string.Join(", ", order));
+        Assert.True(sheetAt < stillAt, string.Join(", ", order));
+        Assert.True(stillAt < gifAt, string.Join(", ", order));
+    }
+
+    [Fact]
     public async Task AnAnimationWrittenDuringAScanIsIndexedByThatSameScan()
     {
         using var directory = new TestDirectory();
