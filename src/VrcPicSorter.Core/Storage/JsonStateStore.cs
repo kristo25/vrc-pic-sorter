@@ -366,6 +366,17 @@ public sealed class JsonStateStore : IDisposable
 
         var restoredBackup = recovered is not null;
         var quarantinedPath = QuarantineStateFile();
+
+        // Every record in the quarantined document points at a fingerprint in the sidecar. Writing
+        // defaults over the top replaces that sidecar with an empty one, so restoring the
+        // quarantined file by hand afterwards gave an index with no fingerprints at all and a full
+        // re-read of the archive. It is set aside with the document it belongs to instead. A
+        // restored backup keeps its sidecar: those records are the ones still in use.
+        if (!restoredBackup)
+        {
+            QuarantineFingerprintFile();
+        }
+
         recovered ??= _defaultStateFactory();
         recovered.History.Add(new ActivityEntry
         {
@@ -380,6 +391,39 @@ public sealed class JsonStateStore : IDisposable
         LastRecoveryNotice = new StateRecoveryNotice(quarantinedPath, restoredBackup);
         await WriteCoreAsync(recovered, requireCurrentRevision: false, cancellationToken).ConfigureAwait(false);
         return recovered;
+    }
+
+    /// <summary>
+    /// Moves the fingerprint sidecar aside so it survives a recovery that falls back to defaults.
+    /// Derived data, so a failure to move it costs a rebuild and never an image.
+    /// </summary>
+    private void QuarantineFingerprintFile()
+    {
+        try
+        {
+            if (!File.Exists(FingerprintPath))
+            {
+                return;
+            }
+
+            var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmssfff");
+            var candidate = Path.Combine(StateDirectory, $"fingerprints.corrupt-{timestamp}.json");
+            for (var suffix = 1; File.Exists(candidate); suffix++)
+            {
+                candidate = Path.Combine(StateDirectory, $"fingerprints.corrupt-{timestamp}-{suffix}.json");
+            }
+
+            File.Move(FingerprintPath, candidate);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        _persistedFingerprints = null;
+        _fingerprintStamp = null;
+        _deferredFingerprints = null;
+        _deferredFingerprintWrites = 0;
     }
 
     private string QuarantineStateFile()

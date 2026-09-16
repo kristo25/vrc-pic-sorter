@@ -27,6 +27,50 @@ public sealed class JsonStateStoreTests
         Assert.True(File.Exists(store.StatePath));
     }
 
+    /// <summary>
+    /// Every record in the quarantined document points at a fingerprint in the sidecar. Writing
+    /// defaults over the top replaced that sidecar with an empty one, so restoring the quarantined
+    /// file by hand afterwards gave an index with no fingerprints at all - the quarantine kept the
+    /// document and threw away the half that made it useful.
+    /// </summary>
+    [Fact]
+    public async Task RecoveringToDefaultsSetsTheFingerprintSidecarAsideRatherThanEmptyingIt()
+    {
+        using var directory = new TestDirectory();
+        using var store = CreateStore(directory);
+        var state = await store.LoadAsync();
+        var category = state.ArchiveIndex.Categories[0];
+        category.Status = IndexStatus.Current;
+        using var image = ImageFixtureFactory.CreatePattern(seed: 41);
+        var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
+        category.Images.Add(new IndexedImageRecord
+        {
+            Id = Guid.NewGuid(),
+            Category = category.Category,
+            Path = @"D:\Archive\first.png",
+            Width = fingerprint.Width,
+            Height = fingerprint.Height,
+            ExactFingerprint = fingerprint.ExactIdentity,
+            PerceptualFingerprint = fingerprint.PerceptualFrames[0].DifferenceHash,
+            Fingerprint = fingerprint,
+        });
+        await store.SaveAsync(state);
+        var sidecar = await File.ReadAllTextAsync(store.FingerprintPath);
+
+        // Both documents unreadable, so there is no backup to fall back to and defaults are all
+        // that is left.
+        await File.WriteAllTextAsync(store.StatePath, "{not-json");
+        await File.WriteAllTextAsync(store.BackupPath, "{not-json either");
+        _ = await store.LoadAsync();
+
+        Assert.NotNull(store.LastRecoveryNotice);
+        Assert.False(store.LastRecoveryNotice.RestoredBackup);
+        var setAside = Directory
+            .GetFiles(Path.GetDirectoryName(store.FingerprintPath)!, "fingerprints.corrupt-*.json")
+            .Single();
+        Assert.Equal(sidecar, await File.ReadAllTextAsync(setAside));
+    }
+
     [Fact]
     public async Task CorruptPrimaryStateRecoversFromLastValidBackup()
     {

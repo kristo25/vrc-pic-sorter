@@ -207,6 +207,8 @@ public sealed class FileRouter
             category,
             incomingFingerprint.ExactIdentity,
             JournalOperationPurpose.AutoKeepArchived);
+        entry.SurvivingPath = archivePath;
+        entry.SurvivingFingerprint = archiveFingerprint;
         await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
     }
 
@@ -241,6 +243,8 @@ public sealed class FileRouter
             category,
             incomingFingerprint.ExactIdentity,
             JournalOperationPurpose.AutoKeepHeld);
+        entry.SurvivingPath = heldPath;
+        entry.SurvivingFingerprint = heldFingerprint;
         await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
     }
 
@@ -303,15 +307,25 @@ public sealed class FileRouter
         // The move deliberately does not resolve the review: this decision has two halves, and
         // if the second one fails the queue entry has to survive so it can be retried. Resolving
         // inside the move left the archived duplicate in place with nothing left to act on.
-        await MoveUniqueAsync(
-                current.HeldFilePath,
-                current.Category,
-                current.IncomingImageFingerprint,
-                current.RoutingContext,
-                reviewItemId: null,
-                duplicateOverride: true,
-                cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
+        //
+        // Which means the first half may already be done. A failure in the second does not undo
+        // it, and the index holding a record at the very path the review now points to is what
+        // says so - moving again from there would put a second copy in the archive.
+        var index = state.ArchiveIndex.Categories.Single(item => item.Category == current.Category);
+        var alreadyArchived = index.Images.Any(
+            item => string.Equals(item.Path, current.HeldFilePath, StringComparison.OrdinalIgnoreCase));
+        if (!alreadyArchived)
+        {
+            await MoveUniqueAsync(
+                    current.HeldFilePath,
+                    current.Category,
+                    current.IncomingImageFingerprint,
+                    current.RoutingContext,
+                    reviewItemId: current.Id,
+                    duplicateOverride: true,
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+        }
         var finalPreservedPath = await RemoveArchiveCandidateAsync(current, currentCandidate, cancellationToken)
             .ConfigureAwait(false);
         await ResolveKeepIncomingAsync(current.Id, cancellationToken).ConfigureAwait(false);
@@ -598,6 +612,7 @@ public sealed class FileRouter
                 switch (decision.Action)
                 {
                     case JournalReconciliationAction.RetrySideEffect:
+                        await VerifySurvivingCopyAsync(entry, cancellationToken).ConfigureAwait(false);
                         if (entry.Phase is JournalPhase.IntentRecorded or JournalPhase.NeedsAttention)
                         {
                             await _journal.AdvanceAsync(entry.Id, JournalPhase.SideEffectStarted, cancellationToken: cancellationToken)
@@ -659,6 +674,14 @@ public sealed class FileRouter
                     var index = state.ArchiveIndex.Categories.Single(item => item.Category == entry.Category);
                     index.Status = IndexStatus.Stale;
                     index.LastError = "A recovery operation was dismissed; rebuild required.";
+
+                    // A hold whose file already reached the Holding folder carries its review item
+                    // here on the journal entry and nowhere else. Completing the entry without it
+                    // left the file on disk with nothing naming it: no review, no row in the queue,
+                    // and Clear local data refusing forever over a file it could not point at. It
+                    // goes into the queue for reconciliation instead.
+                    var rescued = RescueHeldReview(state, entry);
+
                     entry.Phase = JournalPhase.Completed;
                     entry.UpdatedUtc = _timeProvider.GetUtcNow();
                     state.History.Add(new ActivityEntry
@@ -668,7 +691,10 @@ public sealed class FileRouter
                         Kind = ActivityKind.Warning,
                         Level = ActivityLevel.Warning,
                         Category = entry.Category,
-                        Message = "Dismissed an ambiguous recovery operation without changing either file.",
+                        Message = rescued
+                            ? "Dismissed an ambiguous recovery operation without changing either file. "
+                                + "The image it had already moved is back in the review queue."
+                            : "Dismissed an ambiguous recovery operation without changing either file.",
                         SourcePath = entry.SourcePath,
                         DestinationPath = entry.DestinationPath,
                         OperationId = entry.Id,
@@ -726,6 +752,31 @@ public sealed class FileRouter
         PathBoundary.EnsureNoReparsePoints(entry.DestinationPath!, "Image destination");
         Directory.CreateDirectory(Path.GetDirectoryName(entry.DestinationPath!)!);
         File.Move(entry.SourcePath, entry.DestinationPath!, overwrite: false);
+    }
+
+    /// <summary>
+    /// Re-checks the copy an automatic duplicate resolution decided in favour of, before its
+    /// recycle is retried.
+    /// </summary>
+    /// <remarks>
+    /// The check that made the recycle safe ran before the crash. In between, the copy it was
+    /// about can have been moved, renamed or deleted by hand - and retrying blind would then take
+    /// the last one there is. An operation whose survivor is gone lands in Needs attention instead.
+    /// </remarks>
+    private async Task VerifySurvivingCopyAsync(JournalEntry entry, CancellationToken cancellationToken)
+    {
+        if (entry.SurvivingPath is not { } path || entry.SurvivingFingerprint is not { } fingerprint)
+        {
+            return;
+        }
+
+        await VerifyImageFingerprintAsync(
+                path,
+                fingerprint,
+                "The copy this one would have been discarded in favour of is no longer there, "
+                    + "so nothing was discarded.",
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private Task VerifyExpectedSourceAsync(JournalEntry entry, CancellationToken cancellationToken) =>
@@ -796,7 +847,20 @@ public sealed class FileRouter
                     index.Generation++;
                 }
 
-                ResolveReview(state, entry.ReviewItemId);
+                // Keep incoming has two halves and the override is the first of them. Resolving
+                // here would strand the archived duplicate with nothing left to act on, so the
+                // review stays open - but it has to follow the file it is about. Left pointing at
+                // the path the image has moved out of, the review could not be retried, resolved
+                // or restored; every one of those verifies the held file first, and it is gone.
+                if (entry.Purpose == JournalOperationPurpose.MoveDuplicateOverride)
+                {
+                    RepointReview(state, entry.ReviewItemId, entry.DestinationPath);
+                }
+                else
+                {
+                    ResolveReview(state, entry.ReviewItemId);
+                }
+
                 break;
             case JournalOperationPurpose.FileAnimatedSheet:
                 var filed = index.Images.SingleOrDefault(item => item.Id == entry.IndexedImageId);
@@ -824,6 +888,44 @@ public sealed class FileRouter
                 review?.Candidates.RemoveAll(item => item.IndexedImageId == entry.IndexedImageId);
                 index.Generation++;
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Puts back the review item of a dismissed hold whose file is already in the Holding folder.
+    /// </summary>
+    /// <returns>True when a review was put back, so the history entry can say so.</returns>
+    private static bool RescueHeldReview(AppStateDocument state, JournalEntry entry)
+    {
+        if (entry.Purpose != JournalOperationPurpose.HoldForReview
+            || entry.ReviewItemAfterCommit is not { } held
+            || string.IsNullOrWhiteSpace(entry.DestinationPath)
+            || !File.Exists(entry.DestinationPath)
+            || state.ReviewQueue.Any(item => item.Id == held.Id))
+        {
+            return false;
+        }
+
+        // Reconciliation rather than pending: the file moved, the commit never happened, and what
+        // the review says about it has not been checked against the disk since.
+        held.Status = ReviewStatus.NeedsReconciliation;
+        held.HeldFilePath = entry.DestinationPath;
+        state.ReviewQueue.Add(held);
+        return true;
+    }
+
+    /// <summary>Points a review that stays open at where its incoming image has moved to.</summary>
+    private static void RepointReview(AppStateDocument state, Guid? reviewItemId, string? destinationPath)
+    {
+        if (reviewItemId is null || string.IsNullOrWhiteSpace(destinationPath))
+        {
+            return;
+        }
+
+        var review = state.ReviewQueue.SingleOrDefault(item => item.Id == reviewItemId);
+        if (review is not null)
+        {
+            review.HeldFilePath = destinationPath;
         }
     }
 

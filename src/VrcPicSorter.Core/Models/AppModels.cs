@@ -368,6 +368,16 @@ public sealed class JournalEntry
 
     public Guid? IndexedImageId { get; set; }
 
+    /// <summary>
+    /// The copy an automatic duplicate resolution decided to keep, when that decision is the only
+    /// reason this operation is safe. Recorded so recovery can re-check it before retrying, rather
+    /// than discarding a file on a precondition that held before the crash and may not hold now.
+    /// </summary>
+    public string? SurvivingPath { get; set; }
+
+    /// <summary>What <see cref="SurvivingPath"/> must still be for the retry to go ahead.</summary>
+    public string? SurvivingFingerprint { get; set; }
+
     public ReviewItem? ReviewItemAfterCommit { get; set; }
 
     public IndexedImageRecord? IndexedImageAfterCommit { get; set; }
