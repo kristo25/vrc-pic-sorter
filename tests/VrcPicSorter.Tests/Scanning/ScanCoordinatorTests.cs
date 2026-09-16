@@ -1481,6 +1481,98 @@ public sealed class ScanCoordinatorTests
     /// A 2x2 sheet of four frames, each a solid square inset in its cell so the sheet carries the
     /// alpha a real emoji sheet does.
     /// </summary>
+    /// <summary>
+    /// An animation exported from the Animations tab has to go through the rest of what a scan
+    /// does, or it is invisible to deduplication until the next full index.
+    /// </summary>
+    /// <remarks>
+    /// This is how the archive came to hold the same emoji twice: Export GIF wrote the file and
+    /// stopped there, so nothing knew it existed, the sheet stayed among the stills, and a copy
+    /// arriving later had nothing to be compared against.
+    /// </remarks>
+    [Fact]
+    public async Task AHandMadeExportIsIndexedAndItsSheetIsFiled()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        const string sheetName = "player_x_4frames_10fps_linearloopStyle.png";
+        var archivedSheet = Path.Combine(archiveRoot, sheetName);
+        WriteSheet(archivedSheet);
+        using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+        var decoder = new ImageDecoder();
+        var indexer = new ArchiveIndexer(store, decoder);
+        Assert.Equal(IndexStatus.Current, (await indexer.RefreshAsync(VrcImageCategory.Emoji)).Status);
+        var coordinator = CreateCoordinator(store);
+        var catalog = new AtlasAnimationCatalog(store);
+        var sheet = Assert.Single(await catalog.ListAsync());
+
+        var exported = await catalog.ExportAsync(sheet, sheet.Name);
+        Assert.True(exported.Exported);
+        var animationPath = exported.Path!;
+
+        var followUp = await coordinator.FinishExportedAnimationsAsync(
+            [new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, animationPath)]);
+
+        Assert.Empty(followUp.Warnings);
+        Assert.Empty(followUp.Duplicates);
+
+        // The archive now knows about the file the button wrote.
+        var index = (await store.LoadAsync()).ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji);
+        Assert.Contains(index.Images, item => string.Equals(item.Path, animationPath, StringComparison.OrdinalIgnoreCase));
+
+        // And the sheet was filed beside it, exactly as a scan files one.
+        var filed = Assert.Single(followUp.Filed);
+        Assert.Contains(AtlasAnimationWriter.ReferenceFolderName, filed, StringComparison.Ordinal);
+        Assert.True(File.Exists(filed));
+        Assert.False(File.Exists(archivedSheet));
+        Assert.Contains(index.Images, item => string.Equals(item.Path, filed, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// And when the export turns out to be a picture the archive already held, it is reported
+    /// rather than acted on - both copies are archived, so which to keep is a decision.
+    /// </summary>
+    [Fact]
+    public async Task AHandMadeExportThatDuplicatesAnArchivedCopyIsReportedNotRemoved()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        const string sheetName = "player_y_4frames_10fps_linearloopStyle.png";
+        var archivedSheet = Path.Combine(archiveRoot, sheetName);
+        WriteSheet(archivedSheet);
+        using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+        var decoder = new ImageDecoder();
+        var indexer = new ArchiveIndexer(store, decoder);
+        await indexer.RefreshAsync(VrcImageCategory.Emoji);
+        var coordinator = CreateCoordinator(store);
+        var catalog = new AtlasAnimationCatalog(store);
+        var sheet = Assert.Single(await catalog.ListAsync());
+
+        var exported = await catalog.ExportAsync(sheet, sheet.Name);
+        var animationPath = exported.Path!;
+
+        // The same animation already sitting in the archive under another name, which is exactly
+        // what a ready-made GIF from VRChat looks like.
+        var twin = Path.Combine(archiveRoot, "player_y (2).gif");
+        File.Copy(animationPath, twin);
+
+        var followUp = await coordinator.FinishExportedAnimationsAsync(
+            [new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, animationPath)]);
+
+        var duplicate = Assert.Single(followUp.Duplicates);
+        Assert.Equal(animationPath, duplicate.AnimationPath);
+        Assert.Equal(twin, Assert.Single(duplicate.ExistingCopies));
+
+        // Reported, and both files still there.
+        Assert.True(File.Exists(animationPath));
+        Assert.True(File.Exists(twin));
+    }
+
     private static void WriteSheet(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);

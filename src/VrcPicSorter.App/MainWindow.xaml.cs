@@ -2294,9 +2294,21 @@ public partial class MainWindow : Window
 
         ExportSheetButton.IsEnabled = false;
         AtlasAnimationResult result;
+        ExportedAnimationFollowUp? followUp = null;
         try
         {
             result = await AnimationCatalog.ExportAsync(sheet, name);
+
+            // Writing the GIF was only ever the first half. A scan goes on to tell the index about
+            // the new file, file the sheet beside it, and notice when the archive already held that
+            // picture; this button did none of it, so anything exported here stayed invisible to
+            // deduplication until the next full index - which is how the same emoji ended up in the
+            // archive twice.
+            if (result.Exported && result.Path is { } exportedPath)
+            {
+                followUp = await FinishExportAsync(
+                    [new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, exportedPath)]);
+            }
         }
         finally
         {
@@ -2304,6 +2316,7 @@ public partial class MainWindow : Window
         }
 
         await RefreshAnimationsAsync();
+        await RefreshArchiveDuplicatesAsync();
 
         // The answer is written after the refresh, not before it. A successful export takes the
         // sheet off the list of ones still needing a decision, so the refresh clears the selection
@@ -2314,6 +2327,7 @@ public partial class MainWindow : Window
                 ? $"Exported to {result.Path}"
                 : $"Exported to {result.Path} - {result.Note}"
             : $"Not exported: {result.Warning ?? "this file is not a sheet."}";
+        SheetStatusText.Text += DescribeFollowUp(followUp);
 
         if (result.Exported && SheetList.SelectedItem is null)
         {
@@ -2400,22 +2414,31 @@ public partial class MainWindow : Window
         ExportMissingButton.IsEnabled = false;
         var exported = 0;
         var failed = 0;
+        ExportedAnimationFollowUp? followUp = null;
         try
         {
             var sheets = await AnimationCatalog.ListAsync();
+
+            // Collected as they are written and handed over in one go at the end. The follow-up
+            // reads the whole archive once per category, and doing that per file would turn a
+            // fifty-sheet batch into fifty full reads of the archive.
+            var written = new List<ExportedAnimation>();
             foreach (var sheet in sheets.Where(item => item.NeedsDecision))
             {
                 ExportMissingButton.Content = $"Exporting {exported + failed + 1}...";
                 var result = await AnimationCatalog.ExportAsync(sheet, sheet.Name);
-                if (result.Exported)
+                if (result.Exported && result.Path is { } exportedPath)
                 {
                     exported++;
+                    written.Add(new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, exportedPath));
                 }
                 else
                 {
                     failed++;
                 }
             }
+
+            followUp = await FinishExportAsync(written);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
@@ -2427,10 +2450,81 @@ public partial class MainWindow : Window
         }
 
         await RefreshAnimationsAsync();
+        await RefreshArchiveDuplicatesAsync();
 
         // Written after the refresh for the same reason as the single export above.
         SheetStatusText.Text = failed == 0
             ? $"Exported {exported} animations."
             : $"Exported {exported} animations, {failed} could not be exported.";
+        SheetStatusText.Text += DescribeFollowUp(followUp);
+    }
+
+    /// <summary>
+    /// Puts freshly exported animations through the rest of what a scan does to one.
+    /// </summary>
+    /// <remarks>
+    /// Never throws. The animations are already on disk and correct by the time this runs, so a
+    /// failure here is something to say out loud, not a reason to report the export as failed.
+    /// </remarks>
+    private async Task<ExportedAnimationFollowUp> FinishExportAsync(IReadOnlyCollection<ExportedAnimation> written)
+    {
+        try
+        {
+            return await _runtime.Scanner.FinishExportedAnimationsAsync(written, CurrentCancellation);
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or UnauthorizedAccessException
+                or InvalidOperationException
+                or NotSupportedException
+                or InvalidDataException)
+        {
+            return new ExportedAnimationFollowUp(
+                [],
+                [],
+                [$"The archive could not be brought up to date: {exception.Message}. Run a scan."]);
+        }
+    }
+
+    /// <summary>
+    /// What the archive made of an export: where the sheet went, and whether the picture was
+    /// already in there.
+    /// </summary>
+    private static string DescribeFollowUp(ExportedAnimationFollowUp? followUp)
+    {
+        if (followUp is null)
+        {
+            return string.Empty;
+        }
+
+        var sentences = new List<string>();
+        if (followUp.Filed.Count == 1)
+        {
+            sentences.Add($"The sheet was filed beside it, at {followUp.Filed[0]}.");
+        }
+        else if (followUp.Filed.Count > 1)
+        {
+            sentences.Add($"{followUp.Filed.Count} sheets were filed beside their animations.");
+        }
+
+        // Said, not acted on. Both copies are already in the archive, so which one to keep is a
+        // decision - and the place to make it is the archive duplicates list in Settings, where
+        // the copy being kept is checked on disk before anything is removed.
+        if (followUp.Duplicates.Count == 1)
+        {
+            var copies = string.Join(", ", followUp.Duplicates[0].ExistingCopies);
+            sentences.Add(
+                $"The archive already held this picture at {copies}. Nothing was removed - "
+                    + "Settings lists archive duplicates when you want to decide.");
+        }
+        else if (followUp.Duplicates.Count > 1)
+        {
+            sentences.Add(
+                $"{followUp.Duplicates.Count} of them are pictures the archive already held. "
+                    + "Nothing was removed - Settings lists archive duplicates when you want to decide.");
+        }
+
+        sentences.AddRange(followUp.Warnings);
+        return sentences.Count == 0 ? string.Empty : " " + string.Join(" ", sentences);
     }
 }

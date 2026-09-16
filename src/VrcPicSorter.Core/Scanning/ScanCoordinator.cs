@@ -31,6 +31,35 @@ public sealed record ScanProcessingProgress(
     string Activity = "",
     string? FileName = null);
 
+/// <summary>An animation a person exported by hand, waiting for the rest of what a scan does.</summary>
+/// <param name="SheetIndexedImageId">The index record of the sheet it was made from.</param>
+/// <param name="Category">The archive the sheet belongs to.</param>
+/// <param name="AtlasPath">Where that sheet is now.</param>
+/// <param name="AnimationPath">The file the export just wrote.</param>
+public sealed record ExportedAnimation(
+    Guid SheetIndexedImageId,
+    VrcImageCategory Category,
+    string AtlasPath,
+    string AnimationPath);
+
+/// <summary>What became of the animations, once the archive had been told about them.</summary>
+/// <param name="Filed">Sheets that were filed beside their animation, by the path they moved to.</param>
+/// <param name="Duplicates">
+/// Each export that turned out to be a picture the archive already held, and the copies it joins.
+/// Reported, never acted on: two files both already archived is a decision, not a scan result.
+/// </param>
+/// <param name="Warnings">Anything that could not be finished, in the words of the failure.</param>
+public sealed record ExportedAnimationFollowUp(
+    IReadOnlyList<string> Filed,
+    IReadOnlyList<ArchivedAnimationDuplicate> Duplicates,
+    IReadOnlyList<string> Warnings);
+
+/// <param name="AnimationPath">The animation just exported.</param>
+/// <param name="ExistingCopies">Archived files that decode to the very same picture.</param>
+public sealed record ArchivedAnimationDuplicate(
+    string AnimationPath,
+    IReadOnlyList<string> ExistingCopies);
+
 public sealed class ScanCoordinator
 {
     /// <summary>
@@ -812,15 +841,18 @@ public sealed class ScanCoordinator
                         // animation rather than left among the images a person browses. Only a
                         // sheet that actually produced a GIF moves: one still waiting on review is
                         // unfinished work and stays where it can be seen.
-                        await FileAnimatedSheetAsync(
-                                route,
-                                archivedPath,
-                                category,
-                                fingerprint,
-                                mapping.ArchivePath,
-                                errors,
-                                cancellationToken)
-                            .ConfigureAwait(false);
+                        if (route.IndexedImageId is { } indexedSheetId)
+                        {
+                            _ = await FileAnimatedSheetAsync(
+                                    indexedSheetId,
+                                    archivedPath,
+                                    category,
+                                    fingerprint,
+                                    mapping.ArchivePath,
+                                    errors,
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                        }
                     }
                     else if (animation.Warning is { } warning)
                     {
@@ -1055,8 +1087,134 @@ public sealed class ScanCoordinator
     /// written, and the only cost of the sheet staying where it is is that it sits among the
     /// stills. Turning that into a failed scan would be out of proportion to it.
     /// </remarks>
-    private async Task FileAnimatedSheetAsync(
-        FileRouteResult route,
+    /// <summary>
+    /// Puts animations exported by hand through the rest of what a scan does to one.
+    /// </summary>
+    /// <remarks>
+    /// Writing the GIF was only the first step. A scan then tells the index about the new file,
+    /// files the sheet beside it, and knows whether the archive already held that picture; the
+    /// Animations tab did none of it, so an export was invisible to deduplication until the next
+    /// full index - which is how the archive came to hold the same emoji twice. The same steps run
+    /// here, from the same code, so the two paths cannot drift apart again.
+    /// <para>
+    /// Nothing is deleted. A duplicate found here is reported and left alone: both copies are
+    /// already archived, and which one to keep is a decision, not a side effect of a button that
+    /// was pressed to make an animation.
+    /// </para>
+    /// </remarks>
+    public async Task<ExportedAnimationFollowUp> FinishExportedAnimationsAsync(
+        IReadOnlyCollection<ExportedAnimation> exported,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(exported);
+
+        var filed = new List<string>();
+        var duplicates = new List<ArchivedAnimationDuplicate>();
+        var warnings = new List<string>();
+        if (exported.Count == 0)
+        {
+            return new ExportedAnimationFollowUp(filed, duplicates, warnings);
+        }
+
+        // Once per category rather than once per file. A bulk export of fifty sheets would
+        // otherwise read the whole archive fifty times over.
+        foreach (var category in exported.Select(item => item.Category).Distinct())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var refreshed = await _indexer.RefreshAsync(category, cancellationToken).ConfigureAwait(false);
+            if (refreshed.Status != IndexStatus.Current)
+            {
+                warnings.Add(
+                    $"{category}: the new animation could not be added to the archive index "
+                        + $"({string.Join("; ", refreshed.Errors)}). Run a scan to pick it up.");
+            }
+        }
+
+        var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var animation in exported)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var index = state.ArchiveIndex.Categories.SingleOrDefault(item => item.Category == animation.Category);
+            if (index is null || index.Status != IndexStatus.Current)
+            {
+                continue;
+            }
+
+            var copies = FindArchivedCopies(index, animation.AnimationPath);
+            if (copies.Count > 0)
+            {
+                duplicates.Add(new ArchivedAnimationDuplicate(animation.AnimationPath, copies));
+            }
+
+            var mapping = state.Settings.CategoryMappings
+                .SingleOrDefault(item => item.Category == animation.Category);
+            var sheet = FindRecord(index, animation.SheetIndexedImageId, animation.AtlasPath);
+            if (mapping is null || sheet?.Fingerprint is not { } sheetFingerprint)
+            {
+                // Without the sheet's own fingerprint the move cannot verify what it is moving, and
+                // a move that cannot check itself is not one this app makes.
+                warnings.Add(
+                    $"{animation.AtlasPath}: animated, but the sheet could not be filed beside it "
+                        + "because the archive index does not describe it. Run a scan.");
+                continue;
+            }
+
+            var reference = await FileAnimatedSheetAsync(
+                    sheet.Id,
+                    sheet.Path,
+                    animation.Category,
+                    sheetFingerprint,
+                    mapping.ArchivePath,
+                    warnings,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (reference is not null)
+            {
+                filed.Add(reference);
+            }
+
+            state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        return new ExportedAnimationFollowUp(filed, duplicates, warnings);
+    }
+
+    /// <summary>Archived files that decode to the very same picture as <paramref name="path"/>.</summary>
+    /// <remarks>
+    /// Exact identity only. Two sizes of one emoji are a judgement and belong in the archive
+    /// duplicates list, where a person can look at both; this is for the case where the export
+    /// turned out to be a file the archive already had, byte for decoded byte.
+    /// </remarks>
+    private static IReadOnlyList<string> FindArchivedCopies(CategoryIndexState index, string path)
+    {
+        var exported = index.Images.FirstOrDefault(
+            item => string.Equals(item.Path, path, StringComparison.OrdinalIgnoreCase));
+        if (exported is null || string.IsNullOrWhiteSpace(exported.ExactFingerprint))
+        {
+            return [];
+        }
+
+        return
+        [
+            .. index.Images
+                .Where(item => item.Id != exported.Id
+                    && string.Equals(item.ExactFingerprint, exported.ExactFingerprint, StringComparison.Ordinal))
+                .Select(item => item.Path)
+                .Order(StringComparer.OrdinalIgnoreCase),
+        ];
+    }
+
+    /// <summary>
+    /// The sheet's index record, by id where the refresh kept it and by path where it did not.
+    /// </summary>
+    private static IndexedImageRecord? FindRecord(CategoryIndexState index, Guid id, string path) =>
+        index.Images.FirstOrDefault(item => item.Id == id)
+        ?? index.Images.FirstOrDefault(
+            item => string.Equals(item.Path, path, StringComparison.OrdinalIgnoreCase));
+
+    /// <returns>Where the sheet was filed, or null when it stayed where it was.</returns>
+    private async Task<string?> FileAnimatedSheetAsync(
+        Guid indexedImageId,
         string archivedPath,
         VrcImageCategory category,
         ImageFingerprint fingerprint,
@@ -1064,11 +1222,6 @@ public sealed class ScanCoordinator
         List<string> errors,
         CancellationToken cancellationToken)
     {
-        if (route.IndexedImageId is not { } indexedImageId)
-        {
-            return;
-        }
-
         try
         {
             var reference = AtlasAnimationWriter.BuildReferenceDestination(archivedPath, archiveRoot);
@@ -1083,7 +1236,7 @@ public sealed class ScanCoordinator
                 errors.Add(
                     $"{archivedPath}: animated, but a different sheet of the same name is already "
                     + "filed with its animation, so this one was left in place.");
-                return;
+                return null;
             }
 
             await _router
@@ -1095,6 +1248,7 @@ public sealed class ScanCoordinator
                     fingerprint,
                     cancellationToken)
                 .ConfigureAwait(false);
+            return reference;
         }
         catch (Exception exception) when (
             exception is IOException
@@ -1104,6 +1258,7 @@ public sealed class ScanCoordinator
                 or ArgumentException)
         {
             errors.Add($"{archivedPath}: animated, but could not be filed with its animation ({exception.Message}).");
+            return null;
         }
     }
 
