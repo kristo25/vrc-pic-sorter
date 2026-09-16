@@ -1482,6 +1482,124 @@ public sealed class ScanCoordinatorTests
     /// alpha a real emoji sheet does.
     /// </summary>
     /// <summary>
+    /// A sheet the backfill animates is filed beside its animation, rather than left sitting among
+    /// the single emoji.
+    /// </summary>
+    /// <remarks>
+    /// The archive this was reported against had four sprite sheets in the Emoji folder, each with
+    /// its animation already made. They had all been animated by the backfill, which wrote the GIF
+    /// and deliberately left the sheet where it was - so while browsing, a grid of sixty-four
+    /// thumbnails sat among the emoji looking like one of them.
+    /// </remarks>
+    [Fact]
+    public async Task ASheetTheBackfillAnimatesIsFiledWithIt()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        const string sheetName = "player_x_4frames_10fps_linearloopStyle.png";
+        var archivedSheet = Path.Combine(archiveRoot, sheetName);
+        WriteSheet(archivedSheet);
+        using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+        var coordinator = CreateCoordinator(store);
+
+        var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+
+        Assert.Equal(1, result.Animated);
+        Assert.Empty(result.Errors);
+
+        // The animation exists, and the sheet has gone to sit beside it.
+        Assert.True(File.Exists(Path.Combine(
+            archiveRoot, "Animated", "player_x_4frames_10fps_linearloopStyle.gif")));
+        var filed = Path.Combine(
+            archiveRoot, "Animated", "Gif Ref", "player_x_4frames_10fps_linearloopStyle.png");
+        Assert.True(File.Exists(filed));
+        Assert.False(File.Exists(archivedSheet));
+
+        // And nothing is left in the Emoji folder that a person would mistake for an emoji.
+        Assert.Empty(Directory.GetFiles(archiveRoot));
+
+        var index = (await store.LoadAsync()).ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji);
+        Assert.Contains(index.Images, item => string.Equals(item.Path, filed, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// A ready-made GIF for an emoji the archive has already animated never becomes a second copy.
+    /// </summary>
+    /// <remarks>
+    /// VRChat hands its own GIF over for some emoji, and it is a different encoding of the very
+    /// same animation - different bytes, and a perceptual score that can fall short of any
+    /// threshold. It was filed as a brand new image, which is where a folder of "x" beside
+    /// "x (2)" came from. It earns a review card now, because the emoji id and the frame count,
+    /// rate and loop direction in the name are VRChat's own account of what both files are.
+    /// </remarks>
+    [Fact]
+    public async Task AReadyMadeGifOfAnAlreadyAnimatedEmojiIsNotArchivedAgain()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        const string sheetName =
+            "trav_inv_f0fdf2cf-2371-42f2-90ae-8432ecda1d39_stopanimationStyle_4frames_10fps_linearloopStyle.png";
+        WriteSheet(Path.Combine(archiveRoot, sheetName));
+        using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+        var coordinator = CreateCoordinator(store);
+        await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+
+        var archived = Path.Combine(
+            archiveRoot,
+            "Animated",
+            "trav_inv_f0fdf2cf-2371-42f2-90ae-8432ecda1d39_stopanimationStyle_4frames_10fps_linearloopStyle.gif");
+        Assert.True(File.Exists(archived));
+
+        // VRChat's own GIF of the same emoji. Deliberately nothing like the app's export to look
+        // at: if the two merely resembled each other the perceptual ranking would already have
+        // caught it, and this test would prove nothing. All these two have in common is what
+        // VRChat wrote into both names, which is the whole point.
+        var incoming = Path.Combine(sourceRoot, Path.GetFileName(archived));
+        await WriteUnrelatedLookingAnimationAsync(incoming, frames: 4);
+
+        var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+
+        // Not archived as something new, and not discarded either: asked about.
+        Assert.Equal(0, result.MovedUnique);
+        Assert.Equal(1, result.HeldForReview);
+        Assert.True(File.Exists(incoming));
+        var review = Assert.Single((await store.LoadAsync()).ReviewQueue);
+        Assert.Contains(
+            review.Candidates,
+            candidate => string.Equals(candidate.ArchivePath, archived, StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(
+            review.Candidates.SelectMany(candidate => candidate.MatchReasons),
+            reason => reason.Contains("same emoji", StringComparison.OrdinalIgnoreCase));
+
+        // Nothing was thrown away on the strength of a name. Both files are still there.
+        Assert.True(File.Exists(archived));
+    }
+
+    /// <summary>
+    /// An animation that shares nothing with the archive but its file name.
+    /// </summary>
+    private static async Task WriteUnrelatedLookingAnimationAsync(string destination, int frames)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        using var animation = new Image<Rgba32>(64, 64, Colour(0));
+        for (var index = 1; index < frames; index++)
+        {
+            using var frame = new Image<Rgba32>(64, 64, Colour(index));
+            animation.Frames.AddFrame(frame.Frames.RootFrame);
+        }
+
+        await animation.SaveAsGifAsync(destination);
+
+        static Rgba32 Colour(int index) =>
+            new((byte)(30 + (index * 40)), (byte)(200 - (index * 30)), 90, 255);
+    }
+
+    /// <summary>
     /// An animation exported from the Animations tab has to go through the rest of what a scan
     /// does, or it is invisible to deduplication until the next full index.
     /// </summary>

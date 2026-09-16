@@ -47,4 +47,37 @@ public sealed class EmojiIdentityTests
     [Fact]
     public void ANameThatIsNothingButACopyNumberStillHasAKey() =>
         Assert.False(string.IsNullOrWhiteSpace(EmojiIdentity.KeyFor("(2).png")));
+
+    /// <summary>
+    /// "Is this a sheet" and "what does its name say it plays" are different questions, and a GIF
+    /// answers no to the first and yes to the second.
+    /// </summary>
+    /// <remarks>
+    /// Reading them as one question is what stopped the app noticing that VRChat's own GIF and its
+    /// own export of the same sheet play the very same animation: every check gave up the moment
+    /// it saw a .gif.
+    /// </remarks>
+    [Fact]
+    public void AnAnimationCarriesWhatItPlaysEvenThoughItIsNotASheet()
+    {
+        const string sheet =
+            "_ShadowRogue__inv_b191ba0d-fdcd-427b-8386-3daab2b8cff9"
+            + "_stopanimationStyle_64frames_12fps_linearloopStyle.png";
+        const string animation =
+            "_ShadowRogue__inv_b191ba0d-fdcd-427b-8386-3daab2b8cff9"
+            + "_stopanimationStyle_64frames_12fps_linearloopStyle (2).gif";
+
+        Assert.True(EmojiAtlasName.TryParse(sheet, out var fromSheet));
+        Assert.False(EmojiAtlasName.TryParse(animation, out _));
+        Assert.True(EmojiAtlasName.TryReadAnimation(animation, out var fromAnimation));
+
+        Assert.Equal(fromSheet, fromAnimation);
+        Assert.Equal(new EmojiAtlasName(64, 12, AtlasLoopStyle.Linear), fromAnimation);
+    }
+
+    [Fact]
+    public void AStillEmojiNameSaysNothingAboutPlayingAnything() =>
+        Assert.False(EmojiAtlasName.TryReadAnimation(
+            "Qwen3_inv_b680967b-2295-4555-b1ef-0b445b194085_stopanimationStyle.png",
+            out _));
 }

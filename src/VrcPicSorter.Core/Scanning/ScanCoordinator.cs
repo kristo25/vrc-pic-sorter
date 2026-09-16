@@ -703,6 +703,17 @@ public sealed class ScanCoordinator
                     candidates,
                     current.Settings.SimilarityProfile);
 
+                // VRChat hands over its own ready-made GIF for an emoji this app has already
+                // animated. The two are the same animation encoded twice, so they are not the same
+                // bytes and their score can land under any threshold - and the copy was then filed
+                // as a brand new image, which is where a folder full of "x" beside "x (2)" came
+                // from. Being the same emoji, with the same frame count, rate and loop direction in
+                // its name, is not a resemblance to be scored: it is VRChat's own metadata about
+                // its own inventory item. So it always earns a review card, however the score came
+                // out. It never resolves one: discarding a file still needs the decoded content to
+                // match exactly, and these do not.
+                matches = WithSameEmojiAnimations(matches, comparable, path, fingerprint);
+
                 if (matches.Count > 0)
                 {
                     // Only a copy that decodes to the very same pixels wins without asking. The
@@ -1179,6 +1190,66 @@ public sealed class ScanCoordinator
         return new ExportedAnimationFollowUp(filed, duplicates, warnings);
     }
 
+    /// <summary>
+    /// Adds the archived animations of the same emoji to a ranked list that may have missed them.
+    /// </summary>
+    /// <remarks>
+    /// Only ever adds candidates to a review, and only for animations whose names agree on every
+    /// animation parameter VRChat recorded. The score beside each one is measured honestly rather
+    /// than asserted, so the review card shows how alike they really are.
+    /// </remarks>
+    private static IReadOnlyList<ImageMatchResult> WithSameEmojiAnimations(
+        IReadOnlyList<ImageMatchResult> matches,
+        IReadOnlyDictionary<string, IndexedImageRecord> comparable,
+        string incomingPath,
+        ImageFingerprint incoming)
+    {
+        if (!AtlasAnimationWriter.IsAnimation(incomingPath)
+            || !EmojiAtlasName.TryReadAnimation(incomingPath, out var incomingName))
+        {
+            return matches;
+        }
+
+        var ranked = matches.Select(match => match.CandidateKey).ToHashSet(StringComparer.Ordinal);
+        var added = new List<ImageMatchResult>();
+        foreach (var candidate in comparable)
+        {
+            var indexed = candidate.Value;
+            if (ranked.Contains(candidate.Key)
+                || indexed.Fingerprint is null
+                || !AtlasAnimationWriter.IsAnimation(indexed.Path)
+                || !EmojiIdentity.IsSameEmoji(incomingPath, indexed.Path)
+                || !EmojiAtlasName.TryReadAnimation(indexed.Path, out var archivedName)
+                || archivedName != incomingName)
+            {
+                continue;
+            }
+
+            var measured = ImageMatcher.MeasureSimilarity(incoming, indexed.Fingerprint);
+            added.Add(new ImageMatchResult(
+                candidate.Key,
+                MatchKind.Similar,
+                measured.Score,
+                [
+                    .. measured.Reasons,
+                    "The same emoji, and the same frame count, rate and loop direction in its name.",
+                ]));
+        }
+
+        if (added.Count == 0)
+        {
+            return matches;
+        }
+
+        return
+        [
+            .. matches
+                .Concat(added)
+                .OrderByDescending(match => match.SimilarityScore)
+                .ThenBy(match => match.CandidateKey, StringComparer.Ordinal),
+        ];
+    }
+
     /// <summary>Archived files that decode to the very same picture as <paramref name="path"/>.</summary>
     /// <remarks>
     /// Exact identity only. Two sizes of one emoji are a judgement and belong in the archive
@@ -1266,10 +1337,12 @@ public sealed class ScanCoordinator
     /// Writes the missing animations for sheets that were archived before the app could make them.
     /// </summary>
     /// <remarks>
-    /// This one only ever adds files. Sheets it animates keep their place in the archive rather
-    /// than being filed into the reference folder, because rearranging an archive a person has
-    /// already organised is theirs to decide, not a side effect of a scan. Only sheets arriving
-    /// from here on are filed.
+    /// A sheet this animates is filed beside its animation, exactly as one arriving during a scan
+    /// is. It used to be left where it was, on the grounds that rearranging an archive is a
+    /// person's decision rather than a side effect of a scan - but the result was a handful of
+    /// sprite sheets sitting among the single emoji, indistinguishable from them while browsing
+    /// and offering a grid of thumbnails where an emoji was expected. A sheet whose animation
+    /// exists has finished being a still; leaving it in the way was the side effect, not moving it.
     /// </remarks>
     private async Task<int> AnimateArchivedSheetsAsync(
         VrcImageCategory category,
@@ -1355,6 +1428,28 @@ public sealed class ScanCoordinator
                 if (animation.Note is { } note)
                 {
                     notes.Add($"{image.Path}: {note}");
+                }
+
+                // The sheet has finished being a still, so it goes to sit with its animation.
+                // Without the fingerprint the move cannot verify what it is moving, and a move
+                // this app cannot check is one it does not make.
+                if (image.Fingerprint is { } sheetFingerprint)
+                {
+                    _ = await FileAnimatedSheetAsync(
+                            image.Id,
+                            image.Path,
+                            category,
+                            sheetFingerprint,
+                            archiveRoot,
+                            errors,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    errors.Add(
+                        $"{image.Path}: animated, but the archive index does not describe it well "
+                            + "enough to file it beside its animation. Rebuild the index.");
                 }
             }
             else if (animation.Warning is { } warning)

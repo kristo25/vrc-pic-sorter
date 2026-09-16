@@ -10,9 +10,17 @@ public enum ArchiveDuplicateKind
     Identical,
 
     /// <summary>
-    /// The same emoji held more than once, but not the same picture - typically VRChat's own GIF
-    /// beside the one this app exported from the sheet, at a different size. Which one is worth
-    /// keeping is a judgement, so these are only ever reported.
+    /// The same animation of the same emoji, encoded twice: VRChat's own GIF beside the one this
+    /// app exported from the sheet. Not the same bytes, but the same emoji and the same frame
+    /// count, rate and loop direction - which is VRChat's own account of its own inventory item,
+    /// not a resemblance anything guessed at.
+    /// </summary>
+    SameAnimation,
+
+    /// <summary>
+    /// The same emoji held more than once, and nothing says the two are the same picture - a still
+    /// beside another still, or animations whose names disagree about what they play. Which one is
+    /// worth keeping is a judgement, so these are only ever reported.
     /// </summary>
     SameEmoji,
 }
@@ -89,7 +97,34 @@ public static class ArchiveDuplicateFinder
                 continue;
             }
 
-            var ordered = sameEmoji.OrderBy(image => image, PreferByDetail).ToArray();
+            // Animations whose names agree on every animation parameter are the same animation,
+            // whatever their bytes say. Separated out because that is a thing the app can act on:
+            // one of them is the file every other part of the app addresses by name, and the other
+            // is the copy that could not have that name. Anything else stays a report.
+            foreach (var byAnimation in sameEmoji.GroupBy(AnimationParameters))
+            {
+                if (byAnimation.Count() < 2)
+                {
+                    continue;
+                }
+
+                var sameAnimation = byAnimation.OrderBy(image => image, PreferByName).ToArray();
+                groups.Add(new ArchiveDuplicateGroup(
+                    ArchiveDuplicateKind.SameAnimation,
+                    sameAnimation[0],
+                    sameAnimation[1..]));
+            }
+
+            var remaining = sameEmoji
+                .GroupBy(AnimationParameters)
+                .Select(group => group.OrderBy(image => image, PreferByName).First())
+                .ToArray();
+            if (remaining.Length < 2)
+            {
+                continue;
+            }
+
+            var ordered = remaining.OrderBy(image => image, PreferByDetail).ToArray();
             groups.Add(new ArchiveDuplicateGroup(ArchiveDuplicateKind.SameEmoji, ordered[0], ordered[1..]));
         }
 
@@ -97,6 +132,28 @@ public static class ArchiveDuplicateFinder
             .OrderBy(group => group.Kind)
             .ThenBy(group => group.Keep.Path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    /// <summary>
+    /// What a file's name says it plays, or null for anything that is not an animation with the
+    /// parameters in its name.
+    /// </summary>
+    /// <remarks>
+    /// Grouping by this is what separates "the same animation twice" from "the same emoji at two
+    /// sizes". A null is its own group per file - a name that says nothing about what it plays
+    /// cannot be used to say two files play the same thing.
+    /// </remarks>
+    private static object AnimationParameters(IndexedImageRecord image)
+    {
+        // TryParse asks "is this a sheet" and rightly says no to a GIF. The question here is what
+        // the name says it plays, which VRChat writes into the animation's name as well.
+        if (!AtlasAnimationWriter.IsAnimation(image.Path)
+            || !EmojiAtlasName.TryReadAnimation(image.Path, out var name))
+        {
+            return image.Id;
+        }
+
+        return name;
     }
 
     /// <summary>

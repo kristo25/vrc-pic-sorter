@@ -55,16 +55,44 @@ public sealed record EmojiAtlasName(int FrameCount, int FramesPerSecond, AtlasLo
             return false;
         }
 
-        Match match;
         try
         {
-            var fileName = Path.GetFileName(fileNameOrPath);
-            if (!SheetExtensions.Contains(Path.GetExtension(fileName)))
+            if (!SheetExtensions.Contains(Path.GetExtension(Path.GetFileName(fileNameOrPath))))
             {
                 return false;
             }
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
 
-            match = Pattern.Match(fileName);
+        return TryReadAnimation(fileNameOrPath, out result);
+    }
+
+    /// <summary>
+    /// Reads what VRChat wrote about the animation, whatever kind of file is carrying it.
+    /// </summary>
+    /// <remarks>
+    /// The same pattern as <see cref="TryParse"/> without its question about sprite sheets.
+    /// VRChat gives its own exported GIF the very same name as the sheet it came from, so the
+    /// frame count, rate and loop direction are there to be read on an animation too - and two
+    /// animations of one emoji that agree on all three are the same animation, however differently
+    /// they were encoded. <see cref="TryParse"/> answers "is this a sheet" and rightly says no to
+    /// a GIF; this answers "what does its name say it plays", which is a different question.
+    /// </remarks>
+    public static bool TryReadAnimation(string? fileNameOrPath, out EmojiAtlasName result)
+    {
+        result = new EmojiAtlasName(0, 0, AtlasLoopStyle.Linear);
+        if (string.IsNullOrWhiteSpace(fileNameOrPath))
+        {
+            return false;
+        }
+
+        Match match;
+        try
+        {
+            match = Pattern.Match(Path.GetFileName(fileNameOrPath));
         }
         catch (RegexMatchTimeoutException)
         {

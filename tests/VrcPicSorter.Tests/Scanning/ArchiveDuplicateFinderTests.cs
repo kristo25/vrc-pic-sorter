@@ -83,6 +83,63 @@ public sealed class ArchiveDuplicateFinderTests
         Assert.Equal($@"C:\a\Animated\p_inv_{Id}_x (3).gif", Assert.Single(sameEmoji.Extras).Path);
     }
 
+    /// <summary>
+    /// The doubles a real archive was full of: VRChat's own GIF filed beside the one this app
+    /// exported from the sheet, under the very same name plus a copy number.
+    /// </summary>
+    /// <remarks>
+    /// Names taken verbatim from the archive this was reported against, where about forty pairs of
+    /// them had accumulated. They are not the same bytes and never will be - one is VRChat's
+    /// encoding and the other this app's - so nothing that compares pixels could ever offer to
+    /// tidy them. What says they are the same animation is VRChat's own account of its own
+    /// inventory item: the emoji id, and the frame count, rate and loop direction in both names.
+    /// </remarks>
+    [Fact]
+    public void TheSameAnimationEncodedTwiceIsSomethingTheAppCanActOn()
+    {
+        const string original =
+            @"C:\Animated\_ShadowRogue__inv_b191ba0d-fdcd-427b-8386-3daab2b8cff9"
+            + "_stopanimationStyle_64frames_12fps_linearloopStyle.gif";
+        const string copy =
+            @"C:\Animated\_ShadowRogue__inv_b191ba0d-fdcd-427b-8386-3daab2b8cff9"
+            + "_stopanimationStyle_64frames_12fps_linearloopStyle (2).gif";
+
+        var group = Assert.Single(ArchiveDuplicateFinder.Find(Index(
+            Record(copy, "AAA", size: 694109),
+            Record(original, "BBB", size: 569889))));
+
+        Assert.Equal(ArchiveDuplicateKind.SameAnimation, group.Kind);
+
+        // The copy that kept the name stays: it is the one every other part of the app addresses.
+        Assert.Equal(original, group.Keep.Path);
+        Assert.Equal(copy, Assert.Single(group.Extras).Path);
+        Assert.Equal(694109, group.ReclaimableBytes);
+    }
+
+    /// <summary>
+    /// Two animations of one emoji that do not agree on what they play are still only a report.
+    /// </summary>
+    [Fact]
+    public void TwoAnimationsOfOneEmojiThatPlayDifferentlyAreOnlyReported()
+    {
+        var groups = ArchiveDuplicateFinder.Find(Index(
+            Record($@"C:\Animated\p_inv_{Id}_x_64frames_12fps_linearloopStyle.gif", "AAA"),
+            Record($@"C:\Animated\p_inv_{Id}_x_64frames_20fps_linearloopStyle.gif", "BBB")));
+
+        var group = Assert.Single(groups);
+        Assert.Equal(ArchiveDuplicateKind.SameEmoji, group.Kind);
+    }
+
+    /// <summary>
+    /// A sheet and its animation still are not duplicates, even now that both names carry the
+    /// same frame count, rate and loop direction - they always did.
+    /// </summary>
+    [Fact]
+    public void ASheetAndItsAnimationStayApartEvenWhenTheirNamesAgree() =>
+        Assert.Empty(ArchiveDuplicateFinder.Find(Index(
+            Record($@"C:\Animated\p_inv_{Id}_x_16frames_8fps_linearloopStyle.gif", "AAA"),
+            Record($@"C:\Animated\Gif Ref\p_inv_{Id}_x_16frames_8fps_linearloopStyle.png", "BBB"))));
+
     /// <summary>A record with no fingerprint says nothing about being a copy of anything.</summary>
     [Fact]
     public void RecordsWithNoFingerprintAreNotCalledIdentical() =>

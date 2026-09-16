@@ -725,6 +725,72 @@ public sealed class FileRouter
     }
 
     /// <summary>
+    /// Removes a second encoding of an animation the archive already holds: the file goes to the
+    /// Recycle Bin and its record leaves the index.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not the same method as removing an identical copy, and it does not relax that
+    /// method's rule. These two files are not the same bytes and never will be - one is VRChat's
+    /// own GIF and the other is this app's export of the sheet it came from. What makes them the
+    /// same animation is VRChat's own account of its own inventory item: the emoji's id, and the
+    /// frame count, rate and loop direction it wrote into both names. That is checked here, on the
+    /// names, before anything is opened; then the copy being kept is checked on disk like any
+    /// other. Nothing reaches this method automatically - a person presses the button.
+    /// </remarks>
+    public async Task RemoveSupersededAnimationAsync(
+        IndexedImageRecord superseded,
+        IndexedImageRecord keep,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(superseded);
+        ArgumentNullException.ThrowIfNull(keep);
+
+        if (superseded.Id == keep.Id)
+        {
+            throw new InvalidOperationException(
+                "A copy cannot be the reason to discard itself. The duplicate group is stale; rescan the archive.");
+        }
+
+        if (!AtlasAnimationWriter.IsAnimation(superseded.Path) || !AtlasAnimationWriter.IsAnimation(keep.Path))
+        {
+            throw new InvalidOperationException("Only an animation can be removed in favour of another animation.");
+        }
+
+        if (!EmojiIdentity.IsSameEmoji(superseded.Path, keep.Path))
+        {
+            throw new InvalidOperationException(
+                "These two files are not of the same emoji, so neither can stand in for the other.");
+        }
+
+        if (!EmojiAtlasName.TryReadAnimation(superseded.Path, out var supersededName)
+            || !EmojiAtlasName.TryReadAnimation(keep.Path, out var keepName)
+            || supersededName != keepName)
+        {
+            throw new InvalidOperationException(
+                "These two animations do not agree on what they play, so neither can stand in for the other.");
+        }
+
+        EnsureDistinctSurvivor(superseded.Path, keep.Path, keep.ExactFingerprint);
+        await VerifyImageFingerprintAsync(
+                keep.Path,
+                keep.ExactFingerprint,
+                "The copy this one would be removed in favour of is no longer what the archive "
+                    + "recorded, so nothing was removed.",
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        var entry = CreateRecycleEntry(
+            superseded.Path,
+            superseded.Category,
+            superseded.ExactFingerprint,
+            JournalOperationPurpose.RemoveArchiveDuplicate);
+        entry.IndexedImageId = superseded.Id;
+        entry.SurvivingPath = keep.Path;
+        entry.SurvivingFingerprint = keep.ExactFingerprint;
+        await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Refuses a removal whose surviving copy is missing, unnamed, or the very file being removed.
     /// </summary>
     /// <remarks>

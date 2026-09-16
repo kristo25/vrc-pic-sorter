@@ -1114,25 +1114,23 @@ public partial class MainWindow : Window
             .ToArray();
         _archiveDuplicates = groups;
 
-        var identical = groups.Where(group => group.Kind == ArchiveDuplicateKind.Identical).ToArray();
-        var sameEmoji = groups.Length - identical.Length;
-        var extras = identical.Sum(group => group.Extras.Count);
-        var megabytes = identical.Sum(group => group.ReclaimableBytes) / (double)(1024 * 1024);
+        var removable = groups.Where(group => IsRemovable(group.Kind)).ToArray();
+        var sameEmoji = groups.Length - removable.Length;
+        var extras = removable.Sum(group => group.Extras.Count);
+        var megabytes = removable.Sum(group => group.ReclaimableBytes) / (double)(1024 * 1024);
 
         ArchiveDuplicatesList.ItemsSource = groups
             .SelectMany(group => group.Extras.Select(extra => new
             {
                 Extra = Path.GetFileName(extra.Path),
                 Detail = $"{extra.Path}{Environment.NewLine}kept instead: {group.Keep.Path}",
-                Summary = group.Kind == ArchiveDuplicateKind.Identical
-                    ? "identical"
-                    : $"{extra.Width}x{extra.Height} beside {group.Keep.Width}x{group.Keep.Height}",
+                Summary = DescribeDuplicate(group.Kind, extra, group.Keep),
             }))
             .ToArray();
 
         var identicalText = extras == 1
-            ? $"One extra copy is the same picture as one already here, taking {megabytes:0.#} MB."
-            : $"{extras} extra copies are the same picture as one already here, taking {megabytes:0.#} MB.";
+            ? $"One extra copy is a picture already here, taking {megabytes:0.#} MB."
+            : $"{extras} extra copies are pictures already here, taking {megabytes:0.#} MB.";
         var sameEmojiText = sameEmoji == 1
             ? "One image is the same emoji as another copy here, at a different size."
             : $"{sameEmoji} images are the same emoji as another copy here, at a different size.";
@@ -1167,21 +1165,33 @@ public partial class MainWindow : Window
         // passing the extras alone is what let a removal go ahead with the keeper already gone -
         // the router had nothing to check, so there was nothing to refuse.
         var removals = _archiveDuplicates
-            .Where(group => group.Kind == ArchiveDuplicateKind.Identical)
-            .SelectMany(group => group.Extras.Select(extra => (group.Keep, Extra: extra)))
+            .Where(group => IsRemovable(group.Kind))
+            .SelectMany(group => group.Extras.Select(extra => (group.Kind, group.Keep, Extra: extra)))
             .ToArray();
         if (removals.Length == 0)
         {
             return;
         }
 
+        var identicalCount = removals.Count(item => item.Kind == ArchiveDuplicateKind.Identical);
+        var animationCount = removals.Length - identicalCount;
+        var what = (identicalCount, animationCount) switch
+        {
+            (0, _) => "Every one is a second copy of an animation already here: the same emoji, "
+                + "playing the same frames at the same rate, encoded twice. The copy that keeps "
+                + "the name stays.",
+            (_, 0) => "Every one is the same picture, byte for byte, as another copy that stays.",
+            _ => $"{identicalCount} are the same picture byte for byte as a copy that stays; the "
+                + $"other {animationCount} are second copies of an animation already here - the "
+                + "same emoji, playing the same frames at the same rate, encoded twice.",
+        };
+
         var confirmation = MessageBox.Show(
             this,
-            $"Send {removals.Length} extra copies to the Recycle Bin? Every one of them is the same "
-                + "picture, byte for byte, as another copy that stays. Nothing is deleted "
+            $"Send {removals.Length} extra copies to the Recycle Bin? {what} Nothing is deleted "
                 + "permanently, and both files are checked before either is touched: the copy "
                 + "going, and the copy it is going in favour of.",
-            "Recycle the identical extras",
+            "Recycle the extra copies",
             MessageBoxButton.OKCancel,
             MessageBoxImage.Question);
         if (confirmation != MessageBoxResult.OK)
@@ -1200,10 +1210,21 @@ public partial class MainWindow : Window
                     CurrentCancellation.ThrowIfCancellationRequested();
                     try
                     {
-                        await _runtime.Router.RemoveArchivedDuplicateAsync(
-                            removal.Extra,
-                            removal.Keep,
-                            CurrentCancellation);
+                        if (removal.Kind == ArchiveDuplicateKind.Identical)
+                        {
+                            await _runtime.Router.RemoveArchivedDuplicateAsync(
+                                removal.Extra,
+                                removal.Keep,
+                                CurrentCancellation);
+                        }
+                        else
+                        {
+                            await _runtime.Router.RemoveSupersededAnimationAsync(
+                                removal.Extra,
+                                removal.Keep,
+                                CurrentCancellation);
+                        }
+
                         removed++;
                     }
                     catch (Exception exception) when (
@@ -1228,6 +1249,27 @@ public partial class MainWindow : Window
                 await ReportScanErrorsAsync(failures);
             });
     }
+
+    /// <summary>
+    /// Whether the app can act on a duplicate group, or only report it.
+    /// </summary>
+    /// <remarks>
+    /// Two files it can prove are the same thing - the same decoded picture, or the same animation
+    /// of the same emoji by VRChat's own account - can be tidied on request. Two files that merely
+    /// look alike cannot, and never will be.
+    /// </remarks>
+    private static bool IsRemovable(ArchiveDuplicateKind kind) =>
+        kind is ArchiveDuplicateKind.Identical or ArchiveDuplicateKind.SameAnimation;
+
+    private static string DescribeDuplicate(
+        ArchiveDuplicateKind kind,
+        IndexedImageRecord extra,
+        IndexedImageRecord keep) => kind switch
+        {
+            ArchiveDuplicateKind.Identical => "identical",
+            ArchiveDuplicateKind.SameAnimation => "same animation, encoded twice",
+            _ => $"{extra.Width}x{extra.Height} beside {keep.Width}x{keep.Height}",
+        };
 
     private async void MoveRetainedArchives(object sender, RoutedEventArgs e)
     {

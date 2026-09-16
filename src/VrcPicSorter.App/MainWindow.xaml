@@ -476,9 +476,9 @@
                                 </ItemsControl.ItemTemplate>
                             </ItemsControl>
                             <Button x:Name="RemoveIdenticalDuplicatesButton" HorizontalAlignment="Left"
-                                    Style="{StaticResource PrimaryButton}" Content="Recycle the identical extras"
+                                    Style="{StaticResource PrimaryButton}" Content="Recycle the extra copies"
                                     Click="RemoveIdenticalDuplicates"
-                                    automation:AutomationProperties.Name="Send the byte-identical extra copies to the Recycle Bin" />
+                                    automation:AutomationProperties.Name="Send the extra copies the app can prove are duplicates to the Recycle Bin" />
                         </StackPanel>
                     </Border>
 
