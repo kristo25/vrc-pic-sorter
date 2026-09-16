@@ -1055,6 +1055,125 @@ public sealed class ScanCoordinatorTests
         Assert.Equal(filed, indexed.Path);
     }
 
+    /// <summary>
+    /// The archiver never overwrites: when the name it wants is taken it adds a number. That means
+    /// an animation can be sitting right there under a name the next scan does not think to look
+    /// for - and asking File.Exists about one exact name is how an archive ends up holding two of
+    /// everything it had already made.
+    /// </summary>
+    [Fact]
+    public async Task AnAnimationAlreadyThereUnderAnotherNameIsNotWrittenAgain()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        const string sheetName =
+            "player_inv_11111111-2222-3333-4444-555555555555_stopanimationStyle_4frames_10fps_linearloopStyle.png";
+        WriteSheet(Path.Combine(sourceRoot, sheetName));
+        using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+        var coordinator = CreateCoordinator(store);
+        var first = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Equal(1, first.Animated);
+
+        var animationFolder = Path.Combine(archiveRoot, "Animated");
+        var made = Assert.Single(Directory.GetFiles(animationFolder, "*.gif"));
+        var renamed = Path.Combine(
+            animationFolder,
+            Path.GetFileNameWithoutExtension(made) + " (2).gif");
+        File.Move(made, renamed);
+
+        var second = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+
+        Assert.Empty(second.Errors);
+        Assert.Equal(0, second.Animated);
+        Assert.Equal(renamed, Assert.Single(Directory.GetFiles(animationFolder, "*.gif")));
+    }
+
+    /// <summary>
+    /// Run it again and nothing happens. When that stops being true every scan adds another copy
+    /// of whatever it failed to recognise, which is exactly how an archive doubles overnight.
+    /// </summary>
+    [Fact]
+    public async Task ASecondScanLeavesTheArchiveExactlyAsItWas()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        WriteSheet(Path.Combine(
+            sourceRoot,
+            "player_inv_22222222-2222-3333-4444-555555555555_stopanimationStyle_4frames_10fps_linearloopStyle.png"));
+        using var still = ImageFixtureFactory.CreatePattern(seed: 70);
+        await still.SaveAsPngAsync(Path.Combine(sourceRoot, "ordinary.png"));
+        using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+        var coordinator = CreateCoordinator(store);
+
+        var first = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Empty(first.Errors);
+        Assert.Equal(2, first.MovedUnique);
+        Assert.Equal(1, first.Animated);
+        var settled = Snapshot(archiveRoot);
+
+        var second = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+
+        Assert.Empty(second.Errors);
+        Assert.Equal(0, second.MovedUnique);
+        Assert.Equal(0, second.Animated);
+        Assert.Equal(0, second.HeldForReview);
+        Assert.Equal(0, second.AutoKeptArchived);
+        Assert.Equal(settled, Snapshot(archiveRoot));
+    }
+
+    /// <summary>
+    /// The guard that makes the rest of this safe to trust: a run that wants to animate as much as
+    /// the archive already holds has lost track of what is there, and the cost of letting it
+    /// proceed is a second copy of every animation in the folder.
+    /// </summary>
+    [Fact]
+    public async Task AScanThatWouldDoubleTheAnimationFolderRefusesAndSaysSo()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        var animationFolder = Path.Combine(archiveRoot, "Animated");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(animationFolder);
+
+        // Sheets the app can see, and just as many animations it cannot recognise as theirs.
+        using var frame = ImageFixtureFactory.CreatePattern(seed: 71, width: 32, height: 32);
+        for (var index = 0; index < 26; index++)
+        {
+            WriteSheet(Path.Combine(
+                archiveRoot,
+                $"player_inv_3333{index:D4}-2222-3333-4444-555555555555_stopanimationStyle_4frames_10fps_linearloopStyle.png"));
+            await ImageFixtureFactory.SaveGifAsync(
+                directory,
+                Path.Combine("archive", "Emoji", "Animated", $"unrecognised-{index}.gif"),
+                [frame, frame],
+                [100, 100]);
+        }
+
+        using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+        var coordinator = CreateCoordinator(store);
+
+        var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+
+        Assert.Equal(0, result.Animated);
+        Assert.Equal(26, Directory.GetFiles(animationFolder, "*.gif").Length);
+        Assert.Contains(
+            result.Errors,
+            error => error.Contains("Stopped before writing 26 animations", StringComparison.Ordinal));
+    }
+
+    private static string[] Snapshot(string root) =>
+        Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+            .Select(path => $"{Path.GetRelativePath(root, path)}|{new FileInfo(path).Length}")
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
     [Fact]
     public async Task SheetsAreScannedBeforeReadyMadeGifs()
     {

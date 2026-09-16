@@ -70,18 +70,17 @@ public sealed class AtlasAnimationWriter
         && AnimationExtensions.Contains(System.IO.Path.GetExtension(path));
 
     /// <summary>
-    /// The animation that would belong to <paramref name="atlasPath"/>, matched by name.
+    /// The animation that would belong to <paramref name="atlasPath"/>.
     /// </summary>
     /// <remarks>
-    /// VRChat's names carry the player, the emoji's own id and its frame parameters, so two files
-    /// sharing a base name are the same emoji. That is the whole basis for pairing a ready-made GIF
-    /// with the sheet it came from, and it costs nothing - no file is opened to establish it.
+    /// Matched on the emoji itself rather than on the file name. Comparing names meant a ready-made
+    /// GIF that arrived as "x (2).gif" was never paired with the sheet "x.png" it plainly came from,
+    /// and both were kept. It still costs nothing - no file is opened to establish it.
     /// </remarks>
     public static bool IsAnimationOf(string animationPath, string atlasPath) =>
         IsAnimation(animationPath)
         && !IsAnimation(atlasPath)
-        && System.IO.Path.GetFileNameWithoutExtension(animationPath)
-            .Equals(System.IO.Path.GetFileNameWithoutExtension(atlasPath), StringComparison.OrdinalIgnoreCase);
+        && EmojiIdentity.IsSameEmoji(animationPath, atlasPath);
 
     private static bool HasSegment(string path, string segmentName)
     {

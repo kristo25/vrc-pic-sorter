@@ -47,6 +47,13 @@ public sealed class ScanCoordinator
     /// </summary>
     private const long LargeEncodedBytes = 16L * 1024 * 1024;
 
+    /// <summary>
+    /// How many animations one scan will add to an archive that already has some before it treats
+    /// the run as a fault rather than a workload. Set well above any plausible batch of new emoji
+    /// and far below the size of an archive worth protecting.
+    /// </summary>
+    private const int MaximumUnrecognisedAnimations = 25;
+
     private sealed record PreparedImage(ImageFingerprint? Fingerprint, string? Error);
 
     private readonly JsonStateStore _stateStore;
@@ -1117,7 +1124,14 @@ public sealed class ScanCoordinator
         var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
         var index = state.ArchiveIndex.Categories.Single(item => item.Category == category);
         var skipped = new HashSet<string>(state.SkippedAnimations, StringComparer.OrdinalIgnoreCase);
-        var written = 0;
+
+        // Which emoji already have an animation, whatever their file happens to be called. Read
+        // from the folder rather than from the index, because this is a question about what is on
+        // disk and the index can be a scan behind it.
+        var animated = ReadAnimatedEmoji(archiveRoot);
+        var existing = animated.Count;
+
+        var pending = new List<IndexedImageRecord>();
         foreach (var image in index.Images)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1134,11 +1148,36 @@ public sealed class ScanCoordinator
                 continue;
             }
 
-            string destination;
+            // Add answers both questions at once: is this emoji already animated, and has an
+            // earlier sheet in this same run already claimed it.
+            if (!animated.Add(EmojiIdentity.KeyFor(image.Path)))
+            {
+                continue;
+            }
+
+            pending.Add(image);
+        }
+
+        // A run that wants to animate about as much as the folder already holds is not doing work,
+        // it is failing to recognise what is there - and the cost of being wrong is a second copy
+        // of every animation in the archive. A small run goes through, and so does the first run
+        // over an archive with no animations at all; this shape stops and says so.
+        if (existing > 0 && pending.Count > MaximumUnrecognisedAnimations && pending.Count >= existing)
+        {
+            errors.Add(
+                $"Stopped before writing {pending.Count} animations into a folder that already holds "
+                    + $"{existing}. The animations already there are not being recognised, and writing "
+                    + "these would leave two of each. Nothing was written.");
+            return 0;
+        }
+
+        var written = 0;
+        foreach (var image in pending)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                destination = AtlasAnimationWriter.BuildDestination(image.Path, archiveRoot);
-                if (File.Exists(destination))
+                if (File.Exists(AtlasAnimationWriter.BuildDestination(image.Path, archiveRoot)))
                 {
                     continue;
                 }
@@ -1168,6 +1207,44 @@ public sealed class ScanCoordinator
         }
 
         return written;
+    }
+
+    /// <summary>
+    /// The emoji that already have an animation somewhere under the archive's animation folder,
+    /// keyed by the emoji rather than by file name. An unreadable folder answers "none", which is
+    /// what this did before it asked the question at all.
+    /// </summary>
+    private static HashSet<string> ReadAnimatedEmoji(string archiveRoot)
+    {
+        var animated = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(archiveRoot))
+        {
+            return animated;
+        }
+
+        try
+        {
+            var root = Path.Combine(archiveRoot, AtlasAnimationWriter.AnimationFolderName);
+            if (!Directory.Exists(root))
+            {
+                return animated;
+            }
+
+            foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            {
+                if (AtlasAnimationWriter.IsAnimation(path))
+                {
+                    animated.Add(EmojiIdentity.KeyFor(path));
+                }
+            }
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            animated.Clear();
+        }
+
+        return animated;
     }
 
     /// <summary>
