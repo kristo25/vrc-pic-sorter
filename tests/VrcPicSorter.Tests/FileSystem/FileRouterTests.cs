@@ -3,6 +3,7 @@ using SixLabors.ImageSharp;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Imaging;
 using VrcPicSorter.Core.Models;
+using VrcPicSorter.Core.Scanning;
 using VrcPicSorter.Core.Storage;
 using VrcPicSorter.Tests.Imaging;
 
@@ -705,6 +706,80 @@ public sealed class FileRouterTests
         Assert.Equal(Path.Combine(archiveRoot, "emoji.png"), result.DestinationPath);
         Assert.True(File.Exists(Path.Combine(archiveRoot, "emoji.png")));
         Assert.Empty(Directory.GetFiles(abandonedRoot));
+    }
+
+    /// <summary>
+    /// Nothing else in the app can remove a file the archive is holding twice - deduplication only
+    /// ever ran incoming-against-archive, so once both copies were inside they stayed forever.
+    /// </summary>
+    [Fact]
+    public async Task ARemovedArchiveDuplicateGoesToTheRecycleBinAndLeavesTheIndex()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        using var image = ImageFixtureFactory.CreatePattern(seed: 80);
+        var keep = Path.Combine(archiveRoot, "emoji.png");
+        var extra = Path.Combine(archiveRoot, "emoji (2).png");
+        await image.SaveAsPngAsync(keep);
+        await image.SaveAsPngAsync(extra);
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var decoder = new ImageDecoder();
+        var recycleBin = new FakeRecycleBinService();
+        var router = new FileRouter(store, decoder, recycleBin);
+        var indexed = await new ArchiveIndexer(store, decoder).RefreshAsync(VrcImageCategory.Emoji);
+        Assert.Equal(IndexStatus.Current, indexed.Status);
+        var state = await store.LoadAsync();
+        var record = state.ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji)
+            .Images.Single(item => item.Path == extra);
+
+        await router.RemoveArchivedDuplicateAsync(record);
+
+        Assert.Equal(extra, Assert.Single(recycleBin.RecycledPaths));
+        Assert.True(File.Exists(keep));
+        var after = (await store.LoadAsync()).ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji);
+        Assert.Equal(keep, Assert.Single(after.Images).Path);
+    }
+
+    /// <summary>
+    /// The file is verified against what was indexed before it goes, so a copy that changed since
+    /// the duplicate was found is refused rather than discarded on stale information.
+    /// </summary>
+    [Fact]
+    public async Task ADuplicateThatChangedSinceItWasFoundIsNotRemoved()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        using var image = ImageFixtureFactory.CreatePattern(seed: 81);
+        var keep = Path.Combine(archiveRoot, "emoji.png");
+        var extra = Path.Combine(archiveRoot, "emoji (2).png");
+        await image.SaveAsPngAsync(keep);
+        await image.SaveAsPngAsync(extra);
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var decoder = new ImageDecoder();
+        var recycleBin = new FakeRecycleBinService();
+        var router = new FileRouter(store, decoder, recycleBin);
+        await new ArchiveIndexer(store, decoder).RefreshAsync(VrcImageCategory.Emoji);
+        var record = (await store.LoadAsync()).ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji)
+            .Images.Single(item => item.Path == extra);
+
+        using (var replacement = ImageFixtureFactory.CreatePattern(seed: 82))
+        {
+            await replacement.SaveAsPngAsync(extra);
+        }
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => router.RemoveArchivedDuplicateAsync(record));
+        Assert.Empty(recycleBin.RecycledPaths);
+        Assert.True(File.Exists(extra));
     }
 
     internal static JsonStateStore CreateStore(

@@ -557,6 +557,29 @@ public sealed class FileRouter
         await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Removes one copy of an image the archive is holding twice: the file goes to the Recycle Bin
+    /// and its record leaves the index. Nothing about a review is involved, so this is the same
+    /// operation as removing an archived match, without one.
+    /// </summary>
+    /// <remarks>
+    /// The recycle verifies the file is still exactly what was indexed before it goes, so a copy
+    /// that changed since the duplicate was found is refused rather than discarded.
+    /// </remarks>
+    public async Task RemoveArchivedDuplicateAsync(
+        IndexedImageRecord duplicate,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(duplicate);
+        var entry = CreateRecycleEntry(
+            duplicate.Path,
+            duplicate.Category,
+            duplicate.ExactFingerprint,
+            JournalOperationPurpose.RemoveArchiveDuplicate);
+        entry.IndexedImageId = duplicate.Id;
+        await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
+    }
+
     public bool CanRecycle(string path) => _recycleBin.CanRecycle(path);
 
     public async Task<IReadOnlyList<JournalReconciliationDecision>> RecoverPendingOperationsAsync(
@@ -795,6 +818,7 @@ public sealed class FileRouter
                 break;
             case JournalOperationPurpose.DeleteArchiveCandidate:
             case JournalOperationPurpose.PreserveArchiveCandidate:
+            case JournalOperationPurpose.RemoveArchiveDuplicate:
                 index.Images.RemoveAll(item => item.Id == entry.IndexedImageId);
                 var review = state.ReviewQueue.SingleOrDefault(item => item.Id == entry.ReviewItemId);
                 review?.Candidates.RemoveAll(item => item.IndexedImageId == entry.IndexedImageId);
@@ -830,6 +854,7 @@ public sealed class FileRouter
                 JournalOperationPurpose.DeleteArchiveCandidate => ActivityKind.DeletionRequested,
                 JournalOperationPurpose.AutoKeepArchived => ActivityKind.DeletionRequested,
                 JournalOperationPurpose.AutoKeepHeld => ActivityKind.DeletionRequested,
+                JournalOperationPurpose.RemoveArchiveDuplicate => ActivityKind.DeletionRequested,
                 _ => ActivityKind.ReviewDecision,
             },
             Level = ActivityLevel.Information,
@@ -840,6 +865,8 @@ public sealed class FileRouter
                     "Exact duplicate: kept the archived image and recycled the incoming copy.",
                 JournalOperationPurpose.AutoKeepHeld =>
                     "Exact duplicate of an image already waiting in Review: recycled the extra copy.",
+                JournalOperationPurpose.RemoveArchiveDuplicate =>
+                    "The archive held this picture twice: recycled the extra copy.",
                 _ => entry.Purpose.ToString(),
             },
             SourcePath = entry.SourcePath,

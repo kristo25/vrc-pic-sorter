@@ -450,6 +450,38 @@
                         </StackPanel>
                     </Border>
 
+                    <Border x:Name="ArchiveDuplicatesPanel" Visibility="Collapsed"
+                            Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1" CornerRadius="5" Padding="16" Margin="0,0,0,20">
+                        <StackPanel>
+                            <TextBlock FontSize="17" FontWeight="SemiBold" Text="Duplicates in the archive" />
+                            <TextBlock x:Name="ArchiveDuplicatesSummary" Margin="0,3,0,12" TextWrapping="Wrap"
+                                       Foreground="{StaticResource MutedTextBrush}" />
+                            <ItemsControl x:Name="ArchiveDuplicatesList" Margin="0,0,0,12"
+                                          automation:AutomationProperties.Name="Images the archive is holding more than once">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,0,0,6">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="{Binding Extra}" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis"
+                                                       ToolTip="{Binding Detail}" VerticalAlignment="Center" />
+                                            <TextBlock Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center"
+                                                       Foreground="{StaticResource PurpleHoverBrush}" FontWeight="SemiBold"
+                                                       Text="{Binding Summary}" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                            <Button x:Name="RemoveIdenticalDuplicatesButton" HorizontalAlignment="Left"
+                                    Style="{StaticResource PrimaryButton}" Content="Recycle the identical extras"
+                                    Click="RemoveIdenticalDuplicates"
+                                    automation:AutomationProperties.Name="Send the byte-identical extra copies to the Recycle Bin" />
+                        </StackPanel>
+                    </Border>
+
                     <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="5" Padding="16" Margin="0,0,0,20">
                         <StackPanel>
                             <TextBlock FontSize="17" FontWeight="SemiBold" Text="Operation recovery" />

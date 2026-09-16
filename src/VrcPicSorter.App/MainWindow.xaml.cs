@@ -23,6 +23,8 @@ public partial class MainWindow : Window
     private readonly LatestRequestGuard _reviewDisplayRequests = new();
     private readonly KeepIncomingPrompt _keepIncomingPrompt = new();
     private IReadOnlyList<ArchiveRelocationStep> _retainedArchives = [];
+
+    private IReadOnlyList<ArchiveDuplicateGroup> _archiveDuplicates = [];
     private bool _busy;
     private bool _loadingSettings;
     private CancellationTokenSource? _operationCancellation;
@@ -1083,6 +1085,131 @@ public partial class MainWindow : Window
             : Visibility.Visible;
     }
 
+    /// <summary>
+    /// What the archive is holding more than once. Read from the index that is already built, so
+    /// this costs no disk work - but only what the index knows about is considered, which for a
+    /// category that has never been scanned is nothing.
+    /// </summary>
+    private async Task RefreshArchiveDuplicatesAsync()
+    {
+        if (ArchiveDuplicatesPanel is null)
+        {
+            return;
+        }
+
+        var state = await _runtime.StateStore.LoadAsync();
+        var groups = state.ArchiveIndex.Categories
+            .SelectMany(ArchiveDuplicateFinder.Find)
+            .ToArray();
+        _archiveDuplicates = groups;
+
+        var identical = groups.Where(group => group.Kind == ArchiveDuplicateKind.Identical).ToArray();
+        var sameEmoji = groups.Length - identical.Length;
+        var extras = identical.Sum(group => group.Extras.Count);
+        var megabytes = identical.Sum(group => group.ReclaimableBytes) / (double)(1024 * 1024);
+
+        ArchiveDuplicatesList.ItemsSource = groups
+            .SelectMany(group => group.Extras.Select(extra => new
+            {
+                Extra = Path.GetFileName(extra.Path),
+                Detail = $"{extra.Path}{Environment.NewLine}kept instead: {group.Keep.Path}",
+                Summary = group.Kind == ArchiveDuplicateKind.Identical
+                    ? "identical"
+                    : $"{extra.Width}x{extra.Height} beside {group.Keep.Width}x{group.Keep.Height}",
+            }))
+            .ToArray();
+
+        var identicalText = extras == 1
+            ? $"One extra copy is the same picture as one already here, taking {megabytes:0.#} MB."
+            : $"{extras} extra copies are the same picture as one already here, taking {megabytes:0.#} MB.";
+        var sameEmojiText = sameEmoji == 1
+            ? "One image is the same emoji as another copy here, at a different size."
+            : $"{sameEmoji} images are the same emoji as another copy here, at a different size.";
+        var judgement = " Which of those is worth keeping is yours to decide, so nothing here will touch them.";
+
+        // Read from the index, so it describes the archive as the app last saw it. Saying so is
+        // the difference between "you have three duplicates" and "three is what I can see".
+        const string provenance = " Counted from the archive index; run a scan first if the folder"
+            + " has changed outside the app.";
+        ArchiveDuplicatesSummary.Text = (extras, sameEmoji) switch
+        {
+            (0, _) => sameEmojiText + judgement + provenance,
+            (_, 0) => identicalText + provenance,
+            _ => identicalText + " Another " + sameEmojiText[..1].ToLowerInvariant() + sameEmojiText[1..]
+                + judgement + provenance,
+        };
+
+        RemoveIdenticalDuplicatesButton.IsEnabled = extras > 0;
+        ArchiveDuplicatesPanel.Visibility = groups.Length == 0
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+    }
+
+    private async void RemoveIdenticalDuplicates(object sender, RoutedEventArgs e)
+    {
+        if (_busy)
+        {
+            return;
+        }
+
+        var extras = _archiveDuplicates
+            .Where(group => group.Kind == ArchiveDuplicateKind.Identical)
+            .SelectMany(group => group.Extras)
+            .ToArray();
+        if (extras.Length == 0)
+        {
+            return;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            $"Send {extras.Length} extra copies to the Recycle Bin? Every one of them is the same "
+                + "picture, byte for byte, as another copy that stays. Nothing is deleted "
+                + "permanently, and each file is checked to be unchanged before it goes.",
+            "Recycle the identical extras",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Question);
+        if (confirmation != MessageBoxResult.OK)
+        {
+            return;
+        }
+
+        await RunBusyAsync(
+            $"Recycling {extras.Length} duplicate copies...",
+            async () =>
+            {
+                var removed = 0;
+                var failures = new List<string>();
+                foreach (var extra in extras)
+                {
+                    CurrentCancellation.ThrowIfCancellationRequested();
+                    try
+                    {
+                        await _runtime.Router.RemoveArchivedDuplicateAsync(extra, CurrentCancellation);
+                        removed++;
+                    }
+                    catch (Exception exception) when (
+                        exception is NotSupportedException
+                            or InvalidOperationException
+                            or IOException
+                            or UnauthorizedAccessException)
+                    {
+                        // One copy that changed, or a drive that cannot recycle, must not stop the
+                        // rest. Nothing is ever deleted outright to get past it.
+                        failures.Add($"{extra.Path}: {exception.Message}");
+                    }
+                }
+
+                await RefreshArchiveDuplicatesAsync();
+                await RefreshAsync();
+                SetStatus(
+                    failures.Count == 0
+                        ? $"Recycled {removed} duplicate copies."
+                        : $"Recycled {removed} duplicate copies; {failures.Count} were left alone.");
+                await ReportScanErrorsAsync(failures);
+            });
+    }
+
     private async void MoveRetainedArchives(object sender, RoutedEventArgs e)
     {
         var relocation = _retainedArchives;
@@ -1488,10 +1615,14 @@ public partial class MainWindow : Window
         // Counted when the page is opened rather than held from startup: a scan or a move in the
         // meantime changes what is actually left behind.
         _ = AsyncCommandRunner.RunAsync(
-            RefreshRetainedArchivesAsync,
+            async () =>
+            {
+                await RefreshRetainedArchivesAsync();
+                await RefreshArchiveDuplicatesAsync();
+            },
             exception => Dispatcher.InvokeAsync(
                     () => ShowSettingsNotice(
-                        $"Could not check for retained archives. {exception.Message}",
+                        $"Could not check the archive. {exception.Message}",
                         isWarning: true))
                 .Task);
     }

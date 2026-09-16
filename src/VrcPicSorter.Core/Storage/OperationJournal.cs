@@ -238,6 +238,16 @@ public sealed class OperationJournal
                 nameof(entry));
         }
 
+        // Removing a duplicate has no review behind it, so it carries the indexed image alone -
+        // but it must carry that, or the commit would recycle a file and leave its record in the
+        // index pointing at nothing.
+        if (entry.Purpose == JournalOperationPurpose.RemoveArchiveDuplicate && entry.IndexedImageId is null)
+        {
+            throw new ArgumentException(
+                "Removing an archived duplicate requires the indexed-image ID.",
+                nameof(entry));
+        }
+
         if (entry.OperationType == JournalOperationType.Move
             && string.IsNullOrWhiteSpace(entry.DestinationPath))
         {

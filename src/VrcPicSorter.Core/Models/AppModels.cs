@@ -102,6 +102,13 @@ public enum JournalOperationPurpose
     AutoKeepHeld,
     DeleteArchiveCandidate,
     PreserveArchiveCandidate,
+
+    /// <summary>
+    /// Recycles a copy the archive is holding twice. No review is involved: the decision was made
+    /// by comparing two files that are both already archived, which is the one thing deduplication
+    /// never used to do.
+    /// </summary>
+    RemoveArchiveDuplicate,
     RestoreReviewToSource,
 
     /// <summary>

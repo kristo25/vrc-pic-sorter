@@ -77,6 +77,27 @@ public static class EmojiIdentity
         return string.IsNullOrWhiteSpace(name) ? Path.GetFileNameWithoutExtension(fileNameOrPath) : name;
     }
 
+    /// <summary>
+    /// Whether a copy number has been put on this name - by the archiver when the name it wanted
+    /// was taken, or by Windows or a sync client for the same reason.
+    /// </summary>
+    public static bool HasCopySuffix(string? fileNameOrPath)
+    {
+        if (string.IsNullOrWhiteSpace(fileNameOrPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            return CopySuffix.IsMatch(Path.GetFileNameWithoutExtension(fileNameOrPath));
+        }
+        catch (Exception exception) when (exception is RegexMatchTimeoutException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>Whether two files are of the same emoji.</summary>
     public static bool IsSameEmoji(string first, string second) =>
         !string.IsNullOrWhiteSpace(first)
