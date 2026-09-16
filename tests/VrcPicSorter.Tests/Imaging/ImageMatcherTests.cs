@@ -492,18 +492,103 @@ public sealed class ImageMatcherTests
         Assert.True(ImageMatcher.IsSamePicture(match, fingerprint, fingerprint));
     }
 
+    /// <summary>
+    /// The audit's reproduction, as a test that fails while the defect is present.
+    /// </summary>
+    /// <remarks>
+    /// Two sixteen-frame animations whose eight sampled frames agree exactly and whose other eight
+    /// are red against blue. They score a flat 100% because the score only ever sees the sampled
+    /// frames - and on the strength of that number the incoming file was recycled unseen. The
+    /// number is asserted too: this is worthless as a regression test if the pair stops scoring
+    /// 100%, because then it would pass for the wrong reason.
+    /// </remarks>
     [Fact]
-    public void SamePictureCoversAHundredPercentScoreAtTheSameResolution()
+    public void SamePictureRejectsAHundredPercentScoreOnFramesItNeverLookedAt()
+    {
+        var redFrames = CreateHalfDifferingAnimation(new Rgba32(220, 30, 30, 255));
+        var blueFrames = CreateHalfDifferingAnimation(new Rgba32(30, 30, 220, 255));
+        try
+        {
+            var delays = Enumerable.Repeat(80, redFrames.Count).ToArray();
+            var incoming = CreateAnimationFingerprint(redFrames, delays);
+            var archived = CreateAnimationFingerprint(blueFrames, delays);
+
+            Assert.NotEqual(incoming.ExactIdentity, archived.ExactIdentity);
+
+            var results = ImageMatcher.RankCandidates(
+                incoming,
+                [new ImageCandidate("archived", archived)],
+                SimilarityProfile.Strict);
+
+            var match = Assert.Single(results);
+            Assert.True(
+                match.SimilarityScore >= ImageMatcher.DisplayedAsIdenticalThreshold,
+                $"the pair must still be shown as 100% for this to prove anything; it scored {match.SimilarityScore}");
+            Assert.False(ImageMatcher.IsSamePicture(match, incoming, archived));
+        }
+        finally
+        {
+            foreach (var frame in redFrames.Concat(blueFrames))
+            {
+                frame.Dispose();
+            }
+        }
+    }
+
+    [Fact]
+    public void SamePictureRejectsASmallStillImageChange()
     {
         using var image = ImageFixtureFactory.CreatePattern(311);
-        var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
-        var match = new ImageMatchResult(
-            "candidate",
-            MatchKind.Similar,
-            ImageMatcher.IdenticalScoreThreshold,
-            ["reason"]);
+        using var nearly = ImageFixtureFactory.CreateNearDuplicate(image);
+        var incoming = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(nearly));
+        var archived = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
+        var match = new ImageMatchResult("candidate", MatchKind.Similar, 1, ["reason"]);
 
-        Assert.True(ImageMatcher.IsSamePicture(match, fingerprint, fingerprint));
+        // Same size, same frame count, a perfect score handed to it - and still not the same
+        // picture. Nothing short of the decoded content may put a file in the Recycle Bin.
+        Assert.False(ImageMatcher.IsSamePicture(match, incoming, archived));
+    }
+
+    [Fact]
+    public void SamePictureStillCoversTheSameDecodedContent()
+    {
+        using var image = ImageFixtureFactory.CreatePattern(314);
+        var incoming = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
+        var archived = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
+        var results = ImageMatcher.RankCandidates(
+            incoming,
+            [new ImageCandidate("archived", archived)],
+            SimilarityProfile.Strict);
+
+        var match = Assert.Single(results);
+        Assert.Equal(MatchKind.Exact, match.MatchKind);
+        Assert.True(ImageMatcher.IsSamePicture(match, incoming, archived));
+    }
+
+    /// <summary>
+    /// Sixteen frames whose odd-numbered ones are shared and whose even-numbered ones carry
+    /// <paramref name="stripe"/>.
+    /// </summary>
+    /// <remarks>
+    /// The fingerprint samples eight frames by playback time, and with equal delays those land on
+    /// the odd indices. Building the difference into the even ones is what makes the pair invisible
+    /// to the score - which is the whole point of the reproduction.
+    /// </remarks>
+    private static IReadOnlyList<Image<Rgba32>> CreateHalfDifferingAnimation(Rgba32 stripe)
+    {
+        var frames = new List<Image<Rgba32>>(16);
+        for (var index = 0; index < 16; index++)
+        {
+            var frame = ImageFixtureFactory.CreatePattern(400 + (index % 2 == 0 ? 0 : index));
+            if (index % 2 == 0)
+            {
+                PaintRectangle(frame, 0, 0, frame.Width, frame.Height, stripe);
+            }
+
+            frames.Add(frame);
+        }
+
+        return frames;
     }
 
     [Fact]
@@ -520,14 +605,14 @@ public sealed class ImageMatcherTests
     }
 
     [Fact]
-    public void SamePictureRejectsAScoreBelowTheIdenticalThreshold()
+    public void SamePictureRejectsAScoreBelowTheDisplayedThreshold()
     {
         using var image = ImageFixtureFactory.CreatePattern(313);
         var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
         var match = new ImageMatchResult(
             "candidate",
             MatchKind.Similar,
-            ImageMatcher.IdenticalScoreThreshold - 0.001,
+            ImageMatcher.DisplayedAsIdenticalThreshold - 0.001,
             ["reason"]);
 
         Assert.False(ImageMatcher.IsSamePicture(match, fingerprint, fingerprint));

@@ -163,17 +163,30 @@ public sealed class FileRouter
         return await ExecuteMoveAsync(entry, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Recycles the held incoming image because the archived match at
+    /// <paramref name="survivor"/> is the copy being kept.
+    /// </summary>
+    /// <param name="survivor">
+    /// The archived copy this decision is in favour of. Recorded on the journal entry so a retry
+    /// after a crash can re-check that it is still there, rather than discarding the incoming
+    /// image on a precondition nobody has looked at since.
+    /// </param>
     public async Task KeepExistingAsync(
         ReviewItem reviewItem,
+        ReviewCandidate survivor,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(reviewItem);
+        ArgumentNullException.ThrowIfNull(survivor);
         var entry = CreateRecycleEntry(
             reviewItem.HeldFilePath,
             reviewItem.Category,
             reviewItem.IncomingFingerprint,
             JournalOperationPurpose.KeepExisting);
         entry.ReviewItemId = reviewItem.Id;
+        entry.SurvivingPath = survivor.ArchivePath;
+        entry.SurvivingFingerprint = survivor.ExpectedFingerprint;
         await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
     }
 
@@ -261,7 +274,7 @@ public sealed class FileRouter
                 "The archive match changed after it was scanned. No file operation was performed.",
                 cancellationToken)
             .ConfigureAwait(false);
-        await KeepExistingAsync(reviewItem, cancellationToken).ConfigureAwait(false);
+        await KeepExistingAsync(reviewItem, candidate, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<KeepIncomingResult> KeepIncomingOverMatchAsync(
@@ -294,7 +307,14 @@ public sealed class FileRouter
         var currentCandidate = current.Candidates.Single(item => item.Id == candidate.Id);
         if (current.Candidates.Count > 1)
         {
-            var preservedPath = await RemoveArchiveCandidateAsync(current, currentCandidate, cancellationToken)
+            // One match of several: the incoming image stays held while the others are decided, so
+            // the copy that justifies removing this match is the held one.
+            var preservedPath = await RemoveArchiveCandidateAsync(
+                    current,
+                    currentCandidate,
+                    current.HeldFilePath,
+                    current.IncomingFingerprint,
+                    cancellationToken)
                 .ConfigureAwait(false);
             return new KeepIncomingResult(false, preservedPath);
         }
@@ -308,15 +328,13 @@ public sealed class FileRouter
         // if the second one fails the queue entry has to survive so it can be retried. Resolving
         // inside the move left the archived duplicate in place with nothing left to act on.
         //
-        // Which means the first half may already be done. A failure in the second does not undo
-        // it, and the index holding a record at the very path the review now points to is what
-        // says so - moving again from there would put a second copy in the archive.
-        var index = state.ArchiveIndex.Categories.Single(item => item.Category == current.Category);
-        var alreadyArchived = index.Images.Any(
-            item => string.Equals(item.Path, current.HeldFilePath, StringComparison.OrdinalIgnoreCase));
-        if (!alreadyArchived)
+        // Which means the first half may already be done, and a failure in the second does not
+        // undo it. The review records where the incoming image landed the moment that half
+        // commits, so a retry resumes from there instead of putting a second copy in the archive.
+        var archivedPath = ResumeArchivedIncomingPath(state, current);
+        if (string.IsNullOrWhiteSpace(archivedPath))
         {
-            await MoveUniqueAsync(
+            var route = await MoveUniqueAsync(
                     current.HeldFilePath,
                     current.Category,
                     current.IncomingImageFingerprint,
@@ -325,35 +343,81 @@ public sealed class FileRouter
                     duplicateOverride: true,
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
+            archivedPath = route.DestinationPath
+                ?? throw new InvalidOperationException("The archived copy of the incoming image has no path.");
         }
-        var finalPreservedPath = await RemoveArchiveCandidateAsync(current, currentCandidate, cancellationToken)
+
+        var finalPreservedPath = await RemoveArchiveCandidateAsync(
+                current,
+                currentCandidate,
+                archivedPath,
+                current.IncomingImageFingerprint.ExactIdentity,
+                cancellationToken)
             .ConfigureAwait(false);
-        await ResolveKeepIncomingAsync(current.Id, cancellationToken).ConfigureAwait(false);
+        await ResolveKeepIncomingAsync(current, cancellationToken).ConfigureAwait(false);
         return new KeepIncomingResult(true, finalPreservedPath);
     }
 
+    /// <summary>
+    /// Where a Keep incoming decision already put the incoming image, or empty when its first half
+    /// has not run.
+    /// </summary>
+    /// <remarks>
+    /// The review carries the answer from the moment the move commits. State written by an earlier
+    /// version does not, so the index holding a record at the very path the review points to is
+    /// read as the same thing - that is what the first half leaves behind either way, and without
+    /// it an old state document would be archived a second time.
+    /// </remarks>
+    private static string ResumeArchivedIncomingPath(AppStateDocument state, ReviewItem review)
+    {
+        if (!string.IsNullOrWhiteSpace(review.KeptIncomingArchivedPath))
+        {
+            return review.KeptIncomingArchivedPath;
+        }
+
+        if (string.IsNullOrWhiteSpace(review.HeldFilePath))
+        {
+            return string.Empty;
+        }
+
+        // Deliberately not the fail-closed path comparison used before a recycle. Here a path that
+        // cannot be compared has to mean "no record found", so the move runs and is checked on its
+        // own terms; treating it as a match would hand an unrelated archived file to the step that
+        // removes the old one.
+        var index = state.ArchiveIndex.Categories.SingleOrDefault(item => item.Category == review.Category);
+        var archived = index?.Images.FirstOrDefault(
+            item => !string.IsNullOrWhiteSpace(item.Path)
+                && string.Equals(item.Path, review.HeldFilePath, StringComparison.OrdinalIgnoreCase));
+        return archived?.Path ?? string.Empty;
+    }
+
     /// <summary>Closes a Keep incoming decision once both halves of it have committed.</summary>
-    private Task ResolveKeepIncomingAsync(Guid reviewItemId, CancellationToken cancellationToken) =>
+    /// <remarks>
+    /// The history entry is written whether or not the review is still in the queue. Removing the
+    /// last match completes the decision itself, and a resolved review is compacted out of the
+    /// document on the very next write - so by the time this runs the queue entry is usually
+    /// already gone, and gating the history on finding it meant the ordinary success path recorded
+    /// nothing at all. What was decided is read from the review as it was, not from the queue.
+    /// </remarks>
+    private Task ResolveKeepIncomingAsync(ReviewItem decided, CancellationToken cancellationToken) =>
         _stateStore.UpdateAsync(
             state =>
             {
-                var review = state.ReviewQueue.SingleOrDefault(item => item.Id == reviewItemId);
-                if (review is null)
+                var review = state.ReviewQueue.SingleOrDefault(item => item.Id == decided.Id);
+                if (review is not null)
                 {
-                    return false;
+                    CompleteKeepIncoming(review);
                 }
 
-                review.Status = ReviewStatus.Resolved;
-                review.HeldFilePath = string.Empty;
                 state.History.Add(new ActivityEntry
                 {
                     Id = Guid.NewGuid(),
                     OccurredUtc = _timeProvider.GetUtcNow(),
                     Kind = ActivityKind.ReviewDecision,
                     Level = ActivityLevel.Information,
-                    Category = review.Category,
+                    Category = decided.Category,
                     Message = "Kept the incoming image and removed the archived match.",
-                    SourcePath = review.IncomingOriginalPath,
+                    SourcePath = decided.IncomingOriginalPath,
                 });
                 return true;
             },
@@ -362,11 +426,19 @@ public sealed class FileRouter
     private async Task<string?> RemoveArchiveCandidateAsync(
         ReviewItem reviewItem,
         ReviewCandidate candidate,
+        string survivingPath,
+        string survivingFingerprint,
         CancellationToken cancellationToken)
     {
         if (_recycleBin.CanRecycle(candidate.ArchivePath))
         {
-            await DeleteArchiveCandidateAsync(reviewItem, candidate, cancellationToken).ConfigureAwait(false);
+            await DeleteArchiveCandidateAsync(
+                    reviewItem,
+                    candidate,
+                    survivingPath,
+                    survivingFingerprint,
+                    cancellationToken)
+                .ConfigureAwait(false);
             return null;
         }
 
@@ -554,13 +626,34 @@ public sealed class FileRouter
             cancellationToken);
     }
 
+    /// <summary>
+    /// Recycles an archived match because <paramref name="survivingPath"/> is the copy being kept
+    /// in its place.
+    /// </summary>
+    /// <remarks>
+    /// The surviving copy is checked on disk before anything goes, and recorded on the journal
+    /// entry so a retry after a crash checks it again. Without that, an interrupted decision could
+    /// come back and remove the archived match after the copy it was replaced by had been moved
+    /// away by hand - leaving neither.
+    /// </remarks>
     public async Task DeleteArchiveCandidateAsync(
         ReviewItem reviewItem,
         ReviewCandidate candidate,
+        string survivingPath,
+        string survivingFingerprint,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(reviewItem);
         ArgumentNullException.ThrowIfNull(candidate);
+        EnsureDistinctSurvivor(candidate.ArchivePath, survivingPath, survivingFingerprint);
+        await VerifyImageFingerprintAsync(
+                survivingPath,
+                survivingFingerprint,
+                "The copy this match would be removed in favour of is no longer there, "
+                    + "so nothing was removed.",
+                cancellationToken)
+            .ConfigureAwait(false);
+
         var entry = CreateRecycleEntry(
             candidate.ArchivePath,
             reviewItem.Category,
@@ -568,6 +661,8 @@ public sealed class FileRouter
             JournalOperationPurpose.DeleteArchiveCandidate);
         entry.ReviewItemId = reviewItem.Id;
         entry.IndexedImageId = candidate.IndexedImageId;
+        entry.SurvivingPath = survivingPath;
+        entry.SurvivingFingerprint = survivingFingerprint;
         await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
     }
 
@@ -576,22 +671,105 @@ public sealed class FileRouter
     /// and its record leaves the index. Nothing about a review is involved, so this is the same
     /// operation as removing an archived match, without one.
     /// </summary>
+    /// <param name="keep">
+    /// The copy that stays. Removing one of two copies is only safe because the other one is
+    /// there, so the other one is named, checked on disk, and recorded on the journal entry.
+    /// </param>
     /// <remarks>
-    /// The recycle verifies the file is still exactly what was indexed before it goes, so a copy
-    /// that changed since the duplicate was found is refused rather than discarded.
+    /// Both files are verified before either is touched: the one going, against what the index
+    /// says it was, and the one staying, against what the index says it is. The index alone was
+    /// never enough - it describes the archive as the last scan saw it, and a keeper that has since
+    /// been renamed, replaced or deleted leaves the removal taking the only copy there is. A group
+    /// whose two records name the same file, or the same picture twice under one path, is refused
+    /// outright.
     /// </remarks>
     public async Task RemoveArchivedDuplicateAsync(
         IndexedImageRecord duplicate,
+        IndexedImageRecord keep,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(duplicate);
+        ArgumentNullException.ThrowIfNull(keep);
+
+        if (duplicate.Id == keep.Id)
+        {
+            throw new InvalidOperationException(
+                "A copy cannot be the reason to discard itself. The duplicate group is stale; rescan the archive.");
+        }
+
+        if (!string.Equals(duplicate.ExactFingerprint, keep.ExactFingerprint, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The copy being kept is not the same picture as the one being removed. "
+                    + "The duplicate group is stale; rescan the archive.");
+        }
+
+        EnsureDistinctSurvivor(duplicate.Path, keep.Path, keep.ExactFingerprint);
+        await VerifyImageFingerprintAsync(
+                keep.Path,
+                keep.ExactFingerprint,
+                "The copy this one would be removed in favour of is no longer what the archive "
+                    + "recorded, so nothing was removed.",
+                cancellationToken)
+            .ConfigureAwait(false);
+
         var entry = CreateRecycleEntry(
             duplicate.Path,
             duplicate.Category,
             duplicate.ExactFingerprint,
             JournalOperationPurpose.RemoveArchiveDuplicate);
         entry.IndexedImageId = duplicate.Id;
+        entry.SurvivingPath = keep.Path;
+        entry.SurvivingFingerprint = keep.ExactFingerprint;
         await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Refuses a removal whose surviving copy is missing, unnamed, or the very file being removed.
+    /// </summary>
+    /// <remarks>
+    /// Two records can name one file - the same path written twice, or two spellings of it - and a
+    /// removal justified by such a pair would recycle the file it promised to keep. Compared after
+    /// normalizing, so "a\b.png" and "a\.\B.PNG" are recognised as one file rather than two.
+    /// </remarks>
+    private static void EnsureDistinctSurvivor(string removedPath, string survivingPath, string survivingFingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(survivingPath) || string.IsNullOrWhiteSpace(survivingFingerprint))
+        {
+            throw new InvalidOperationException(
+                "Nothing can be removed without naming the copy that stays and what it must still be.");
+        }
+
+        if (PathsMatch(removedPath, survivingPath))
+        {
+            throw new InvalidOperationException(
+                "Both records name the same file, so removing one would remove the only copy.");
+        }
+    }
+
+    /// <summary>True when two paths name the same file once spelling is taken out of it.</summary>
+    private static bool PathsMatch(string? first, string? second)
+    {
+        if (string.IsNullOrWhiteSpace(first) || string.IsNullOrWhiteSpace(second))
+        {
+            return false;
+        }
+
+        try
+        {
+            return string.Equals(
+                PathBoundary.Normalize(first),
+                PathBoundary.Normalize(second),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            // An unusable path cannot be shown to be the same file as anything, and saying "not the
+            // same" here would let a removal through on it. The caller's own verification refuses
+            // it a moment later, on the file rather than on the spelling.
+            return true;
+        }
     }
 
     public bool CanRecycle(string path) => _recycleBin.CanRecycle(path);
@@ -765,9 +943,28 @@ public sealed class FileRouter
     /// </remarks>
     private async Task VerifySurvivingCopyAsync(JournalEntry entry, CancellationToken cancellationToken)
     {
-        if (entry.SurvivingPath is not { } path || entry.SurvivingFingerprint is not { } fingerprint)
+        var path = entry.SurvivingPath;
+        var fingerprint = entry.SurvivingFingerprint;
+        if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(fingerprint))
         {
+            if (OperationJournal.RequiresSurvivingCopy(entry))
+            {
+                // Recorded by a version that kept no proof. Inheriting permission to recycle from
+                // a check nobody can see is exactly the failure this exists to prevent, so it goes
+                // to Needs attention with both paths named and waits for a person.
+                throw new InvalidOperationException(
+                    "This pending operation was recorded before the app kept a record of the copy "
+                        + "it was discarding in favour of, so it cannot be retried on its own. "
+                        + "Check both files and dismiss it from Needs attention.");
+            }
+
             return;
+        }
+
+        if (PathsMatch(entry.SourcePath, path))
+        {
+            throw new InvalidOperationException(
+                "This pending operation names the same file as the copy it would keep, so nothing was discarded.");
         }
 
         await VerifyImageFingerprintAsync(
@@ -887,6 +1084,18 @@ public sealed class FileRouter
                 var review = state.ReviewQueue.SingleOrDefault(item => item.Id == entry.ReviewItemId);
                 review?.Candidates.RemoveAll(item => item.IndexedImageId == entry.IndexedImageId);
                 index.Generation++;
+
+                // The second half of Keep incoming, whether it ran now or was finished by
+                // recovery hours later. With the incoming image archived and the last match gone,
+                // the decision is complete - and a review left open here pointed at an image the
+                // archive already owns and a match that no longer exists, which nothing could act
+                // on and only recovery could clear.
+                if (review is { Candidates.Count: 0 }
+                    && !string.IsNullOrWhiteSpace(review.KeptIncomingArchivedPath))
+                {
+                    CompleteKeepIncoming(review);
+                }
+
                 break;
         }
     }
@@ -914,7 +1123,15 @@ public sealed class FileRouter
         return true;
     }
 
-    /// <summary>Points a review that stays open at where its incoming image has moved to.</summary>
+    /// <summary>
+    /// Points a review that stays open at where its incoming image has moved to, and records that
+    /// the first half of a Keep incoming decision is done.
+    /// </summary>
+    /// <remarks>
+    /// Written in the same durable update as the index record, so the two can never disagree about
+    /// whether the image was archived. It is what a retry reads to know it must not archive a
+    /// second copy, and what tells the removal of the last match that the decision is finished.
+    /// </remarks>
     private static void RepointReview(AppStateDocument state, Guid? reviewItemId, string? destinationPath)
     {
         if (reviewItemId is null || string.IsNullOrWhiteSpace(destinationPath))
@@ -926,7 +1143,16 @@ public sealed class FileRouter
         if (review is not null)
         {
             review.HeldFilePath = destinationPath;
+            review.KeptIncomingArchivedPath = destinationPath;
         }
+    }
+
+    /// <summary>Closes a Keep incoming decision whose two halves have both committed.</summary>
+    private static void CompleteKeepIncoming(ReviewItem review)
+    {
+        review.Status = ReviewStatus.Resolved;
+        review.HeldFilePath = string.Empty;
+        review.KeptIncomingArchivedPath = null;
     }
 
     private static void ResolveReview(AppStateDocument state, Guid? reviewItemId)
@@ -941,6 +1167,7 @@ public sealed class FileRouter
         {
             review.Status = ReviewStatus.Resolved;
             review.HeldFilePath = string.Empty;
+            review.KeptIncomingArchivedPath = null;
         }
     }
 

@@ -248,6 +248,19 @@ public sealed class OperationJournal
                 nameof(entry));
         }
 
+        // Every recycle below discards one copy of a picture because another copy exists. Naming
+        // that copy is what makes the operation safe, and recording it is what keeps it safe
+        // across a crash: recovery re-checks it before retrying rather than trusting a check that
+        // ran before the interruption. An entry that cannot name it must never reach the journal.
+        if (RequiresSurvivingCopy(entry)
+            && (string.IsNullOrWhiteSpace(entry.SurvivingPath)
+                || string.IsNullOrWhiteSpace(entry.SurvivingFingerprint)))
+        {
+            throw new ArgumentException(
+                $"Recycling for {entry.Purpose} requires the retained copy's path and expected identity.",
+                nameof(entry));
+        }
+
         if (entry.OperationType == JournalOperationType.Move
             && string.IsNullOrWhiteSpace(entry.DestinationPath))
         {
@@ -259,6 +272,26 @@ public sealed class OperationJournal
         {
             throw new ArgumentException("Recycle journal entries cannot have a destination path.", nameof(entry));
         }
+    }
+
+    /// <summary>
+    /// True when this operation destroys one copy of a picture only because another copy exists.
+    /// </summary>
+    /// <remarks>
+    /// The same list the router re-checks before a destructive retry. Kept here as well so the
+    /// requirement is structural: an entry without its proof cannot be recorded in the first place,
+    /// and one already on disk from an older version fails into Needs attention rather than being
+    /// retried on trust.
+    /// </remarks>
+    public static bool RequiresSurvivingCopy(JournalEntry entry)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        return entry.OperationType == JournalOperationType.Recycle
+            && entry.Purpose is JournalOperationPurpose.AutoKeepArchived
+                or JournalOperationPurpose.AutoKeepHeld
+                or JournalOperationPurpose.RemoveArchiveDuplicate
+                or JournalOperationPurpose.DeleteArchiveCandidate
+                or JournalOperationPurpose.KeepExisting;
     }
 
     private static void ValidateTransition(JournalPhase current, JournalPhase next)

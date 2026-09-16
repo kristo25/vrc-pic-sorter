@@ -71,6 +71,101 @@ public sealed class PathBoundaryTests
     [Fact]
     public void AWholeDriveOverlapsAFolderOnIt() =>
         Assert.True(PathBoundary.Overlaps(@"D:\", @"D:\VRChat\Emoji"));
+
+    /// <summary>
+    /// The audit's sixth finding: the ancestor walk stopped at the first folder that did not exist.
+    /// </summary>
+    /// <remarks>
+    /// A file about to be written usually has no parent folder yet, which is what CreateDirectory
+    /// is for. Stopping there meant every existing folder above it went unexamined - and that is
+    /// precisely where a junction sits: one standing in for an archive's Animated folder passed
+    /// this check, because the nested folder below it had never been created.
+    /// </remarks>
+    [Fact]
+    public async Task AJunctionIsFoundAboveFoldersThatDoNotExistYet()
+    {
+        using var directory = new TestDirectory();
+        var root = directory.GetPath("root");
+        var outside = directory.GetPath("outside");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(outside);
+        var linked = Path.Combine(root, "Animated");
+        Assert.True(await TryCreateJunctionAsync(linked, outside));
+
+        try
+        {
+            var destination = Path.Combine(linked, "2026-09", "nested", "emoji.gif");
+            Assert.False(Directory.Exists(Path.GetDirectoryName(destination)));
+
+            var refusal = Assert.Throws<InvalidOperationException>(
+                () => PathBoundary.EnsureNoReparsePoints(destination, "Exported animation"));
+            Assert.Contains("junction", refusal.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(linked);
+        }
+    }
+
+    [Fact]
+    public void AnOrdinaryPathUnderFoldersThatDoNotExistYetIsAllowed()
+    {
+        using var directory = new TestDirectory();
+        var root = directory.GetPath("root");
+        Directory.CreateDirectory(root);
+
+        // The ordinary case, and the one that must not become collateral damage: nothing above
+        // this path is a link, and most of it has yet to be created.
+        PathBoundary.EnsureNoReparsePoints(
+            Path.Combine(root, "Animated", "2026-09", "emoji.gif"),
+            "Exported animation");
+    }
+
+    [Fact]
+    public async Task ASafeDestinationMustAlsoStayInsideItsRoot()
+    {
+        using var directory = new TestDirectory();
+        var root = directory.GetPath("root");
+        var outside = directory.GetPath("outside");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(outside);
+
+        PathBoundary.EnsureSafeDestination(root, Path.Combine(root, "a", "b.gif"), "Exported animation");
+        Assert.Throws<InvalidOperationException>(
+            () => PathBoundary.EnsureSafeDestination(root, Path.Combine(outside, "b.gif"), "Exported animation"));
+
+        var linked = Path.Combine(root, "linked");
+        Assert.True(await TryCreateJunctionAsync(linked, outside));
+        try
+        {
+            // Inside the root by its spelling, outside it in fact. The containment check alone
+            // cannot tell; the link check is what does.
+            Assert.Throws<InvalidOperationException>(
+                () => PathBoundary.EnsureSafeDestination(root, Path.Combine(linked, "b.gif"), "Exported animation"));
+        }
+        finally
+        {
+            Directory.Delete(linked);
+        }
+    }
+
+    internal static async Task<bool> TryCreateJunctionAsync(string link, string target)
+    {
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardError = true,
+        }.WithArguments("/d", "/c", "mklink", "/J", link, target));
+        if (process is null)
+        {
+            return false;
+        }
+
+        await process.WaitForExitAsync();
+        return process.ExitCode == 0 && Directory.Exists(link);
+    }
 }
 
 internal static class ProcessStartInfoExtensions

@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats;
 using SixLabors.ImageSharp.Formats.Gif;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
@@ -12,6 +13,12 @@ namespace VrcPicSorter.App.Services;
 
 public sealed class PreviewService : IDisposable
 {
+    /// <summary>
+    /// What every preview decode is allowed to cost. The header checks refuse an image that says
+    /// it is too big; this refuses one whose header understated it.
+    /// </summary>
+    private static readonly DecoderOptions BoundedOptions = new() { MaxFrames = ImageResourceLimits.MaximumFrames };
+
     private readonly Dictionary<System.Windows.Controls.Image, PreviewAnimation> _animations = [];
 
     /// <summary>
@@ -30,9 +37,10 @@ public sealed class PreviewService : IDisposable
 
         try
         {
+            ImageResourceLimits.EnsureEncodedSizeSafe(path);
             var info = SixLabors.ImageSharp.Image.Identify(path);
             ImageResourceLimits.EnsureSafe(info.Width, info.Height, Math.Max(1, info.FrameMetadataCollection.Count));
-            using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(path);
+            using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(BoundedOptions, path);
             image.Mutate(context => context.AutoOrient());
             if (image.Width > decodeWidth)
             {
@@ -120,9 +128,10 @@ public sealed class PreviewService : IDisposable
         string path,
         int decodeWidth)
     {
+        ImageResourceLimits.EnsureEncodedSizeSafe(path);
         var info = SixLabors.ImageSharp.Image.Identify(path);
         ImageResourceLimits.EnsureSafe(info.Width, info.Height, Math.Max(1, info.FrameMetadataCollection.Count));
-        using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(path);
+        using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(BoundedOptions, path);
         image.Mutate(context => context.AutoOrient());
         if (image.Width > decodeWidth)
         {

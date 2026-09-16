@@ -676,9 +676,11 @@ public sealed class ScanCoordinator
 
                 if (matches.Count > 0)
                 {
-                    // A match reported as 100% is the same picture, so the archived copy wins
-                    // without asking. Everything below 100% is a judgement call and goes to
-                    // review, as does a 100% match at a different resolution.
+                    // Only a copy that decodes to the very same pixels wins without asking. The
+                    // percentage beside a match is a ranking, not a proof: it is measured from a
+                    // handful of sampled frames and rounds to 100% for animations that differ on
+                    // half of theirs. Everything that is not provably the same picture - including
+                    // a match the screen would call 100% - goes to review.
                     IndexedImageRecord? duplicate = null;
                     foreach (var match in matches)
                     {

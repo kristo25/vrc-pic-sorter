@@ -307,6 +307,20 @@ public sealed class ReviewItem
 
     public long IndexGeneration { get; set; }
 
+    /// <summary>
+    /// Where a Keep incoming decision has already put the incoming image, once the first of its
+    /// two halves has committed.
+    /// </summary>
+    /// <remarks>
+    /// Keep incoming archives the incoming image and then removes the match it replaced, and the
+    /// two steps are separate durable writes. This is the phase between them, written as part of
+    /// the same update that adds the archive record: a retry reads it and resumes at the second
+    /// step instead of filing a second copy, and the removal of the last match reads it to know
+    /// the decision is complete. Null on a review that has not started one, and cleared again when
+    /// the decision closes.
+    /// </remarks>
+    public string? KeptIncomingArchivedPath { get; set; }
+
     public DateTimeOffset CreatedUtc { get; set; }
 
     public ScanRoutingContext RoutingContext { get; set; } = new();

@@ -109,17 +109,136 @@ public sealed class ArchiveRelocationTests
         var index = new CategoryIndexState { Category = VrcImageCategory.Emoji };
         state.ArchiveIndex.Categories.Add(index);
         var id = Guid.NewGuid();
-        index.Images.Add(new IndexedImageRecord { Id = id, Category = VrcImageCategory.Emoji, Path = Path.Combine(from, "2025-05", "a.png") });
+        var moved = Path.Combine(from, "2025-05", "a.png");
+        index.Images.Add(new IndexedImageRecord { Id = id, Category = VrcImageCategory.Emoji, Path = moved });
         index.Images.Add(new IndexedImageRecord { Id = Guid.NewGuid(), Category = VrcImageCategory.Emoji, Path = @"D:\elsewhere\b.png" });
 
         var rebased = ArchiveRelocation.RebaseIndex(
             state,
-            [new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 1, 1)]);
+            [new ArchiveRelocationMove(VrcImageCategory.Emoji, moved, Path.Combine(to, "2025-05", "a.png"))]);
 
         Assert.Equal(1, rebased);
         Assert.Equal(Path.Combine(to, "2025-05", "a.png"), index.Images[0].Path);
         Assert.Equal(id, index.Images[0].Id);
         Assert.Equal(@"D:\elsewhere\b.png", index.Images[1].Path);
+        Assert.Equal(1, index.Generation);
+    }
+
+    /// <summary>
+    /// The audit's fifth finding: a mixed batch rebased every record under the old root, including
+    /// the records of files that never moved.
+    /// </summary>
+    /// <remarks>
+    /// The collision is the dangerous half. A different image already filed under the same name at
+    /// the destination is exactly what a record must not be pointed at, because the old fingerprint
+    /// travels with the record and would then describe somebody else's picture.
+    /// </remarks>
+    [Fact]
+    public async Task OnlyTheFilesThatMovedAreRebased()
+    {
+        using var directory = new TestDirectory();
+        var from = directory.GetPath("old", "Emoji");
+        var to = directory.GetPath("new", "Emoji");
+        Directory.CreateDirectory(from);
+        Directory.CreateDirectory(to);
+        var movedFile = Path.Combine(from, "moved.png");
+        var collidingFile = Path.Combine(from, "same.png");
+        File.WriteAllText(movedFile, "moved");
+        File.WriteAllText(collidingFile, "mine");
+        File.WriteAllText(Path.Combine(to, "same.png"), "someone else's");
+
+        var state = new AppStateDocument();
+        var index = new CategoryIndexState { Category = VrcImageCategory.Emoji };
+        state.ArchiveIndex.Categories.Add(index);
+        var movedId = Guid.NewGuid();
+        var stayedId = Guid.NewGuid();
+        index.Images.Add(new IndexedImageRecord
+        {
+            Id = movedId,
+            Category = VrcImageCategory.Emoji,
+            Path = movedFile,
+            ExactFingerprint = "moved-fingerprint",
+        });
+        index.Images.Add(new IndexedImageRecord
+        {
+            Id = stayedId,
+            Category = VrcImageCategory.Emoji,
+            Path = collidingFile,
+            ExactFingerprint = "mine-fingerprint",
+        });
+
+        var review = new ReviewItem
+        {
+            Id = Guid.NewGuid(),
+            Category = VrcImageCategory.Emoji,
+            Status = ReviewStatus.Pending,
+            HeldFilePath = directory.GetPath("held", "incoming.png"),
+        };
+        review.Candidates.Add(new ReviewCandidate
+        {
+            Id = Guid.NewGuid(),
+            IndexedImageId = movedId,
+            ArchivePath = movedFile,
+        });
+        review.Candidates.Add(new ReviewCandidate
+        {
+            Id = Guid.NewGuid(),
+            IndexedImageId = stayedId,
+            ArchivePath = collidingFile,
+        });
+        state.ReviewQueue.Add(review);
+
+        var result = await ArchiveRelocation.RelocateAsync(
+            [new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 2, 9)]);
+
+        Assert.Equal(1, result.Moved);
+        Assert.Equal(1, result.LeftBehind);
+        var recorded = Assert.Single(result.Moves);
+        Assert.Equal(movedFile, recorded.From);
+        Assert.Equal(Path.Combine(to, "moved.png"), recorded.To);
+
+        Assert.Equal(1, ArchiveRelocation.RebaseIndex(state, result.Moves));
+
+        Assert.Equal(Path.Combine(to, "moved.png"), index.Images.Single(item => item.Id == movedId).Path);
+        Assert.Equal(collidingFile, index.Images.Single(item => item.Id == stayedId).Path);
+        Assert.Equal("mine", File.ReadAllText(collidingFile));
+        Assert.Equal("someone else's", File.ReadAllText(Path.Combine(to, "same.png")));
+        Assert.Equal(
+            Path.Combine(to, "moved.png"),
+            review.Candidates.Single(item => item.IndexedImageId == movedId).ArchivePath);
+        Assert.Equal(
+            collidingFile,
+            review.Candidates.Single(item => item.IndexedImageId == stayedId).ArchivePath);
+    }
+
+    /// <summary>
+    /// A relocation stopped part-way still has to say what it moved, or the index goes on naming
+    /// files that are no longer there and nothing can put it right.
+    /// </summary>
+    [Fact]
+    public async Task AStoppedRelocationStillReportsWhatItMoved()
+    {
+        using var directory = new TestDirectory();
+        var from = directory.GetPath("old", "Emoji");
+        var to = directory.GetPath("new", "Emoji");
+        Directory.CreateDirectory(from);
+        File.WriteAllText(Path.Combine(from, "a.png"), "a");
+        File.WriteAllText(Path.Combine(from, "b.png"), "b");
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var result = await ArchiveRelocation.RelocateAsync(
+            [new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 2, 2)],
+            cancellationToken: cancellation.Token);
+
+        Assert.Equal(0, result.Moved);
+        Assert.Empty(result.Moves);
+        Assert.Single(result.Errors);
+        Assert.True(File.Exists(Path.Combine(from, "a.png")));
+
+        // And it says it stopped. Reporting the same thing as a clean finish made an interrupted
+        // move look like one that had brought the whole archive across.
+        Assert.True(result.Stopped);
     }
 
     [Fact]

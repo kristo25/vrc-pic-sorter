@@ -49,6 +49,8 @@ public sealed class FileRouterTests
         var candidatePath = Path.Combine(archiveRoot, "candidate.png");
         using var original = ImageFixtureFactory.CreatePattern(10);
         var expected = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(original));
+        var survivorPath = Path.Combine(sourceRoot, "survivor.png");
+        await original.SaveAsPngAsync(survivorPath);
         using var replacement = ImageFixtureFactory.CreatePattern(11);
         await replacement.SaveAsPngAsync(candidatePath);
         using var store = CreateStore(directory, sourceRoot, archiveRoot);
@@ -63,7 +65,9 @@ public sealed class FileRouterTests
                     IndexedImageId = Guid.NewGuid(),
                     ArchivePath = candidatePath,
                     ExpectedFingerprint = expected.ExactIdentity,
-                }));
+                },
+                survivorPath,
+                expected.ExactIdentity));
 
         Assert.True(File.Exists(candidatePath));
         Assert.Empty(recycleBin.RecycledPaths);
@@ -90,7 +94,15 @@ public sealed class FileRouterTests
             IncomingFingerprint = "fingerprint",
         };
 
-        await Assert.ThrowsAsync<NotSupportedException>(() => router.KeepExistingAsync(review));
+        await Assert.ThrowsAsync<NotSupportedException>(
+            () => router.KeepExistingAsync(
+                review,
+                new ReviewCandidate
+                {
+                    IndexedImageId = Guid.NewGuid(),
+                    ArchivePath = Path.Combine(archiveRoot, "archived.png"),
+                    ExpectedFingerprint = "archived-fingerprint",
+                }));
 
         Assert.True(File.Exists(held));
         Assert.Empty((await store.LoadAsync()).OperationJournal);
@@ -726,6 +738,140 @@ public sealed class FileRouterTests
             .Single(item => item.Category == VrcImageCategory.Emoji).Images;
         Assert.Contains(images, item => item.Path == open.HeldFilePath);
         Assert.Equal(2, images.Count);
+
+        // And the review says in so many words that the first half is done, so a retry resumes at
+        // the second rather than working it out from the index and hoping.
+        Assert.Equal(open.HeldFilePath, open.KeptIncomingArchivedPath);
+    }
+
+    /// <summary>
+    /// Recovery finishing the second half must close the decision, not leave the review open.
+    /// </summary>
+    /// <remarks>
+    /// This is the shape the audit described: the archived match is removed hours later by journal
+    /// recovery, and the review was left pointing at an image the archive already owns and a match
+    /// that no longer exists. Nothing could be done with it but dismiss it.
+    /// </remarks>
+    [Fact]
+    public async Task RecoveryFinishingKeepIncomingClosesTheReview()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        using var incoming = ImageFixtureFactory.CreatePattern(seed: 93);
+        using var archived = ImageFixtureFactory.CreateNearDuplicate(incoming);
+        var heldPath = Path.Combine(sourceRoot, "held.png");
+        var candidatePath = Path.Combine(archiveRoot, "existing.png");
+        await incoming.SaveAsPngAsync(heldPath);
+        await archived.SaveAsPngAsync(candidatePath);
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var decoder = new ImageDecoder();
+        var (review, candidate) = await QueueReviewAsync(store, decoder, heldPath, candidatePath);
+
+        await Assert.ThrowsAsync<IOException>(
+            () => new FileRouter(store, decoder, new FakeRecycleBinService(throwOnRecycle: true))
+                .KeepIncomingOverMatchAsync(review, candidate));
+
+        var recycleBin = new FakeRecycleBinService();
+        await new FileRouter(store, decoder, recycleBin).RecoverPendingOperationsAsync();
+
+        Assert.Equal(candidatePath, Assert.Single(recycleBin.RecycledPaths));
+        var state = await store.LoadAsync();
+
+        // Exactly one retained incoming file, in the archive, and nothing left in the queue.
+        var images = state.ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji).Images;
+        Assert.Single(images);
+        Assert.True(File.Exists(images[0].Path));
+        Assert.Empty(state.ReviewQueue);
+        Assert.All(state.OperationJournal, entry => Assert.Equal(JournalPhase.Completed, entry.Phase));
+    }
+
+    /// <summary>
+    /// A pending recycle written before the app kept proof of the copy it was keeping.
+    /// </summary>
+    /// <remarks>
+    /// The audit's third finding in its oldest form: an entry from an earlier state format has no
+    /// survivor recorded, so there is nothing to re-check. Retrying it would be inheriting
+    /// permission to discard a file from a check nobody can see, which is exactly what must not
+    /// happen. It goes to Needs attention with the file untouched.
+    /// </remarks>
+    [Fact]
+    public async Task ARecycleWithNoRecordedSurvivorIsNeverRetried()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        using var image = ImageFixtureFactory.CreatePattern(seed: 94);
+        var incomingPath = Path.Combine(sourceRoot, "copy.png");
+        var survivorPath = Path.Combine(archiveRoot, "original.png");
+        await image.SaveAsPngAsync(incomingPath);
+        await image.SaveAsPngAsync(survivorPath);
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var decoder = new ImageDecoder();
+        var fingerprint = ImageFingerprint.Create((await decoder.DecodeAsync(incomingPath)).Image!);
+        await store.UpdateAsync(state =>
+        {
+            state.OperationJournal.Add(new JournalEntry
+            {
+                Id = Guid.NewGuid(),
+                Phase = JournalPhase.SideEffectStarted,
+                Purpose = JournalOperationPurpose.AutoKeepArchived,
+                OperationType = JournalOperationType.Recycle,
+                Category = VrcImageCategory.Emoji,
+                SourcePath = incomingPath,
+                ExpectedSource = new ExpectedFileIdentity
+                {
+                    Fingerprint = fingerprint.ExactIdentity,
+                    FileSize = new FileInfo(incomingPath).Length,
+                    LastWriteUtc = File.GetLastWriteTimeUtc(incomingPath),
+                },
+            });
+            return true;
+        });
+
+        var recycleBin = new FakeRecycleBinService();
+        await new FileRouter(store, decoder, recycleBin).RecoverPendingOperationsAsync();
+
+        Assert.Empty(recycleBin.RecycledPaths);
+        Assert.True(File.Exists(incomingPath));
+        Assert.True(File.Exists(survivorPath));
+        var entry = Assert.Single((await store.LoadAsync()).OperationJournal);
+        Assert.Equal(JournalPhase.NeedsAttention, entry.Phase);
+    }
+
+    /// <summary>
+    /// The same rule going in: an automatic recycle cannot even be recorded without naming the copy
+    /// it is keeping, so no future version can reintroduce an entry with nothing to re-check.
+    /// </summary>
+    [Fact]
+    public async Task ARecycleIntentWithoutASurvivorIsRefused()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var journal = new OperationJournal(store);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => journal.RecordIntentAsync(new JournalEntry
+            {
+                Id = Guid.NewGuid(),
+                OperationType = JournalOperationType.Recycle,
+                Purpose = JournalOperationPurpose.RemoveArchiveDuplicate,
+                Category = VrcImageCategory.Emoji,
+                SourcePath = Path.Combine(archiveRoot, "extra.png"),
+                IndexedImageId = Guid.NewGuid(),
+                ExpectedSource = new ExpectedFileIdentity { Fingerprint = "fingerprint" },
+            }));
+
+        Assert.Empty((await store.LoadAsync()).OperationJournal);
     }
 
     /// <summary>
@@ -767,6 +913,13 @@ public sealed class FileRouterTests
         // Resolving it is the end of it: a resolved review is compacted out of the queue rather
         // than kept with a status on it.
         Assert.Empty(state.ReviewQueue);
+
+        // Which is exactly why the history entry cannot be written only when the review is still
+        // findable. Removing the last match resolves it, compaction drops it on that same write,
+        // and the decision would have gone unrecorded on the ordinary success path.
+        Assert.Contains(
+            state.History,
+            entry => entry.Message.StartsWith("Kept the incoming image", StringComparison.Ordinal));
     }
 
     /// <summary>
@@ -974,11 +1127,13 @@ public sealed class FileRouterTests
         var indexed = await new ArchiveIndexer(store, decoder).RefreshAsync(VrcImageCategory.Emoji);
         Assert.Equal(IndexStatus.Current, indexed.Status);
         var state = await store.LoadAsync();
-        var record = state.ArchiveIndex.Categories
+        var images = state.ArchiveIndex.Categories
             .Single(item => item.Category == VrcImageCategory.Emoji)
-            .Images.Single(item => item.Path == extra);
+            .Images;
+        var record = images.Single(item => item.Path == extra);
+        var survivor = images.Single(item => item.Path == keep);
 
-        await router.RemoveArchivedDuplicateAsync(record);
+        await router.RemoveArchivedDuplicateAsync(record, survivor);
 
         Assert.Equal(extra, Assert.Single(recycleBin.RecycledPaths));
         Assert.True(File.Exists(keep));
@@ -1009,9 +1164,11 @@ public sealed class FileRouterTests
         var recycleBin = new FakeRecycleBinService();
         var router = new FileRouter(store, decoder, recycleBin);
         await new ArchiveIndexer(store, decoder).RefreshAsync(VrcImageCategory.Emoji);
-        var record = (await store.LoadAsync()).ArchiveIndex.Categories
+        var images = (await store.LoadAsync()).ArchiveIndex.Categories
             .Single(item => item.Category == VrcImageCategory.Emoji)
-            .Images.Single(item => item.Path == extra);
+            .Images;
+        var record = images.Single(item => item.Path == extra);
+        var survivor = images.Single(item => item.Path == keep);
 
         using (var replacement = ImageFixtureFactory.CreatePattern(seed: 82))
         {
@@ -1019,9 +1176,125 @@ public sealed class FileRouterTests
         }
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => router.RemoveArchivedDuplicateAsync(record));
+            () => router.RemoveArchivedDuplicateAsync(record, survivor));
         Assert.Empty(recycleBin.RecycledPaths);
         Assert.True(File.Exists(extra));
+    }
+
+    /// <summary>
+    /// The audit's second finding: cleanup dropped the copy it was keeping and passed only the
+    /// extra, so nothing could notice the keeper had gone.
+    /// </summary>
+    [Fact]
+    public async Task ADuplicateIsNotRemovedWhenTheCopyBeingKeptHasGone()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        using var image = ImageFixtureFactory.CreatePattern(seed: 83);
+        var keep = Path.Combine(archiveRoot, "emoji.png");
+        var extra = Path.Combine(archiveRoot, "emoji (2).png");
+        await image.SaveAsPngAsync(keep);
+        await image.SaveAsPngAsync(extra);
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var decoder = new ImageDecoder();
+        var recycleBin = new FakeRecycleBinService();
+        var router = new FileRouter(store, decoder, recycleBin);
+        await new ArchiveIndexer(store, decoder).RefreshAsync(VrcImageCategory.Emoji);
+        var images = (await store.LoadAsync()).ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji)
+            .Images;
+        var record = images.Single(item => item.Path == extra);
+        var survivor = images.Single(item => item.Path == keep);
+
+        File.Delete(keep);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => router.RemoveArchivedDuplicateAsync(record, survivor));
+
+        Assert.Empty(recycleBin.RecycledPaths);
+        Assert.True(File.Exists(extra));
+        Assert.Empty((await store.LoadAsync()).OperationJournal);
+    }
+
+    /// <summary>
+    /// The same again with the keeper replaced rather than removed. A file of the right name that
+    /// is the wrong picture is not a reason to discard anything.
+    /// </summary>
+    [Fact]
+    public async Task ADuplicateIsNotRemovedWhenTheCopyBeingKeptWasReplaced()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        using var image = ImageFixtureFactory.CreatePattern(seed: 84);
+        var keep = Path.Combine(archiveRoot, "emoji.png");
+        var extra = Path.Combine(archiveRoot, "emoji (2).png");
+        await image.SaveAsPngAsync(keep);
+        await image.SaveAsPngAsync(extra);
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var decoder = new ImageDecoder();
+        var recycleBin = new FakeRecycleBinService();
+        var router = new FileRouter(store, decoder, recycleBin);
+        await new ArchiveIndexer(store, decoder).RefreshAsync(VrcImageCategory.Emoji);
+        var images = (await store.LoadAsync()).ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji)
+            .Images;
+        var record = images.Single(item => item.Path == extra);
+        var survivor = images.Single(item => item.Path == keep);
+
+        using (var replacement = ImageFixtureFactory.CreatePattern(seed: 85))
+        {
+            await replacement.SaveAsPngAsync(keep);
+        }
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => router.RemoveArchivedDuplicateAsync(record, survivor));
+
+        Assert.Empty(recycleBin.RecycledPaths);
+        Assert.True(File.Exists(extra));
+    }
+
+    /// <summary>
+    /// Two index records naming one file are one file. Removing the "extra" would take the copy the
+    /// group promised to keep, so the pair is refused before anything is opened.
+    /// </summary>
+    [Fact]
+    public async Task ADuplicateGroupThatNamesOneFileTwiceIsRefused()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        using var image = ImageFixtureFactory.CreatePattern(seed: 86);
+        var only = Path.Combine(archiveRoot, "emoji.png");
+        await image.SaveAsPngAsync(only);
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var decoder = new ImageDecoder();
+        var recycleBin = new FakeRecycleBinService();
+        var router = new FileRouter(store, decoder, recycleBin);
+        await new ArchiveIndexer(store, decoder).RefreshAsync(VrcImageCategory.Emoji);
+        var record = (await store.LoadAsync()).ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji)
+            .Images.Single();
+        var twin = new IndexedImageRecord
+        {
+            Id = Guid.NewGuid(),
+            Category = record.Category,
+            Path = Path.Combine(archiveRoot, ".", "EMOJI.PNG"),
+            ExactFingerprint = record.ExactFingerprint,
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => router.RemoveArchivedDuplicateAsync(record, twin));
+
+        Assert.Empty(recycleBin.RecycledPaths);
+        Assert.True(File.Exists(only));
     }
 
     internal static JsonStateStore CreateStore(

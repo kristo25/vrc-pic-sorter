@@ -2,6 +2,7 @@ using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Gif;
 using SixLabors.ImageSharp.PixelFormats;
 using VrcPicSorter.Core.Atlas;
+using VrcPicSorter.Core.Imaging;
 
 namespace VrcPicSorter.Tests.Atlas;
 
@@ -462,6 +463,132 @@ public sealed class AtlasGifExporterTests
             Parse(name));
 
         Assert.Equal(AtlasGifExporter.EffectiveFramesPerSecondFor(17), result.EffectiveFramesPerSecond);
+    }
+
+    /// <summary>
+    /// The audit's sixth finding, at the exporter: the source was checked and the destination was
+    /// not, so a junction in place of the Animated folder took the export out of the archive.
+    /// </summary>
+    [Fact]
+    public async Task AnExportIsRefusedWhenAJunctionWouldRedirectIt()
+    {
+        using var directory = new TestDirectory();
+        const string name = "x_a_4frames_10fps_linearloopStyle.png";
+        var source = WriteSheet(directory, name, frames: 4, canvas: 128);
+        var archiveRoot = directory.GetPath("archive");
+        var outside = directory.GetPath("outside");
+        Directory.CreateDirectory(archiveRoot);
+        Directory.CreateDirectory(outside);
+        var linked = Path.Combine(archiveRoot, "Animated");
+        Assert.True(await global::VrcPicSorter.Tests.FileSystem.PathBoundaryTests.TryCreateJunctionAsync(linked, outside));
+
+        try
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => new AtlasGifExporter().ExportAsync(
+                    source,
+                    Path.Combine(linked, "2026-09", "emoji.gif"),
+                    Parse(name),
+                    archiveRoot));
+
+            // Nothing was written, and nothing outside the archive was touched.
+            Assert.Empty(Directory.GetFiles(outside, "*", SearchOption.AllDirectories));
+        }
+        finally
+        {
+            Directory.Delete(linked);
+        }
+    }
+
+    [Fact]
+    public async Task AnExportIsRefusedWhenItWouldLandOutsideTheArchive()
+    {
+        using var directory = new TestDirectory();
+        const string name = "x_a_4frames_10fps_linearloopStyle.png";
+        var source = WriteSheet(directory, name, frames: 4, canvas: 128);
+        var archiveRoot = directory.GetPath("archive");
+        Directory.CreateDirectory(archiveRoot);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new AtlasGifExporter().ExportAsync(
+                source,
+                directory.GetPath("elsewhere", "emoji.gif"),
+                Parse(name),
+                archiveRoot));
+
+        Assert.False(Directory.Exists(directory.GetPath("elsewhere")));
+    }
+
+    [Fact]
+    public async Task AnOrdinaryNewFolderInsideTheArchiveIsStillFine()
+    {
+        using var directory = new TestDirectory();
+        const string name = "x_a_4frames_10fps_linearloopStyle.png";
+        var source = WriteSheet(directory, name, frames: 4, canvas: 128);
+        var archiveRoot = directory.GetPath("archive");
+        Directory.CreateDirectory(archiveRoot);
+        var destination = Path.Combine(archiveRoot, "Animated", "2026-09", "emoji.gif");
+
+        var result = await new AtlasGifExporter().ExportAsync(source, destination, Parse(name), archiveRoot);
+
+        Assert.Equal(destination, result.Path);
+        Assert.True(File.Exists(destination));
+        Assert.Empty(Directory.GetFiles(archiveRoot, "*.tmp", SearchOption.AllDirectories));
+    }
+
+    /// <summary>
+    /// The audit's extra concern: the sheet was loaded whole and asked about its size afterwards.
+    /// </summary>
+    /// <remarks>
+    /// Bounded on purpose. A sheet wide enough to be refused is cheap to build at one pixel tall,
+    /// and it proves the limit is applied to the sheet path; that it is applied to the header
+    /// rather than to a decoded image is what the ordering in ExportAsync now says, and what
+    /// <see cref="TheEncodedFileIsMeasuredBeforeADecoderSeesIt"/> covers from the other end. No
+    /// test here deliberately exhausts memory to make its point.
+    /// </remarks>
+    [Fact]
+    public async Task ASheetPastTheResourceLimitIsRefused()
+    {
+        using var directory = new TestDirectory();
+        var path = directory.GetPath("sheets", "x_a_4frames_10fps_linearloopStyle.png");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using (var wide = new Image<Rgba32>(ImageResourceLimits.MaximumWidth + 8, 1))
+        {
+            await wide.SaveAsPngAsync(path);
+        }
+
+        var failure = await Assert.ThrowsAsync<InvalidDataException>(
+            () => new AtlasGifExporter().ExportAsync(
+                path,
+                directory.GetPath("out", "a.gif"),
+                new EmojiAtlasName(4, 10, AtlasLoopStyle.Linear)));
+
+        Assert.Contains("resource limit", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(directory.GetPath("out")));
+    }
+
+    /// <summary>
+    /// The gate that runs before anything is opened, let alone decoded.
+    /// </summary>
+    /// <remarks>
+    /// It measures the file on the path rather than anything that has been read, which is the whole
+    /// point: it is the only check available before a decoder has been handed the bytes. A file
+    /// that is not there is not its business - the open reports that in its own words.
+    /// </remarks>
+    [Fact]
+    public async Task TheEncodedFileIsMeasuredBeforeADecoderSeesIt()
+    {
+        using var directory = new TestDirectory();
+        var path = directory.GetPath("sheets", "ordinary.png");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using (var small = new Image<Rgba32>(8, 8))
+        {
+            await small.SaveAsPngAsync(path);
+        }
+
+        ImageResourceLimits.EnsureEncodedSizeSafe(path);
+        ImageResourceLimits.EnsureEncodedSizeSafe(directory.GetPath("sheets", "missing.png"));
+        Assert.True(new FileInfo(path).Length < ImageResourceLimits.MaximumEncodedBytes);
     }
 
     private static EmojiAtlasName Parse(string name)

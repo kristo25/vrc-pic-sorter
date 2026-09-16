@@ -54,18 +54,27 @@ public static class ImageMatcher
     public static MatchingProfileDefinition GetProfile(SimilarityProfile profile) => Profiles[profile];
 
     /// <summary>
-    /// A similarity score at or above this is the same picture, not merely a close one. It is
-    /// the point at which the reported percentage reads as 100%, so "shown as 100%" and
-    /// "resolved automatically" can never disagree.
+    /// The score at which the reported percentage rounds to 100%.
     /// </summary>
-    public const double IdenticalScoreThreshold = 0.995;
+    /// <remarks>
+    /// A presentation threshold and nothing more. It decides what a person is shown next to a
+    /// match; it does not decide anything about their files, and no code path may treat a number
+    /// on the screen as permission to discard one.
+    /// </remarks>
+    public const double DisplayedAsIdenticalThreshold = 0.995;
 
     /// <summary>
-    /// True when a ranked match can be resolved without asking the user: byte-identical decoded
-    /// pixels, or a 100% score at the same resolution and frame count. Two pictures at different
-    /// resolutions are never treated as identical, because deciding which one to keep is the
-    /// user's call, not the app's.
+    /// True when a ranked match can be resolved without asking anyone: the two images decode to
+    /// the very same pixels, at the same size, in the same frame order, with the same timing.
     /// </summary>
+    /// <remarks>
+    /// Perceptual similarity ranks matches for review. It never authorises a deletion, because it
+    /// cannot prove identity: an animation is compared on eight sampled frames, so a pair that
+    /// differs on half of its frames still scores a rounded 100%. The audit built exactly that
+    /// pair - two 16-frame GIFs, eight frames red against eight frames blue - and watched the
+    /// incoming image go to the Recycle Bin without anyone seeing it. Identity is the whole
+    /// decoded content or it is not identity.
+    /// </remarks>
     public static bool IsSamePicture(
         ImageMatchResult match,
         ImageFingerprint incoming,
@@ -75,15 +84,8 @@ public static class ImageMatcher
         ArgumentNullException.ThrowIfNull(incoming);
         ArgumentNullException.ThrowIfNull(candidate);
 
-        if (match.MatchKind == MatchKind.Exact)
-        {
-            return true;
-        }
-
-        return match.SimilarityScore >= IdenticalScoreThreshold
-            && incoming.Width == candidate.Width
-            && incoming.Height == candidate.Height
-            && incoming.FrameCount == candidate.FrameCount;
+        return match.MatchKind == MatchKind.Exact
+            && incoming.ExactIdentity.Equals(candidate.ExactIdentity, StringComparison.Ordinal);
     }
 
     public static ImageSimilarityMeasurement MeasureSimilarity(

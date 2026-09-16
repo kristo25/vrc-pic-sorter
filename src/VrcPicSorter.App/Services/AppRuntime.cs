@@ -79,15 +79,20 @@ public sealed class AppRuntime : IDisposable
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
         _ = await StateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
-        _ = await Router.RecoverPendingOperationsAsync(cancellationToken).ConfigureAwait(false);
 
-        // Moving the data folder leaves the paths recorded inside the document still naming the old
-        // one. Repaired on every start rather than only in the run that moved the folder, because a
-        // crash between the two would otherwise strand a setting pointing at a folder that is gone.
+        // Before recovery, not after. Moving the data folder leaves the paths recorded inside the
+        // document still naming the old one, and recovery is the first thing to act on them: an
+        // unfinished operation naming the vanished folder found neither its source nor its
+        // destination and went straight to Needs attention, where the repair that would have made
+        // it reconcilable arrived a moment too late to help. Repaired on every start rather than
+        // only in the run that moved the folder, because a crash between the two would otherwise
+        // strand a path pointing at a folder that is gone.
         if (_previousStateDirectory is { } previousDirectory)
         {
             await RepairMigratedPathsAsync(previousDirectory, cancellationToken).ConfigureAwait(false);
         }
+
+        _ = await Router.RecoverPendingOperationsAsync(cancellationToken).ConfigureAwait(false);
 
         // A start-with-Windows registration made under the old name would otherwise keep launching
         // whatever now sits at the old executable's path, while Settings reported the option as
@@ -103,14 +108,14 @@ public sealed class AppRuntime : IDisposable
         // Checked before writing: every start would otherwise rewrite the state document to say
         // exactly what it already said.
         var state = await StateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
-        if (!LocalDataMigration.NeedsRebase(state.Settings, previousDirectory))
+        if (!LocalDataMigration.NeedsRebase(state, previousDirectory, StateDirectory))
         {
             return;
         }
 
         _ = await StateStore.UpdateAsync(
                 document => LocalDataMigration.RebasePaths(
-                    document.Settings,
+                    document,
                     previousDirectory,
                     StateDirectory),
                 cancellationToken)

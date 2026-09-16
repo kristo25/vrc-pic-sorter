@@ -56,26 +56,20 @@ public static class LocalDataMigration
     }
 
     /// <summary>
-    /// True when a setting still names a path inside the old data folder.
+    /// True when anything the state document remembers still names a path inside the old data
+    /// folder.
     /// </summary>
     /// <remarks>
-    /// Moving the folder is only half the job. Paths are stored absolute, so a setting written
-    /// while the application had its old name goes on naming the old folder afterwards - which is
-    /// now a folder that does not exist. The holding root is the one that matters: it is derived
-    /// from the data folder, and clearing local data refuses to run when it sits outside it.
+    /// Moving the folder is only half the job. Paths are stored absolute, so everything written
+    /// while the application had its old name goes on naming the old folder afterwards - a folder
+    /// that is no longer there. Settings were repaired and nothing else was, which left the parts
+    /// that matter most: a held review pointing at a file under the vanished name could not be
+    /// decided, restored or dismissed, and an unfinished operation naming one could not be
+    /// reconciled. Asked before writing, so an ordinary start does not rewrite the document to say
+    /// exactly what it already said.
     /// </remarks>
-    public static bool NeedsRebase(AppSettings settings, string previousDirectory)
-    {
-        ArgumentNullException.ThrowIfNull(settings);
-        ArgumentException.ThrowIfNullOrWhiteSpace(previousDirectory);
-
-        return IsInside(settings.HoldingRootPath, previousDirectory)
-            || IsInside(settings.OutputRootPath, previousDirectory)
-            || settings.CategoryMappings.Any(mapping =>
-                IsInside(mapping.SourcePath, previousDirectory)
-                || IsInside(mapping.ArchivePath, previousDirectory))
-            || settings.LegacyArchiveMappings.Any(mapping => IsInside(mapping.ArchivePath, previousDirectory));
-    }
+    public static bool NeedsRebase(AppStateDocument state, string previousDirectory, string currentDirectory) =>
+        Apply(state, previousDirectory, currentDirectory, commit: false) > 0;
 
     /// <summary>
     /// Rewrites every stored path that sat inside <paramref name="previousDirectory"/> so it names
@@ -84,44 +78,185 @@ public static class LocalDataMigration
     /// <remarks>
     /// Paths outside the old data folder are left exactly as they are. Someone's archive on another
     /// drive has nothing to do with what this application is called.
+    /// <para>
+    /// Safe to run twice: a path that has been rewritten no longer sits inside the old folder, so
+    /// the second run finds nothing to do. Safe to run after an interruption for the same reason -
+    /// whatever was rewritten stays rewritten, and whatever was not is found again next time.
+    /// </para>
     /// </remarks>
     /// <returns>How many paths were rewritten.</returns>
-    public static int RebasePaths(AppSettings settings, string previousDirectory, string currentDirectory)
+    public static int RebasePaths(AppStateDocument state, string previousDirectory, string currentDirectory) =>
+        Apply(state, previousDirectory, currentDirectory, commit: true);
+
+    /// <summary>
+    /// Walks every path the document holds once, either counting what would move or moving it.
+    /// </summary>
+    /// <remarks>
+    /// One traversal for both questions on purpose. Two would drift, and the one that decides
+    /// whether to write is the one that must agree with the one that writes.
+    /// </remarks>
+    private static int Apply(
+        AppStateDocument state,
+        string previousDirectory,
+        string currentDirectory,
+        bool commit)
     {
-        ArgumentNullException.ThrowIfNull(settings);
+        ArgumentNullException.ThrowIfNull(state);
         ArgumentException.ThrowIfNullOrWhiteSpace(previousDirectory);
         ArgumentException.ThrowIfNullOrWhiteSpace(currentDirectory);
 
         var rebased = 0;
-        settings.HoldingRootPath = Rebase(settings.HoldingRootPath, previousDirectory, currentDirectory, ref rebased);
-        settings.OutputRootPath = Rebase(settings.OutputRootPath, previousDirectory, currentDirectory, ref rebased);
+        var settings = state.Settings;
+        settings.HoldingRootPath = Rebase(settings.HoldingRootPath, previousDirectory, currentDirectory, commit, ref rebased);
+        settings.OutputRootPath = Rebase(settings.OutputRootPath, previousDirectory, currentDirectory, commit, ref rebased);
 
         foreach (var mapping in settings.CategoryMappings)
         {
-            mapping.SourcePath = Rebase(mapping.SourcePath, previousDirectory, currentDirectory, ref rebased);
-            mapping.ArchivePath = Rebase(mapping.ArchivePath, previousDirectory, currentDirectory, ref rebased);
+            mapping.SourcePath = Rebase(mapping.SourcePath, previousDirectory, currentDirectory, commit, ref rebased);
+            mapping.ArchivePath = Rebase(mapping.ArchivePath, previousDirectory, currentDirectory, commit, ref rebased);
         }
 
         foreach (var mapping in settings.LegacyArchiveMappings)
         {
-            mapping.ArchivePath = Rebase(mapping.ArchivePath, previousDirectory, currentDirectory, ref rebased);
+            mapping.ArchivePath = Rebase(mapping.ArchivePath, previousDirectory, currentDirectory, commit, ref rebased);
+        }
+
+        foreach (var review in state.ReviewQueue)
+        {
+            RebaseReview(review, previousDirectory, currentDirectory, commit, ref rebased);
+        }
+
+        foreach (var category in state.ArchiveIndex.Categories)
+        {
+            foreach (var image in category.Images)
+            {
+                image.Path = Rebase(image.Path, previousDirectory, currentDirectory, commit, ref rebased);
+            }
+        }
+
+        foreach (var entry in state.OperationJournal)
+        {
+            entry.SourcePath = Rebase(entry.SourcePath, previousDirectory, currentDirectory, commit, ref rebased);
+            entry.DestinationPath = RebaseOptional(entry.DestinationPath, previousDirectory, currentDirectory, commit, ref rebased);
+            entry.SurvivingPath = RebaseOptional(entry.SurvivingPath, previousDirectory, currentDirectory, commit, ref rebased);
+            RebaseRouting(entry.RoutingContext, previousDirectory, currentDirectory, commit, ref rebased);
+
+            // The review an unfinished hold is carrying. It is not in the queue yet - that is what
+            // the unfinished half was going to do - so nothing else in this walk would reach it.
+            if (entry.ReviewItemAfterCommit is { } pendingReview)
+            {
+                RebaseReview(pendingReview, previousDirectory, currentDirectory, commit, ref rebased);
+            }
+
+            if (entry.IndexedImageAfterCommit is { } pendingRecord)
+            {
+                pendingRecord.Path = Rebase(pendingRecord.Path, previousDirectory, currentDirectory, commit, ref rebased);
+            }
         }
 
         return rebased;
     }
 
-    private static string Rebase(string path, string previousDirectory, string currentDirectory, ref int rebased)
+    private static void RebaseReview(
+        ReviewItem review,
+        string previousDirectory,
+        string currentDirectory,
+        bool commit,
+        ref int rebased)
+    {
+        review.HeldFilePath = Rebase(review.HeldFilePath, previousDirectory, currentDirectory, commit, ref rebased);
+        review.IncomingOriginalPath = Rebase(review.IncomingOriginalPath, previousDirectory, currentDirectory, commit, ref rebased);
+        review.KeptIncomingArchivedPath = RebaseOptional(review.KeptIncomingArchivedPath, previousDirectory, currentDirectory, commit, ref rebased);
+        RebaseRouting(review.RoutingContext, previousDirectory, currentDirectory, commit, ref rebased);
+
+        foreach (var candidate in review.Candidates)
+        {
+            candidate.ArchivePath = Rebase(candidate.ArchivePath, previousDirectory, currentDirectory, commit, ref rebased);
+        }
+    }
+
+    private static void RebaseRouting(
+        ScanRoutingContext? routing,
+        string previousDirectory,
+        string currentDirectory,
+        bool commit,
+        ref int rebased)
+    {
+        if (routing is null)
+        {
+            return;
+        }
+
+        routing.SourceRootPath = Rebase(routing.SourceRootPath, previousDirectory, currentDirectory, commit, ref rebased);
+        routing.OutputRootPath = Rebase(routing.OutputRootPath, previousDirectory, currentDirectory, commit, ref rebased);
+    }
+
+    private static string? RebaseOptional(
+        string? path,
+        string previousDirectory,
+        string currentDirectory,
+        bool commit,
+        ref int rebased) =>
+        path is null ? null : Rebase(path, previousDirectory, currentDirectory, commit, ref rebased);
+
+    private static string Rebase(
+        string path,
+        string previousDirectory,
+        string currentDirectory,
+        bool commit,
+        ref int rebased)
     {
         if (!IsInside(path, previousDirectory))
         {
             return path;
         }
 
+        // Both folders can exist at once - the carry-over declines when they do, rather than
+        // guessing which copy of the state document is the real one. A file that is genuinely
+        // still in the old folder, with nothing at the new place, stays named where it is: moving
+        // the name without the file would lose it.
         var relative = Path.GetRelativePath(previousDirectory, path);
+        var rebasedPath = relative == "." ? currentDirectory : Path.Combine(currentDirectory, relative);
+        if (Exists(path) && !Exists(rebasedPath))
+        {
+            return path;
+        }
+
         rebased++;
-        return relative == "." ? currentDirectory : Path.Combine(currentDirectory, relative);
+        return commit ? rebasedPath : path;
     }
 
-    private static bool IsInside(string path, string previousDirectory) =>
-        !string.IsNullOrWhiteSpace(path) && PathBoundary.Contains(previousDirectory, path);
+    private static bool Exists(string path)
+    {
+        try
+        {
+            return File.Exists(path) || Directory.Exists(path);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsInside(string path, string previousDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            return PathBoundary.Contains(previousDirectory, path);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            // This walks the whole state document now rather than a handful of settings, and it
+            // runs before anything else on every start. One unusable path left behind by some
+            // earlier version has to be stepped over, not allowed to stop the application.
+            return false;
+        }
+    }
 }

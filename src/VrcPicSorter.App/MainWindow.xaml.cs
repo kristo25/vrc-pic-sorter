@@ -1036,7 +1036,12 @@ public partial class MainWindow : Window
                         // Only the folders that actually emptied are forgotten. One that kept a
                         // file back is still a place images live.
                         var emptied = relocation.Where(step => IsEmptyNow(step.From)).ToArray();
-                        ArchiveRelocation.RebaseIndex(state, relocation);
+
+                        // Rebased from the files that moved, not from the folders it was tried on.
+                        // A collision or a failure leaves that record where it was, and pointing it
+                        // at the destination anyway named a file that had never arrived - or, when
+                        // the collision was a different image under the same name, the wrong one.
+                        ArchiveRelocation.RebaseIndex(state, result.Moves);
                         ArchiveRelocation.ForgetRelocated(state.Settings, emptied);
                         return true;
                     });
@@ -1044,9 +1049,15 @@ public partial class MainWindow : Window
                 await RefreshAsync();
                 await RefreshRetainedArchivesAsync();
                 SetStatus(
-                    result.LeftBehind == 0
-                        ? $"Moved {result.Moved} images into your archive."
-                        : $"Moved {result.Moved} images; {result.LeftBehind} were left where they are.");
+                    (result.Stopped, result.LeftBehind) switch
+                    {
+                        // A stopped run is not a finished one. It reported the same sentence as a
+                        // clean finish, so a move interrupted half way looked like a move that had
+                        // brought everything across.
+                        (true, _) => $"Stopped after moving {result.Moved} images; the rest are still where they were.",
+                        (false, 0) => $"Moved {result.Moved} images into your archive.",
+                        _ => $"Moved {result.Moved} images; {result.LeftBehind} were left where they are.",
+                    });
                 await ReportScanErrorsAsync(result.Errors);
             });
     }
@@ -1152,20 +1163,24 @@ public partial class MainWindow : Window
             return;
         }
 
-        var extras = _archiveDuplicates
+        // The copy each extra is being removed in favour of travels with it. Dropping it here and
+        // passing the extras alone is what let a removal go ahead with the keeper already gone -
+        // the router had nothing to check, so there was nothing to refuse.
+        var removals = _archiveDuplicates
             .Where(group => group.Kind == ArchiveDuplicateKind.Identical)
-            .SelectMany(group => group.Extras)
+            .SelectMany(group => group.Extras.Select(extra => (group.Keep, Extra: extra)))
             .ToArray();
-        if (extras.Length == 0)
+        if (removals.Length == 0)
         {
             return;
         }
 
         var confirmation = MessageBox.Show(
             this,
-            $"Send {extras.Length} extra copies to the Recycle Bin? Every one of them is the same "
+            $"Send {removals.Length} extra copies to the Recycle Bin? Every one of them is the same "
                 + "picture, byte for byte, as another copy that stays. Nothing is deleted "
-                + "permanently, and each file is checked to be unchanged before it goes.",
+                + "permanently, and both files are checked before either is touched: the copy "
+                + "going, and the copy it is going in favour of.",
             "Recycle the identical extras",
             MessageBoxButton.OKCancel,
             MessageBoxImage.Question);
@@ -1175,17 +1190,20 @@ public partial class MainWindow : Window
         }
 
         await RunBusyAsync(
-            $"Recycling {extras.Length} duplicate copies...",
+            $"Recycling {removals.Length} duplicate copies...",
             async () =>
             {
                 var removed = 0;
                 var failures = new List<string>();
-                foreach (var extra in extras)
+                foreach (var removal in removals)
                 {
                     CurrentCancellation.ThrowIfCancellationRequested();
                     try
                     {
-                        await _runtime.Router.RemoveArchivedDuplicateAsync(extra, CurrentCancellation);
+                        await _runtime.Router.RemoveArchivedDuplicateAsync(
+                            removal.Extra,
+                            removal.Keep,
+                            CurrentCancellation);
                         removed++;
                     }
                     catch (Exception exception) when (
@@ -1194,9 +1212,10 @@ public partial class MainWindow : Window
                             or IOException
                             or UnauthorizedAccessException)
                     {
-                        // One copy that changed, or a drive that cannot recycle, must not stop the
-                        // rest. Nothing is ever deleted outright to get past it.
-                        failures.Add($"{extra.Path}: {exception.Message}");
+                        // One copy that changed, a keeper that is no longer there, or a drive that
+                        // cannot recycle, must not stop the rest. Nothing is ever deleted outright
+                        // to get past it.
+                        failures.Add($"{removal.Extra.Path}: {exception.Message}");
                     }
                 }
 

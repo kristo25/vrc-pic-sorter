@@ -119,6 +119,19 @@ public sealed class AtlasAnimationWriter
     }
 
     /// <summary>
+    /// The folder an animation for <paramref name="archivedPath"/> is allowed to be written inside.
+    /// </summary>
+    /// <remarks>
+    /// The same folder <see cref="BuildDestination"/> measures from, handed to the exporter so a
+    /// link cannot move the finished file out of it.
+    /// </remarks>
+    public static string DestinationRoot(string archivedPath, string archiveRoot)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(archivedPath);
+        return Locate(archivedPath, archiveRoot).Root;
+    }
+
+    /// <summary>
     /// Where the atlas itself belongs once its animation exists: one level below the animation, so
     /// the folder reads as the GIFs plus the sheets they were cut from.
     /// </summary>
@@ -203,8 +216,9 @@ public sealed class AtlasAnimationWriter
         try
         {
             var destination = BuildDestination(archivedPath, archiveRoot);
+            var destinationRoot = DestinationRoot(archivedPath, archiveRoot);
             var exported = await _exporter
-                .ExportAsync(archivedPath, destination, name, cancellationToken)
+                .ExportAsync(archivedPath, destination, name, destinationRoot, cancellationToken)
                 .ConfigureAwait(false);
             return new AtlasAnimationResult(true, exported.Path, null, exported.Note);
         }

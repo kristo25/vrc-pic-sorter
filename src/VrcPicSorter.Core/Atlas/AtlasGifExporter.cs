@@ -67,12 +67,26 @@ public sealed class AtlasGifExporter
         string sourcePath,
         string destinationPath,
         EmojiAtlasName name,
+        string? allowedDestinationRoot = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sourcePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
         ArgumentNullException.ThrowIfNull(name);
         PathBoundary.EnsureNoReparsePoints(sourcePath, "Atlas image");
+
+        // Where the finished file will land is checked before a single pixel is read. The source
+        // was always checked and the destination never was, so a junction standing in for the
+        // Animated folder took every export out of the archive - to somewhere nobody would think
+        // to look, over whatever happened to be sitting there.
+        var temporaryPath = destinationPath + ".tmp";
+        EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
+        EnsureDestinationIsSafe(temporaryPath, allowedDestinationRoot);
+
+        // Measured before it is opened, and its header read before it is decoded. Loading first
+        // and asking about the size afterwards means the allocation this limit exists to prevent
+        // has already happened by the time the limit is consulted.
+        ImageResourceLimits.EnsureEncodedSizeSafe(sourcePath);
 
         // A file that already carries several frames is an animation, not a sheet. VRChat's own
         // exported GIF sits beside its sheet under the identical name, so this is the only thing
@@ -86,11 +100,18 @@ public sealed class AtlasGifExporter
             FileOptions.Asynchronous | FileOptions.SequentialScan))
         {
             var info = await Image.IdentifyAsync(probe, cancellationToken).ConfigureAwait(false);
-            if (info is not null && info.FrameMetadataCollection.Count > 1)
+            if (info is null)
+            {
+                throw new InvalidDataException("The image header could not be read.");
+            }
+
+            if (info.FrameMetadataCollection.Count > 1)
             {
                 throw new InvalidOperationException(
                     "This image is already animated. A sprite sheet has to be a single still image.");
             }
+
+            ImageResourceLimits.EnsureSafe(info.Width, info.Height, 1);
         }
 
         var options = new DecoderOptions { MaxFrames = 1 };
@@ -187,7 +208,11 @@ public sealed class AtlasGifExporter
                 Directory.CreateDirectory(directory);
             }
 
-            var temporaryPath = destinationPath + ".tmp";
+            // Checked again now the folder exists. The first check proved no link stood between
+            // here and the nearest folder that did exist; this one covers anything that appeared
+            // while the frames were being cut, including a folder created for us.
+            EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
+            EnsureDestinationIsSafe(temporaryPath, allowedDestinationRoot);
             await animation.SaveAsync(temporaryPath, Encoder, cancellationToken).ConfigureAwait(false);
             File.Move(temporaryPath, destinationPath, overwrite: true);
             return new AtlasExportResult(
@@ -201,5 +226,24 @@ public sealed class AtlasGifExporter
         {
             animation?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Refuses a destination a link would redirect, and one outside the folder the caller allowed.
+    /// </summary>
+    /// <remarks>
+    /// A caller that names no root still gets the link check. Refusing to export at all without one
+    /// would break every direct use of the exporter, and the link check is the half that stops the
+    /// file leaving the folder it was addressed to.
+    /// </remarks>
+    private static void EnsureDestinationIsSafe(string path, string? allowedRoot)
+    {
+        if (string.IsNullOrWhiteSpace(allowedRoot))
+        {
+            PathBoundary.EnsureNoReparsePoints(path, "Exported animation");
+            return;
+        }
+
+        PathBoundary.EnsureSafeDestination(allowedRoot, path, "Exported animation");
     }
 }

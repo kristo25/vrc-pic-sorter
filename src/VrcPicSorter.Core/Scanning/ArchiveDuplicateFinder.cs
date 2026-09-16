@@ -1,4 +1,5 @@
 using VrcPicSorter.Core.Atlas;
+using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Models;
 
 namespace VrcPicSorter.Core.Scanning;
@@ -49,8 +50,21 @@ public static class ArchiveDuplicateFinder
         var groups = new List<ArchiveDuplicateGroup>();
         var survivors = new List<IndexedImageRecord>();
 
-        foreach (var identical in index.Images
-            .Where(image => !string.IsNullOrWhiteSpace(image.Path))
+        // Two records naming the same file are one file. An index that has picked up a second
+        // record for a path - two spellings of it, or the same one written twice after an
+        // interrupted rebuild - would otherwise report a picture as its own duplicate, and
+        // recycling the extra would take the very copy the group promised to keep.
+        var distinct = new List<IndexedImageRecord>(index.Images.Count);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var image in index.Images.Where(item => !string.IsNullOrWhiteSpace(item.Path)))
+        {
+            if (seen.Add(NormalizePath(image.Path)))
+            {
+                distinct.Add(image);
+            }
+        }
+
+        foreach (var identical in distinct
             .GroupBy(image => image.ExactFingerprint, StringComparer.Ordinal))
         {
             var ordered = identical.OrderBy(image => image, PreferByName).ToArray();
@@ -83,6 +97,26 @@ public static class ArchiveDuplicateFinder
             .OrderBy(group => group.Kind)
             .ThenBy(group => group.Keep.Path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    /// <summary>
+    /// One spelling per file, so a path written two ways counts once.
+    /// </summary>
+    /// <remarks>
+    /// A path the filesystem will not accept cannot be normalized, and is left as written. Two
+    /// such records would still be caught by the router, which checks the files themselves.
+    /// </remarks>
+    private static string NormalizePath(string path)
+    {
+        try
+        {
+            return PathBoundary.Normalize(path);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return path;
+        }
     }
 
     /// <summary>

@@ -1,4 +1,5 @@
 using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats;
 using SixLabors.ImageSharp.PixelFormats;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Imaging;
@@ -106,10 +107,13 @@ public static class AtlasInspector
         // list, so an image far larger than it claims - or simply an enormous one - would otherwise
         // be decoded whole on a thread-pool thread with nothing to stop it.
         PathBoundary.EnsureNoReparsePoints(atlasPath, "Sheet");
+        ImageResourceLimits.EnsureEncodedSizeSafe(atlasPath);
         var info = Image.Identify(atlasPath);
         ImageResourceLimits.EnsureSafe(info.Width, info.Height, 1);
 
-        using var atlas = Image.Load<Rgba32>(atlasPath);
+        // A sheet is a still, so one frame is all that is ever wanted from it. Without the bound a
+        // file that is really an animation would be decoded whole before anything noticed.
+        using var atlas = Image.Load<Rgba32>(new DecoderOptions { MaxFrames = 1 }, atlasPath);
         return AtlasLayout.TryCreate(name.FrameCount, atlas.Width, atlas.Height, out var layout)
             ? Inspect(atlas, layout)
             : null;
