@@ -472,19 +472,22 @@ public sealed class ScanCoordinator
         // whatever is missing, which also means a deleted animation comes back on the next scan.
         // A sheet whose pixels contradict its name is left for the Animations tab rather than
         // reported here, or it would warn on every scan forever.
-        var animated = await AnimateArchivedSheetsAsync(
+        var backfill = await AnimateArchivedSheetsAsync(
                 category,
                 mapping.ArchivePath,
                 errors,
                 notes,
                 cancellationToken)
             .ConfigureAwait(false);
+        var animated = backfill.Written;
 
         // Those animations are archived images, and they were written after the index was built,
         // so the index does not know about them. Left that way they are invisible to matching for
         // the rest of this scan, and an incoming copy of one of them is archived again as though
         // the app had never made it. Only the new files are decoded here; everything else is reused.
-        if (animated > 0)
+        // Filing a sheet moves it, so the index is out of date after that too - not only after an
+        // animation is written.
+        if (backfill.ChangedTheArchive)
         {
             var reindexed = await _indexer.RefreshAsync(category, cancellationToken).ConfigureAwait(false);
             if (reindexed.Status != IndexStatus.Current)
@@ -1344,7 +1347,15 @@ public sealed class ScanCoordinator
     /// and offering a grid of thumbnails where an emoji was expected. A sheet whose animation
     /// exists has finished being a still; leaving it in the way was the side effect, not moving it.
     /// </remarks>
-    private async Task<int> AnimateArchivedSheetsAsync(
+    /// <param name="Written">Animations this run created.</param>
+    /// <param name="Filed">Sheets it moved to sit beside an animation.</param>
+    private sealed record BackfillResult(int Written, int Filed)
+    {
+        /// <summary>True when the archive changed, so the index no longer describes it.</summary>
+        public bool ChangedTheArchive => Written > 0 || Filed > 0;
+    }
+
+    private async Task<BackfillResult> AnimateArchivedSheetsAsync(
         VrcImageCategory category,
         string archiveRoot,
         List<string> errors,
@@ -1362,6 +1373,11 @@ public sealed class ScanCoordinator
         var existing = animated.Count;
 
         var pending = new List<IndexedImageRecord>();
+
+        // Sheets whose animation already exists and which are still sitting among the stills. They
+        // are the ones this used to leave behind: nothing to write for them, so the loop skipped
+        // them outright and they stayed in the emoji folder for good.
+        var strays = new List<IndexedImageRecord>();
         foreach (var image in index.Images)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1382,6 +1398,11 @@ public sealed class ScanCoordinator
             // earlier sheet in this same run already claimed it.
             if (!animated.Add(EmojiIdentity.KeyFor(image.Path)))
             {
+                if (!AtlasAnimationWriter.IsReferenceFolder(image.Path))
+                {
+                    strays.Add(image);
+                }
+
                 continue;
             }
 
@@ -1398,7 +1419,7 @@ public sealed class ScanCoordinator
                 $"Stopped before writing {pending.Count} animations into a folder that already holds "
                     + $"{existing}. The animations already there are not being recognised, and writing "
                     + "these would leave two of each. Nothing was written.");
-            return 0;
+            return new BackfillResult(0, 0);
         }
 
         var written = 0;
@@ -1458,7 +1479,35 @@ public sealed class ScanCoordinator
             }
         }
 
-        return written;
+        // The ones that were animated before this filed anything. Their animation is already
+        // there, so there was nothing to write and nothing brought them along; they are caught up
+        // with here rather than left among the emoji forever.
+        var caughtUp = 0;
+        foreach (var stray in strays)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (stray.Fingerprint is not { } strayFingerprint)
+            {
+                continue;
+            }
+
+            var filed = await FileAnimatedSheetAsync(
+                    stray.Id,
+                    stray.Path,
+                    category,
+                    strayFingerprint,
+                    archiveRoot,
+                    errors,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (filed is not null)
+            {
+                caughtUp++;
+                notes.Add($"{stray.Path}: its animation already existed, so the sheet was filed beside it.");
+            }
+        }
+
+        return new BackfillResult(written, caughtUp);
     }
 
     /// <summary>

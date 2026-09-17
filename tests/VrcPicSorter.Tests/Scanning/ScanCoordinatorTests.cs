@@ -1526,6 +1526,56 @@ public sealed class ScanCoordinatorTests
     }
 
     /// <summary>
+    /// A sheet animated before any of this existed is caught up with rather than left behind.
+    /// </summary>
+    /// <remarks>
+    /// The four sheets found sitting in a real Emoji folder were exactly this: their animation had
+    /// been made long ago, so there was nothing left to write for them and the backfill skipped
+    /// them outright. Nothing brought them along, and nothing ever would have.
+    /// </remarks>
+    [Fact]
+    public async Task ASheetAnimatedLongAgoIsFiledOnTheNextScan()
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        const string sheetName = "player_x_4frames_10fps_linearloopStyle.png";
+        var archivedSheet = Path.Combine(archiveRoot, sheetName);
+        WriteSheet(archivedSheet);
+        using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+        var coordinator = CreateCoordinator(store);
+
+        // The first scan animates it and files it, which is the fixed behaviour. Put the sheet
+        // back where a version that only ever wrote the GIF would have left it.
+        await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        var filed = Path.Combine(
+            archiveRoot, "Animated", "Gif Ref", sheetName);
+        Assert.True(File.Exists(filed));
+        File.Move(filed, archivedSheet);
+        Directory.Delete(Path.GetDirectoryName(filed)!, recursive: true);
+        Assert.True(File.Exists(Path.Combine(
+            archiveRoot, "Animated", "player_x_4frames_10fps_linearloopStyle.gif")));
+
+        var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+
+        // Nothing to animate - the GIF is already there - and the sheet still comes along.
+        Assert.Equal(0, result.Animated);
+        Assert.Empty(result.Errors);
+        Assert.True(File.Exists(filed));
+        Assert.False(File.Exists(archivedSheet));
+        Assert.Empty(Directory.GetFiles(archiveRoot));
+
+        // And the index followed it, rather than describing a file that is no longer there.
+        var images = (await store.LoadAsync()).ArchiveIndex.Categories
+            .Single(item => item.Category == VrcImageCategory.Emoji).Images;
+        Assert.Contains(images, item => string.Equals(item.Path, filed, StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(
+            images,
+            item => string.Equals(item.Path, archivedSheet, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
     /// A ready-made GIF for an emoji the archive has already animated never becomes a second copy.
     /// </summary>
     /// <remarks>
