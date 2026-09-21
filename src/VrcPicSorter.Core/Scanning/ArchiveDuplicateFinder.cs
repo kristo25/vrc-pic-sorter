@@ -10,10 +10,8 @@ public enum ArchiveDuplicateKind
     Identical,
 
     /// <summary>
-    /// The same animation of the same emoji, encoded twice: VRChat's own GIF beside the one this
-    /// app exported from the sheet. Not the same bytes, but the same emoji and the same frame
-    /// count, rate and loop direction - which is VRChat's own account of its own inventory item,
-    /// not a resemblance anything guessed at.
+    /// Animations whose names describe the same emoji, frame count, rate and loop direction.
+    /// Naming metadata does not prove equal decoded content; these are review suggestions only.
     /// </summary>
     SameAnimation,
 
@@ -32,6 +30,8 @@ public sealed record ArchiveDuplicateGroup(
     IndexedImageRecord Keep,
     IReadOnlyList<IndexedImageRecord> Extras)
 {
+    public bool IsRemovable => Kind == ArchiveDuplicateKind.Identical;
+
     public long ReclaimableBytes => Extras.Sum(item => item.FileSize);
 }
 
@@ -97,10 +97,8 @@ public static class ArchiveDuplicateFinder
                 continue;
             }
 
-            // Animations whose names agree on every animation parameter are the same animation,
-            // whatever their bytes say. Separated out because that is a thing the app can act on:
-            // one of them is the file every other part of the app addresses by name, and the other
-            // is the copy that could not have that name. Anything else stays a report.
+            // Matching names help a person review likely copies, but do not establish decoded
+            // equality. SameAnimation groups remain advisory and cannot authorize removal.
             foreach (var byAnimation in sameEmoji.GroupBy(AnimationParameters))
             {
                 if (byAnimation.Count() < 2)
@@ -139,8 +137,8 @@ public static class ArchiveDuplicateFinder
     /// parameters in its name.
     /// </summary>
     /// <remarks>
-    /// Grouping by this is what separates "the same animation twice" from "the same emoji at two
-    /// sizes". A null is its own group per file - a name that says nothing about what it plays
+    /// Grouping by this distinguishes matching animation metadata from other same-emoji
+    /// suggestions. An unknown is its own group per file - a name that says nothing about what it plays
     /// cannot be used to say two files play the same thing.
     /// </remarks>
     private static object AnimationParameters(IndexedImageRecord image)

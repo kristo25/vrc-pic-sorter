@@ -60,7 +60,7 @@ public sealed record ArchivedAnimationDuplicate(
     string AnimationPath,
     IReadOnlyList<string> ExistingCopies);
 
-public sealed class ScanCoordinator
+public sealed partial class ScanCoordinator
 {
     /// <summary>
     /// How many images may be read and fingerprinted at once. Reading is pure - it touches no
@@ -92,6 +92,15 @@ public sealed class ScanCoordinator
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _settleDelay;
     private readonly SemaphoreSlim _scanGate = new(1, 1);
+
+    /// <summary>Runs a settings application or relocation between scanner operations.
+    /// The callback must not call another scanner entry point or stop the watcher.</summary>
+    public async Task RunExclusiveAsync(Func<Task> action, CancellationToken cancellationToken = default)
+    {
+        await _scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { await action().ConfigureAwait(false); }
+        finally { _scanGate.Release(); }
+    }
     private readonly AtlasAnimationWriter _animationWriter = new();
 
     public ScanCoordinator(
@@ -169,7 +178,8 @@ public sealed class ScanCoordinator
                                 processingProgress?.Report(
                                     new ScanProcessingProgress(processedImages, totalImages, activity, file));
                             },
-                            cancellationToken)
+                            cancellationToken,
+                            reconcileAllPending: true)
                         .ConfigureAwait(false));
                 }
                 catch (Exception exception) when (
@@ -361,7 +371,8 @@ public sealed class ScanCoordinator
         SourceSnapshot? sourceSnapshot,
         Action<string, string?>? onImageScanned,
         Action<string, string?>? onImageProcessed,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool reconcileAllPending = false)
     {
         await _stateStore.HoldFingerprintWritesAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -373,7 +384,8 @@ public sealed class ScanCoordinator
                     sourceSnapshot,
                     onImageScanned,
                     onImageProcessed,
-                    cancellationToken)
+                    cancellationToken,
+                    reconcileAllPending)
                 .ConfigureAwait(false);
         }
         finally
@@ -391,7 +403,8 @@ public sealed class ScanCoordinator
         SourceSnapshot? sourceSnapshot,
         Action<string, string?>? onImageScanned,
         Action<string, string?>? onImageProcessed,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool reconcileAllPending)
     {
         var initial = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
         if (!initial.Settings.OutputRootConfirmed)
@@ -501,7 +514,48 @@ public sealed class ScanCoordinator
             }
         }
 
-        var paths = sourceSnapshot.Paths;
+        var resolvedQueuedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var requestedPaths = sourceSnapshot.Paths.Select(PathBoundary.Normalize)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var refreshed = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var archivedImages = refreshed.ArchiveIndex.Categories.Single(item => item.Category == category).Images;
+        foreach (var waiting in refreshed.ReviewQueue.Where(item =>
+                     item.Category == category && item.Status == ReviewStatus.Pending
+                     && (reconcileAllPending || requestedPaths.Contains(PathBoundary.Normalize(item.IncomingOriginalPath)))
+                     && item.IncomingImageFingerprint is not null
+                     && item.Candidates.Any(candidate => candidate.MatchKind == MatchKind.Exact)))
+        {
+            var duplicate = archivedImages.FirstOrDefault(image =>
+                image.ExactFingerprint == waiting.IncomingFingerprint);
+            if (duplicate is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                await _router.AutoKeepArchivedAsync(
+                    waiting.HeldFilePath, category, waiting.IncomingImageFingerprint!,
+                    duplicate.Path, duplicate.ExactFingerprint, cancellationToken, waiting.Id).ConfigureAwait(false);
+                resolvedQueuedPaths.Add(waiting.IncomingOriginalPath);
+                autoKept++;
+                if (sourceSnapshot.Paths.Contains(waiting.IncomingOriginalPath, StringComparer.OrdinalIgnoreCase))
+                {
+                    examined++;
+                    var name = Path.GetFileName(waiting.IncomingOriginalPath);
+                    onImageScanned?.Invoke("Resolved queued exact match", name);
+                    onImageProcessed?.Invoke("Resolved queued exact match", name);
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                                                 or InvalidOperationException or NotSupportedException)
+            {
+                errors.Add($"{waiting.HeldFilePath}: could not resolve queued exact match ({exception.Message}).");
+            }
+        }
+
+        initial = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var paths = sourceSnapshot.Paths.Where(path => !resolvedQueuedPaths.Contains(path)).ToList();
         skipped = sourceSnapshot.UnsupportedFiles;
         var settledPaths = await FindSettledPathsAsync(paths, cancellationToken).ConfigureAwait(false);
         var queuedPaths = initial.ReviewQueue
@@ -701,10 +755,13 @@ public sealed class ScanCoordinator
                     }
                 }
 
+                var thresholds = current.Settings.CustomSimilarityThresholds;
+                thresholds?.Validate();
                 var matches = ImageMatcher.RankCandidates(
                     fingerprint,
                     candidates,
-                    current.Settings.SimilarityProfile);
+                    current.Settings.SimilarityProfile,
+                    thresholds?.MinimumPercent / 100);
 
                 // VRChat hands over its own ready-made GIF for an emoji this app has already
                 // animated. The two are the same animation encoded twice, so they are not the same
@@ -719,11 +776,8 @@ public sealed class ScanCoordinator
 
                 if (matches.Count > 0)
                 {
-                    // Only a copy that decodes to the very same pixels wins without asking. The
-                    // percentage beside a match is a ranking, not a proof: it is measured from a
-                    // handful of sampled frames and rounds to 100% for animations that differ on
-                    // half of theirs. Everything that is not provably the same picture - including
-                    // a match the screen would call 100% - goes to review.
+                    // Exact identity permits the existing permanent-removal fallback. Custom
+                    // score-based decisions below use recycling only, never that fallback.
                     IndexedImageRecord? duplicate = null;
                     foreach (var match in matches)
                     {
@@ -749,7 +803,7 @@ public sealed class ScanCoordinator
                                     cancellationToken)
                                 .ConfigureAwait(false);
                             autoKept++;
-                            outcome = "Exact duplicate recycled";
+                            outcome = "Exact duplicate resolved; archived copy kept";
                             continue;
                         }
                         catch (Exception exception) when (
@@ -758,9 +812,7 @@ public sealed class ScanCoordinator
                                 or IOException
                                 or UnauthorizedAccessException)
                         {
-                            // The Recycle Bin was unavailable, or the archived copy changed
-                            // between indexing and now. Never delete and never drop the image:
-                            // fall through and let the user decide.
+                            // A copy changed or removal failed. Keep the incoming file in review.
                             errors.Add($"{path}: could not resolve automatically ({exception.Message}).");
                         }
                     }
@@ -795,6 +847,25 @@ public sealed class ScanCoordinator
                             .ToList(),
                     };
                     await _router.QueueForReviewAsync(review, cancellationToken).ConfigureAwait(false);
+                    var best = review.Candidates.OrderByDescending(candidate => candidate.SimilarityScore).First();
+                    if (duplicate is null && thresholds is not null
+                        && best.SimilarityScore >= thresholds.MaximumPercent / 100)
+                    {
+                        try
+                        {
+                            // Reuse verified, journaled review routing. Non-identical copies
+                            // must remain recoverable even when their score rounds to 100%.
+                            await _router.KeepMatchAsync(review, best, cancellationToken).ConfigureAwait(false);
+                            autoKept++;
+                            outcome = "Similarity limit reached; incoming recycled and archived copy kept";
+                            continue;
+                        }
+                        catch (Exception exception) when (exception is NotSupportedException
+                            or InvalidOperationException or IOException or UnauthorizedAccessException)
+                        {
+                            errors.Add($"{path}: automatic recycling unavailable or failed; check review/recovery ({exception.Message}).");
+                        }
+                    }
                     queuedPaths.Add(path);
                     heldByIdentity.TryAdd(fingerprint.ExactIdentity, new HeldImage(path, fingerprint));
                     held++;
@@ -919,7 +990,7 @@ public sealed class ScanCoordinator
                         Kind = ActivityKind.Scan,
                         Level = errors.Count == 0 ? ActivityLevel.Information : ActivityLevel.Warning,
                         Category = category,
-                        Message = $"Scanned {sourceRoot}: {examined} examined, {moved} moved, {animated} animated, {autoKept} exact duplicates recycled, {held} queued, {skipped} skipped, {errors.Count} failed.",
+                        Message = $"Scanned {sourceRoot}: {examined} examined, {moved} moved, {animated} animated, {autoKept} exact duplicates resolved, {held} queued, {skipped} skipped, {errors.Count} failed.",
                         SourcePath = sourceRoot,
                     });
                     return true;
@@ -950,8 +1021,7 @@ public sealed class ScanCoordinator
 
         try
         {
-            var destination = AtlasAnimationWriter.BuildDestination(archivedPath, archiveRoot);
-            if (File.Exists(destination))
+            if (AtlasAnimationWriter.FindExistingAnimation(archivedPath, archiveRoot) is { } destination)
             {
                 return await AdoptAsync(destination, name, cancellationToken).ConfigureAwait(false);
             }
@@ -1033,7 +1103,10 @@ public sealed class ScanCoordinator
 
         try
         {
-            var companionPath = AtlasAnimationWriter.BuildDestination(sheet.Path, archiveRoot);
+            var ownerState = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+            archiveRoot = ArchiveOwner.Resolve(ownerState.Settings, index.Category, sheet.Path);
+            var companionPath = AtlasAnimationWriter.FindExistingAnimation(sheet.Path, archiveRoot)
+                ?? AtlasAnimationWriter.BuildDestination(sheet.Path, archiveRoot);
 
             // Animations are indexed, so the sheet's own is usually already a candidate. Adding a
             // second record for the same file would put two rows with one path into the review,
@@ -1120,6 +1193,21 @@ public sealed class ScanCoordinator
         IReadOnlyCollection<ExportedAnimation> exported,
         CancellationToken cancellationToken = default)
     {
+        await _scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await FinishExportedAnimationsCoreAsync(exported, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    private async Task<ExportedAnimationFollowUp> FinishExportedAnimationsCoreAsync(
+        IReadOnlyCollection<ExportedAnimation> exported,
+        CancellationToken cancellationToken = default)
+    {
         ArgumentNullException.ThrowIfNull(exported);
 
         var filed = new List<string>();
@@ -1142,6 +1230,7 @@ public sealed class ScanCoordinator
                     $"{category}: the new animation could not be added to the archive index "
                         + $"({string.Join("; ", refreshed.Errors)}). Run a scan to pick it up.");
             }
+            warnings.AddRange(refreshed.SkippedFiles.Select(error => $"{category}: {error}"));
         }
 
         var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
@@ -1298,7 +1387,13 @@ public sealed class ScanCoordinator
     {
         try
         {
+            var ownerState = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+            archiveRoot = ArchiveOwner.Resolve(ownerState.Settings, category, archivedPath);
             var reference = AtlasAnimationWriter.BuildReferenceDestination(archivedPath, archiveRoot);
+            if (string.Equals(Path.GetFullPath(archivedPath), Path.GetFullPath(reference), StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
 
             // Two different sheets can carry the same file name - the archive root disambiguates
             // them, but the first one filed vacates that name, so the second arrives thinking it is
@@ -1369,7 +1464,24 @@ public sealed class ScanCoordinator
         // Which emoji already have an animation, whatever their file happens to be called. Read
         // from the folder rather than from the index, because this is a question about what is on
         // disk and the index can be a scan behind it.
-        var animated = ReadAnimatedEmoji(archiveRoot);
+        var owners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var image in index.Images.Where(image => EmojiAtlasName.TryParse(image.Path, out _)))
+        {
+            try
+            {
+                owners[image.Path] = ArchiveOwner.Resolve(state.Settings, category, image.Path);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                or InvalidOperationException or ArgumentException or NotSupportedException)
+            {
+                errors.Add($"{image.Path}: could not resolve archive ownership ({exception.Message})");
+                return new BackfillResult(0, 0);
+            }
+        }
+        var animatedByRoot = owners.Values.Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(root => root, ReadAnimatedEmoji, StringComparer.OrdinalIgnoreCase);
+        var animated = new HashSet<string>(animatedByRoot.SelectMany(pair =>
+            pair.Value.Select(key => pair.Key + "|" + key)), StringComparer.OrdinalIgnoreCase);
         var existing = animated.Count;
 
         var pending = new List<IndexedImageRecord>();
@@ -1396,7 +1508,7 @@ public sealed class ScanCoordinator
 
             // Add answers both questions at once: is this emoji already animated, and has an
             // earlier sheet in this same run already claimed it.
-            if (!animated.Add(EmojiIdentity.KeyFor(image.Path)))
+            if (!animated.Add(owners[image.Path] + "|" + EmojiIdentity.KeyFor(image.Path)))
             {
                 if (!AtlasAnimationWriter.IsReferenceFolder(image.Path))
                 {
@@ -1425,6 +1537,7 @@ public sealed class ScanCoordinator
         var written = 0;
         foreach (var image in pending)
         {
+            archiveRoot = owners[image.Path];
             cancellationToken.ThrowIfCancellationRequested();
             try
             {

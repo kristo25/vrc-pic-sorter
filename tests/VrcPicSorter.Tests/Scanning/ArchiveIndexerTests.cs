@@ -9,6 +9,36 @@ namespace VrcPicSorter.Tests.Scanning;
 
 public sealed class ArchiveIndexerTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnavailableConfiguredRootPreservesCachedIndex(bool currentUnavailable)
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var current = directory.GetPath("archive", "Emoji");
+        var retained = directory.GetPath("retained");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(current);
+        Directory.CreateDirectory(retained);
+        using var image = ImageFixtureFactory.CreatePattern(207);
+        var original = Path.Combine(currentUnavailable ? current : retained, "keeper.png");
+        await image.SaveAsPngAsync(original);
+        using var store = FileRouterTests.CreateStore(directory, source, current);
+        await store.UpdateAsync(state => { state.Settings.LegacyArchiveMappings.Add(
+            new LegacyArchiveMapping { Category = VrcImageCategory.Emoji, ArchivePath = retained }); return true; });
+        var indexer = new ArchiveIndexer(store, new ImageDecoder());
+        Assert.Equal(IndexStatus.Current, (await indexer.RefreshAsync(VrcImageCategory.Emoji)).Status);
+        var unavailable = currentUnavailable ? current : retained;
+        Directory.Move(unavailable, unavailable + "-offline");
+        var result = await indexer.RefreshAsync(VrcImageCategory.Emoji);
+        Assert.Equal(IndexStatus.Unavailable, result.Status);
+        Assert.NotEmpty(result.Errors);
+        Assert.Equal(original, Assert.Single((await store.LoadAsync()).ArchiveIndex.Categories[0].Images).Path);
+        Directory.Move(unavailable + "-offline", unavailable);
+        Assert.Equal(IndexStatus.Current, (await indexer.RefreshAsync(VrcImageCategory.Emoji)).Status);
+    }
+
     [Fact]
     public async Task RefreshReusesPersistedFingerprintForUnchangedFile()
     {
@@ -119,7 +149,7 @@ public sealed class ArchiveIndexerTests
     }
 
     [Fact]
-    public async Task UnreadableArchiveFileIsSkippedWithoutDisablingTheCategory()
+    public async Task UnreadableArchiveFilePreventsClaimingCompleteCoverage()
     {
         using var directory = new TestDirectory();
         var sourceRoot = directory.GetPath("incoming");
@@ -141,11 +171,11 @@ public sealed class ArchiveIndexerTests
         var result = await indexer.RefreshAsync(VrcImageCategory.Emoji);
         var index = (await store.LoadAsync()).ArchiveIndex.Categories[0];
 
-        Assert.Equal(IndexStatus.Current, result.Status);
-        Assert.Equal(IndexStatus.Current, index.Status);
-        Assert.Empty(result.Errors);
+        Assert.Equal(IndexStatus.Unavailable, result.Status);
+        Assert.Equal(IndexStatus.Unavailable, index.Status);
+        Assert.NotEmpty(result.Errors);
         Assert.Contains(unreadable, Assert.Single(result.SkippedFiles));
-        Assert.Equal(readable, Assert.Single(index.Images).Path);
+        Assert.Empty(index.Images);
         Assert.NotNull(index.LastError);
     }
 }

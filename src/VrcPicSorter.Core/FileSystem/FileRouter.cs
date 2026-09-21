@@ -192,9 +192,8 @@ public sealed class FileRouter
 
     /// <summary>
     /// Resolves an exact duplicate without review: the archived image is kept and the incoming
-    /// copy goes to the Recycle Bin. Throws <see cref="NotSupportedException"/> when the Recycle
-    /// Bin is unavailable for the incoming path, so the caller can fall back to a review instead
-    /// of ever deleting permanently.
+    /// copy goes to the Recycle Bin, or is permanently deleted when recycling is unavailable.
+    /// Both decoded identities and the surviving archived copy are verified before removal.
     /// </summary>
     public async Task AutoKeepArchivedAsync(
         string incomingPath,
@@ -202,9 +201,15 @@ public sealed class FileRouter
         ImageFingerprint incomingFingerprint,
         string archivePath,
         string archiveFingerprint,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Guid? reviewItemId = null)
     {
         ArgumentNullException.ThrowIfNull(incomingFingerprint);
+
+        if (!string.Equals(incomingFingerprint.ExactIdentity, archiveFingerprint, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Automatic resolution requires an exact archived copy.");
+        }
 
         // The archived copy must still be exactly what was indexed before the incoming one is
         // discarded, otherwise this would delete the only remaining copy.
@@ -222,7 +227,23 @@ public sealed class FileRouter
             JournalOperationPurpose.AutoKeepArchived);
         entry.SurvivingPath = archivePath;
         entry.SurvivingFingerprint = archiveFingerprint;
-        await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
+        entry.ReviewItemId = reviewItemId;
+        await VerifySurvivingCopyAsync(entry, cancellationToken).ConfigureAwait(false);
+        if (_recycleBin.CanRecycle(incomingPath))
+        {
+            await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            entry.OperationType = JournalOperationType.DeleteExactIncoming;
+            await VerifySurvivingCopyAsync(entry, cancellationToken).ConfigureAwait(false);
+            await VerifyExpectedSourceAsync(entry, cancellationToken).ConfigureAwait(false);
+            await _journal.RecordIntentAsync(entry, cancellationToken).ConfigureAwait(false);
+            await _journal.AdvanceAsync(entry.Id, JournalPhase.SideEffectStarted, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            await ApplySideEffectAsync(entry, cancellationToken).ConfigureAwait(false);
+            await CommitMutationAsync(entry, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -868,6 +889,7 @@ public sealed class FileRouter
                         await CommitMutationAsync(entry, cancellationToken).ConfigureAwait(false);
                         break;
                     case JournalReconciliationAction.CommitState:
+                        await VerifySurvivingCopyAsync(entry, cancellationToken).ConfigureAwait(false);
                         await RestoreCarriedFingerprintAsync(entry, cancellationToken).ConfigureAwait(false);
                         await CommitMutationAsync(entry, cancellationToken).ConfigureAwait(false);
                         break;
@@ -900,6 +922,8 @@ public sealed class FileRouter
                     or NotSupportedException)
             {
                 await MarkNeedsAttentionAsync(entry.Id, exception.Message, cancellationToken).ConfigureAwait(false);
+                decisions[^1] = new JournalReconciliationDecision(entry.Id,
+                    JournalReconciliationAction.NeedsAttention, exception.Message);
             }
         }
 
@@ -987,6 +1011,21 @@ public sealed class FileRouter
 
     private async Task ApplySideEffectAsync(JournalEntry entry, CancellationToken cancellationToken)
     {
+        if (entry.OperationType == JournalOperationType.DeleteExactIncoming)
+        {
+            if (entry.Purpose != JournalOperationPurpose.AutoKeepArchived
+                || !string.Equals(entry.ExpectedSource.Fingerprint, entry.SurvivingFingerprint, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("Permanent deletion requires an exact archived survivor.");
+            }
+
+            await VerifySurvivingCopyAsync(entry, cancellationToken).ConfigureAwait(false);
+            await VerifyExpectedSourceAsync(entry, cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Delete(entry.SourcePath);
+            return;
+        }
+
         if (entry.OperationType == JournalOperationType.Recycle)
         {
             await _recycleBin.RecycleAsync(entry.SourcePath, cancellationToken).ConfigureAwait(false);
@@ -1030,14 +1069,14 @@ public sealed class FileRouter
         if (PathsMatch(entry.SourcePath, path))
         {
             throw new InvalidOperationException(
-                "This pending operation names the same file as the copy it would keep, so nothing was discarded.");
+                "This pending operation names the same file as the copy it would keep. No further removal was attempted.");
         }
 
         await VerifyImageFingerprintAsync(
                 path,
                 fingerprint,
                 "The copy this one would have been discarded in favour of is no longer there, "
-                    + "so nothing was discarded.",
+                    + "so no further removal was attempted.",
                 cancellationToken)
             .ConfigureAwait(false);
     }
@@ -1256,6 +1295,8 @@ public sealed class FileRouter
             Category = entry.Category,
             Message = entry.Purpose switch
             {
+                JournalOperationPurpose.AutoKeepArchived when entry.OperationType == JournalOperationType.DeleteExactIncoming =>
+                    "Exact duplicate: kept the archived image and permanently deleted the incoming copy (Recycle Bin unavailable).",
                 JournalOperationPurpose.AutoKeepArchived =>
                     "Exact duplicate: kept the archived image and recycled the incoming copy.",
                 JournalOperationPurpose.AutoKeepHeld =>
@@ -1493,7 +1534,7 @@ public sealed class FileRouter
     {
         var source = await ObservePathAsync(entry.SourcePath, entry.ExpectedSource.Fingerprint, cancellationToken)
             .ConfigureAwait(false);
-        if (entry.OperationType == JournalOperationType.Recycle)
+        if (entry.OperationType is JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming)
         {
             return new JournalFileObservation(source);
         }
@@ -1511,15 +1552,36 @@ public sealed class FileRouter
         string expectedFingerprint,
         CancellationToken cancellationToken)
     {
-        if (!File.Exists(path))
+        try
         {
-            return JournalPathState.Missing;
+            PathBoundary.EnsureNoReparsePoints(path, "Recovery path");
+            _ = File.GetAttributes(path);
+        }
+        catch (FileNotFoundException)
+        {
+            // A failed Exists check also means denied/offline. Only a successful complete
+            // parent enumeration establishes absence; a missing parent remains ambiguous.
+            try
+            {
+                var parent = Path.GetDirectoryName(Path.GetFullPath(path))!;
+                var entries = Directory.GetFileSystemEntries(parent);
+                return entries.Any(entry => string.Equals(Path.GetFullPath(entry), Path.GetFullPath(path),
+                    StringComparison.OrdinalIgnoreCase)) ? JournalPathState.Unavailable : JournalPathState.Missing;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                return JournalPathState.Unavailable;
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            return JournalPathState.Unavailable;
         }
 
         var decoded = await _decoder.DecodeAsync(path, cancellationToken).ConfigureAwait(false);
         if (!decoded.IsSuccess)
         {
-            return JournalPathState.DifferentFile;
+            return JournalPathState.Unavailable;
         }
 
         return ImageFingerprint.Create(decoded.Image!).ExactIdentity == expectedFingerprint

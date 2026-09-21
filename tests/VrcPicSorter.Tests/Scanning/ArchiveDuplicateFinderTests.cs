@@ -5,6 +5,17 @@ namespace VrcPicSorter.Tests.Scanning;
 
 public sealed class ArchiveDuplicateFinderTests
 {
+    [Theory]
+    [InlineData(ArchiveDuplicateKind.Identical, true)]
+    [InlineData(ArchiveDuplicateKind.SameAnimation, false)]
+    [InlineData(ArchiveDuplicateKind.SameEmoji, false)]
+    public void OnlyDecodedIdenticalCopiesCanBeRemoved(ArchiveDuplicateKind kind, bool removable)
+    {
+        var group = new ArchiveDuplicateGroup(kind, Record(@"C:\a\original.gif", "A"),
+            [Record(@"C:\a\copy.gif", "B")]);
+        Assert.Equal(removable, group.IsRemovable);
+    }
+
     private const string Id = "11111111-2222-3333-4444-555555555555";
 
     [Fact]
@@ -88,14 +99,11 @@ public sealed class ArchiveDuplicateFinderTests
     /// exported from the sheet, under the very same name plus a copy number.
     /// </summary>
     /// <remarks>
-    /// Names taken verbatim from the archive this was reported against, where about forty pairs of
-    /// them had accumulated. They are not the same bytes and never will be - one is VRChat's
-    /// encoding and the other this app's - so nothing that compares pixels could ever offer to
-    /// tidy them. What says they are the same animation is VRChat's own account of its own
-    /// inventory item: the emoji id, and the frame count, rate and loop direction in both names.
+    /// The inventory ID and animation parameters in the names support a review suggestion.
+    /// Different decoded fingerprints mean the app cannot safely remove either copy on that basis.
     /// </remarks>
     [Fact]
-    public void TheSameAnimationEncodedTwiceIsSomethingTheAppCanActOn()
+    public void MatchingAnimationNamesWithDifferentFingerprintsAreOnlyAReviewSuggestion()
     {
         const string original =
             @"C:\Animated\_ShadowRogue__inv_b191ba0d-fdcd-427b-8386-3daab2b8cff9"
@@ -109,8 +117,9 @@ public sealed class ArchiveDuplicateFinderTests
             Record(original, "BBB", size: 569889))));
 
         Assert.Equal(ArchiveDuplicateKind.SameAnimation, group.Kind);
+        Assert.False(group.IsRemovable);
 
-        // The copy that kept the name stays: it is the one every other part of the app addresses.
+        // The tidier name is only the suggested keeper; this group cannot authorize recycling.
         Assert.Equal(original, group.Keep.Path);
         Assert.Equal(copy, Assert.Single(group.Extras).Path);
         Assert.Equal(694109, group.ReclaimableBytes);

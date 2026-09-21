@@ -6,8 +6,8 @@ VRC Pic Sorter is a local Windows tool for reviewing duplicate and similar image
 
 - Filenames and metadata do not determine image identity.
 - Exact matches use normalized decoded pixels, dimensions, GIF frame order, and frame timing.
-- **Images that match an archived image 100% are resolved automatically**: the archived copy is kept and the incoming copy goes to the Windows Recycle Bin, without asking. See *Automatic duplicate resolution* below.
-- Anything below 100%, and any 100% match at a different resolution, is always reviewed by you.
+- **Exact decoded matches are resolved automatically**: the archived copy is kept and the incoming copy is recycled, or permanently deleted when recycling is unavailable. See *Automatic duplicate resolution* below.
+- Non-exact matches go to review by default. Opt-in custom similarity limits can recycle incoming near matches automatically; they never enable permanent deletion of non-exact images.
 - Images are processed in path order. Each unique image moves into the archive immediately, so later files in the same scan are compared against the updated archive.
 - Possible matches remain in their incoming folders while the Review queue stores references to them; scanning does not create or move a review copy.
 - Clearing the Review queue leaves those incoming files untouched. Reviews created by older versions are still returned safely from the legacy holding folder.
@@ -16,28 +16,48 @@ VRC Pic Sorter is a local Windows tool for reviewing duplicate and similar image
 - Oversized or unusually frame-heavy images are rejected before full decoding to protect application memory.
 - Interrupted moves and recycle requests are recorded in a durable operation journal and reconciled on restart.
 - Archive fingerprints are stored locally and reused when a file's path, size, and modification time are unchanged. Every scan refreshes additions, removals, and changed files before matching.
-- Settings save automatically when a field is committed. A source folder that does not exist yet is reported inline rather than refused, so a folder that appears later still works; only overlapping source and output folders block a save. Scanning creates the output folder on demand and never creates a source folder.
+- Settings save automatically when a field is committed; the newest choice wins and destination labels show saved settings. Unsafe overlaps with source, holding, or retained archive folders block the change. Scanning creates the output folder on demand and never creates a source folder.
+- An unavailable archive root or unreadable supported archive image pauses changes for that category until coverage is complete. Cached records remain intact. An offline source is not treated as proof that a pending deletion succeeded.
 - Animating a sheet only adds files. The sheet itself is kept and filed beside the GIF made from it, never deleted, and an existing animation is never overwritten by a sheet arriving later.
 - Tests use temporary folders and never access the configured VRCX or archive folders.
 
 ## Automatic duplicate resolution
 
-An incoming image is resolved without asking only when it is the *same picture* as one already
-in the archive. That means either byte-identical decoded pixels, or a similarity score of 100%
-**at the same resolution and frame count**. In that case the archived copy is kept and the
-incoming copy is moved to the Windows Recycle Bin.
+By default, an incoming image is resolved without asking only when it is the *same picture* as one already
+in the archive. That requires an exact decoded fingerprint, including every frame and its timing;
+a rounded similarity score of 100% is not enough. In that case the archived copy is kept and the
+incoming copy is moved to the Windows Recycle Bin. When recycling is unavailable (for example,
+on a network share), the exact incoming duplicate is permanently deleted after both copies are
+rechecked. History explicitly records permanent deletion. **Scan now** also retries pending exact
+matches in enabled categories, including those from a previously scanned extra folder. Watcher
+events and **Scan another folder** only resolve incoming files within that scan's captured scope.
 
 Three deliberate limits on this:
 
-- A 100% match at a **different resolution** is never automatic. Choosing between a larger and a
-  smaller copy is your decision, so it goes to the review queue.
+- A 100% match at a **different resolution** goes to review unless custom similarity limits are enabled.
 - The archived copy's fingerprint is re-verified immediately before the incoming copy is
-  discarded, so the last remaining copy of an image can never be thrown away.
-- If the Recycle Bin is unavailable, or anything else fails, the image is queued for review
-  instead. Permanent deletion is never used as a fallback.
+  discarded; changed or missing keepers prevent automatic removal.
+- Changed, unreadable, or missing copies prevent automatic removal and leave the item for review.
+  Non-exact matches never use the permanent-deletion fallback.
 
-Recovering an automatically resolved image means restoring it from the Recycle Bin. Every one is
-recorded in **History**.
+Recycled copies can be restored from the Recycle Bin. Permanently removed incoming copies cannot;
+the verified archive copy is kept. **History** distinguishes these outcomes.
+
+## Custom similarity limits
+
+In **Settings**, enable **Use custom similarity limits** to override the preset with percentages from 0 to 100. Minimum must not exceed maximum; decimals are allowed.
+
+- Below minimum: archive as unique.
+- At minimum and below maximum: queue for review.
+- At or above maximum: keep the archived copy and recycle incoming. If recycling is unavailable, a non-exact incoming file remains for review. Both copies are revalidated before recycling.
+
+Limits use the raw score, not the rounded displayed percentage. Exact duplicates retain the existing verified removal rules. Changes apply to newly analyzed files; existing review items remain manual decisions. Known variants of the same animated emoji still receive review even below minimum, preserving duplicate-GIF protection. Disabling custom limits restores the selected preset. Existing saved settings default to custom limits disabled.
+
+## Visual matching
+
+Still images retain full-canvas comparisons and an additional view without fully transparent borders. Border alignment applies only when canvas dimensions differ and the visible content has a compatible aspect ratio; moving artwork within the same canvas remains a layout change. Animations retain detailed frame samples and now compare compact summaries of every decoded frame, allowing cyclic loop alignment while lowering confidence when an unsampled frame differs.
+
+Similarity percentages are estimates, not probabilities or proof of identity. Compact animation summaries can miss small changes, and some edited or shifted images still need manual review. Exact-match removal continues to require the complete decoded fingerprint. Fingerprint feature version 5 causes older cached visual features to be recomputed during archive refresh.
 
 ## Animated emoji
 
@@ -63,6 +83,17 @@ what gets written.
 **Frames**, **Frames per second**, and **Loop** can each be corrected before exporting, for the
 occasional sheet whose name is wrong. **Export GIF** writes it; **Export missing** does every sheet
 that has no animation yet.
+
+Missing-only export and scans recognize retained numbered GIFs such as `name (2).gif`, even
+before they are indexed. They leave that animation unchanged instead of recreating `name.gif`.
+Manual **Export GIF** can replace the displayed animation after confirmation; if its content
+changes after the list was loaded, refresh the list and confirm again. An unreadable archive
+shows an error and disables export instead of presenting an empty queue.
+
+The duplicate report in **Settings** refreshes the archive folders before listing copies.
+Only equal decoded fingerprints qualify for bulk recycling. Same-emoji GIFs with different
+pixels or timing remain listed for comparison and are preserved. An incomplete archive check
+disables bulk recycling and explains which folders or files could not be read.
 
 **Skip** sets aside a sheet not worth animating. Nothing is moved or deleted - the sheet stops
 counting as work still to do, and stops being decoded on every scan. A skip is remembered by the
@@ -125,6 +156,12 @@ The app suggests category folders beneath that root. Source paths remain editabl
 - **PreserveIncomingRelativeFolder** writes `<output>\Emoji\2025-05\image.png`, recreating whatever folders the image already sat in under its source.
 
 Changing this decides where new files go. Existing archived files are not moved.
+
+Use **Settings > Retained archives > Move them into my archive** to relocate old archives explicitly.
+Overlapping relocation folders are refused, and inaccessible folders remain listed with an error.
+Moving runs in the background; Stop finishes the current file and prevents the next move. Completed
+changes remain after a partial failure or cancellation. Existing GIFs in retained dated folders are
+reused in their original archive until it is explicitly relocated.
 
 **Start with Windows** launches the app in background watching mode. Ordinary launches begin with watching stopped.
 

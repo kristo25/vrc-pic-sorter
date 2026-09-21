@@ -374,6 +374,23 @@
                         <ComboBox x:Name="SimilarityCombo" Grid.Column="1" SelectionChanged="SettingsSelectionChanged" />
                     </Grid>
 
+                    <StackPanel Margin="0,0,0,20">
+                        <CheckBox x:Name="CustomSimilarityLimits" Content="Use custom similarity limits (overrides preset)"
+                                  Checked="SettingsToggled" Unchecked="SettingsToggled" />
+                        <StackPanel Orientation="Horizontal" Margin="0,10,0,8" IsEnabled="{Binding IsChecked, ElementName=CustomSimilarityLimits}">
+                            <TextBlock Text="Minimum %" VerticalAlignment="Center" Margin="0,0,8,0" />
+                            <TextBox x:Name="MinimumSimilarity" Width="75" Margin="0,0,24,0"
+                                     LostFocus="SettingsFieldCommitted" KeyDown="SettingsFieldKeyDown"
+                                     automation:AutomationProperties.Name="Minimum similarity percent for review" />
+                            <TextBlock Text="Maximum %" VerticalAlignment="Center" Margin="0,0,8,0" />
+                            <TextBox x:Name="MaximumSimilarity" Width="75"
+                                     LostFocus="SettingsFieldCommitted" KeyDown="SettingsFieldKeyDown"
+                                     automation:AutomationProperties.Name="Similarity percent for automatically keeping archive" />
+                        </StackPanel>
+                        <TextBlock TextWrapping="Wrap" Foreground="{StaticResource MutedTextBrush}" FontSize="12"
+                                   Text="0–100%. Below minimum: archive as unique. From minimum up to maximum: review. At or above maximum: keep the archive and recycle incoming. If recycling is unavailable, non-exact matches stay for review. Exact duplicates keep their existing removal rules. Applies to newly analyzed files; existing review items stay for review. Known animation variants may still require review below minimum." />
+                    </StackPanel>
+
                     <Grid Margin="0,0,0,20">
                         <Grid.ColumnDefinitions><ColumnDefinition Width="210" /><ColumnDefinition Width="300" /></Grid.ColumnDefinitions>
                         <StackPanel>

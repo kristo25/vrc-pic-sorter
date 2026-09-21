@@ -6,6 +6,16 @@ namespace VrcPicSorter.Tests.Services;
 public sealed class SettingsDraftTests
 {
     [Fact]
+    public void OutputNestedInExistingArchiveIsRejected()
+    {
+        using var directory = new TestDirectory();
+        var state = AppStateDefaults.Create(directory.GetPath("profile"), directory.GetPath("local"));
+        var archive = state.Settings.CategoryMappings.Single(m => m.Category == VrcImageCategory.Emoji).ArchivePath;
+        var draft = Draft(Path.Combine(archive, "new-output"), VrcImageCategory.Emoji, directory.GetPath("incoming"));
+        Assert.NotNull(draft.DescribeBlockingProblem(state.Settings));
+    }
+
+    [Fact]
     public void ApplyUsesOneOutputRootAndOnlyStalesChangedCategories()
     {
         using var directory = new TestDirectory();
@@ -49,6 +59,7 @@ public sealed class SettingsDraftTests
     {
         using var directory = new TestDirectory();
         var state = AppStateDefaults.Create(directory.GetPath("profile"), directory.GetPath("local"));
+        state.Settings.OutputRootIsSuggested = false; // Previously selected archive, possibly offline.
         foreach (var index in state.ArchiveIndex.Categories)
         {
             index.Status = IndexStatus.Current;
@@ -74,6 +85,25 @@ public sealed class SettingsDraftTests
             pair => Assert.Contains(
                 state.Settings.LegacyArchiveMappings,
                 legacy => legacy.Category == pair.Key && legacy.ArchivePath == pair.Value));
+    }
+
+    [Fact]
+    public void PreviouslyUnusedOutputIsRetainedWhenItsParentBecomesUnavailable()
+    {
+        using var directory = new TestDirectory();
+        var state = AppStateDefaults.Create(directory.GetPath("profile"), directory.GetPath("local"));
+        var firstOutput = directory.GetPath("first-output");
+        Directory.CreateDirectory(firstOutput);
+        Draft(firstOutput, VrcImageCategory.Emoji, directory.GetPath("incoming")).ApplyTo(state);
+        var previousArchive = state.Settings.CategoryMappings.Single(item => item.Category == VrcImageCategory.Emoji).ArchivePath;
+        Assert.True(state.Settings.CategoryMappings.Single(item => item.Category == VrcImageCategory.Emoji).ArchivePathKnownMissing);
+
+        // Loss of access to the parent no longer proves the category folder is absent.
+        Directory.Move(firstOutput, directory.GetPath("temporarily-offline-output"));
+        Draft(directory.GetPath("second-output"), VrcImageCategory.Emoji, directory.GetPath("incoming")).ApplyTo(state);
+
+        Assert.Contains(state.Settings.LegacyArchiveMappings,
+            item => item.Category == VrcImageCategory.Emoji && item.ArchivePath == previousArchive);
     }
 
     private static SettingsDraft Draft(

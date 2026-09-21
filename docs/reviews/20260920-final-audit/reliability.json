@@ -1,0 +1,29 @@
+{
+  "reviewer": "reliability",
+  "findings": [
+    {
+      "title": "Successful moves can be recorded as left behind",
+      "severity": "P1",
+      "file": "src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs",
+      "line": 215,
+      "why_it_matters": "A relocation can move a file successfully and then lose access to the destination before the follow-up existence probe. File.Exists reports false for both absence and inaccessible storage, so the result omits that move and claims the source copy was left behind. MainWindow then rebases only the reported moves and independently forgets an empty source archive, leaving persisted index, review, or journal paths pointing at the vacated source even though the only file is at the destination. The user sees an inaccurate partial outcome and recovery no longer has the move receipt needed to reconcile it.",
+      "autofix_class": "gated_auto",
+      "owner": "downstream-resolver",
+      "requires_verification": true,
+      "suggested_fix": "Treat a successful File.Move as the move receipt boundary and append ArchiveRelocationMove immediately. If destination verification is retained, represent an unreadable destination as an unknown outcome without converting the completed move to LeftBehind, and do not forget the source mapping until the persisted move receipt and a complete source inventory agree. Add a controlled regression that makes destination observation unavailable after File.Move and asserts the move is retained/rebased with an explicitly uncertain verification status.",
+      "confidence": 75,
+      "evidence": [
+        "src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs:215 -- if (!File.Exists(destination))",
+        "src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs:217-219 -- leftBehind++; errors.Add($\"{file}: the move reported success but nothing arrived.\"); continue;",
+        "src/VrcPicSorter.App/MainWindow.xaml.cs:983-996 -- emptied is derived from the source directory, while RebaseIndex receives only result.Moves before ForgetRelocated removes emptied source mappings."
+      ],
+      "pre_existing": false
+    }
+  ],
+  "residual_risks": [
+    "Real slow, disconnected, or cross-volume storage behavior remains unverified; the recorded validation used local disposable fixtures and a responsiveness seam."
+  ],
+  "testing_gaps": [
+    "No regression forces destination observation to become unavailable after File.Move succeeds, the boundary where relocation must preserve a truthful move receipt."
+  ]
+}

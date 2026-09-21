@@ -1,0 +1,117 @@
+[
+  {
+    "reviewer": "correctness",
+    "findings": [],
+    "residual_risks": [],
+    "testing_gaps": [
+      "The reviewed tests cover the settings sequencer and scanner gate, but do not drive MainWindow autosave, watcher restart, and stale presentation together through a WPF dispatcher. The implementation progress document also records that real slow SMB relocation responsiveness remains unverified; the deterministic blocked-worker test is not that runtime validation."
+    ]
+  },
+  {
+    "reviewer": "testing",
+    "findings": [],
+    "residual_risks": [],
+    "testing_gaps": [
+      "The latest-wins coordinator and runtime gate have deterministic unit coverage, but no test drives MainWindow autosave, stale error suppression, saved-destination labels, and watcher restart together through the WPF dispatcher; a wiring regression could therefore leave the UI showing a destination different from the persisted settings despite the coordinator remaining green.",
+      "Relocation cancellation is covered with a blocked worker and disposable local files, but real slow-network and cross-volume responsiveness, disconnection during enumeration or move, and packaged Stop behavior remain unverified, as the implementation progress document records."
+    ]
+  },
+  {
+    "reviewer": "reliability",
+    "findings": [
+      {
+        "title": "Successful moves can be recorded as left behind",
+        "severity": "P1",
+        "file": "src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs",
+        "line": 215,
+        "why_it_matters": "A relocation can move a file successfully and then lose access to the destination before the follow-up existence probe. File.Exists reports false for both absence and inaccessible storage, so the result omits that move and claims the source copy was left behind. MainWindow then rebases only the reported moves and independently forgets an empty source archive, leaving persisted index, review, or journal paths pointing at the vacated source even though the only file is at the destination. The user sees an inaccurate partial outcome and recovery no longer has the move receipt needed to reconcile it.",
+        "autofix_class": "gated_auto",
+        "owner": "downstream-resolver",
+        "requires_verification": true,
+        "suggested_fix": "Treat a successful File.Move as the move receipt boundary and append ArchiveRelocationMove immediately. If destination verification is retained, represent an unreadable destination as an unknown outcome without converting the completed move to LeftBehind, and do not forget the source mapping until the persisted move receipt and a complete source inventory agree. Add a controlled regression that makes destination observation unavailable after File.Move and asserts the move is retained/rebased with an explicitly uncertain verification status.",
+        "confidence": 75,
+        "evidence": [
+          "src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs:215 -- if (!File.Exists(destination))",
+          "src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs:217-219 -- leftBehind++; errors.Add($\"{file}: the move reported success but nothing arrived.\"); continue;",
+          "src/VrcPicSorter.App/MainWindow.xaml.cs:983-996 -- emptied is derived from the source directory, while RebaseIndex receives only result.Moves before ForgetRelocated removes emptied source mappings."
+        ],
+        "pre_existing": false
+      }
+    ],
+    "residual_risks": [
+      "Real slow, disconnected, or cross-volume storage behavior remains unverified; the recorded validation used local disposable fixtures and a responsiveness seam."
+    ],
+    "testing_gaps": [
+      "No regression forces destination observation to become unavailable after File.Move succeeds, the boundary where relocation must preserve a truthful move receipt."
+    ]
+  },
+  {
+    "reviewer": "maintainability",
+    "findings": [],
+    "residual_risks": [],
+    "testing_gaps": []
+  },
+  {
+    "reviewer": "security",
+    "findings": [],
+    "residual_risks": [],
+    "testing_gaps": []
+  },
+  {
+    "reviewer": "julik-frontend-races",
+    "findings": [
+      {
+        "title": "Superseded invalid edit can persist older settings",
+        "severity": "P1",
+        "file": "src/VrcPicSorter.App/MainWindow.xaml.cs",
+        "line": 931,
+        "why_it_matters": "A user can type a newer invalid output while an older valid save is already writing, yet the older output can still become the persisted active destination. The UI request guard suppresses the old completion message, but its final current-request check runs inside the state mutation callback; JsonStateStore then asynchronously writes that mutated document after the callback returns. A newer Begin during that write cannot revoke it, and an invalid newer draft performs no replacement write. This breaks the stated latest-intent rule at the storage boundary and can send the next scan to a destination the user believed they had superseded.",
+        "autofix_class": "gated_auto",
+        "owner": "downstream-resolver",
+        "requires_verification": true,
+        "suggested_fix": "Move version validation and persistence into one coordinator-owned serialized commit protocol that can distinguish prepared, committing, and committed versions. At minimum, after an obsolete commit completes, enqueue a compensating commit of the newest valid snapshot or saved baseline before releasing the settings operation boundary; cover the invalid-newer-request-during-WriteCoreAsync case with a controllable state-store seam.",
+        "confidence": 75,
+        "evidence": [
+          "src/VrcPicSorter.App/MainWindow.xaml.cs:931 -- if (!_settingsSaves.IsCurrent(request)) return false;",
+          "src/VrcPicSorter.Core/Storage/JsonStateStore.cs:165-166 -- var result = update(state); await WriteCoreAsync(state, requireCurrentRevision: true, cancellationToken).ConfigureAwait(false);",
+          "src/VrcPicSorter.App/MainWindow.xaml.cs:912-917 -- a newer invalid draft refreshes presentation but performs no state update that could replace an older write",
+          "tests/VrcPicSorter.Tests/Services/SettingsSaveCoordinatorTests.cs:13-21 -- the persistence test uses an in-memory apply callback and checks only the false completion result, not the persisted settings"
+        ],
+        "pre_existing": false
+      },
+      {
+        "title": "Watch toggle bypasses restart serialization gate",
+        "severity": "P1",
+        "file": "src/VrcPicSorter.App/MainWindow.xaml.cs",
+        "line": 435,
+        "why_it_matters": "The Watch button can invert the user's intent while a settings save restarts monitoring. ApplyAutomationSettingsAsync temporarily sets IsRunning false while StopAsync waits for an active watcher scan. During that responsive window, a click on the still-present Stop action observes false and enters the start branch; the settings restart can then start monitoring again as well. The user asked monitoring to stop but it remains running, and concurrent Start calls also replace watcher collections and cancellation sources without one UI-level operation ordering them.",
+        "autofix_class": "gated_auto",
+        "owner": "downstream-resolver",
+        "requires_verification": true,
+        "suggested_fix": "Route ToggleWatching, settings-driven ApplyAutomationSettingsAsync, and other UI watcher start/stop/restart paths through the same automation gate. Capture the requested terminal state under that gate instead of deciding from IsRunning before acquiring it, then update the display after the serialized transition. Add a deterministic test that blocks StopAsync on an active scan and clicks Stop during a settings restart.",
+        "confidence": 75,
+        "evidence": [
+          "src/VrcPicSorter.App/MainWindow.xaml.cs:435-437 -- if (_runtime.Watcher.IsRunning) { await _runtime.StopWatchingAsync();",
+          "src/VrcPicSorter.App/MainWindow.xaml.cs:942-948 -- only the settings restart acquires _automationSettingsGate around ApplyAutomationSettingsAsync",
+          "src/VrcPicSorter.App/Services/AppRuntime.cs:128-135 -- ApplyAutomationSettingsAsync stops the running watcher and then starts it again",
+          "src/VrcPicSorter.App/Services/WatchService.cs:197-201 -- StopAsync calls Stop(), which clears IsRunning, before awaiting the active scan gate"
+        ],
+        "pre_existing": false
+      }
+    ],
+    "residual_risks": [
+      "The relocation worker and Stop path are unit-tested with a blocking progress callback, but real WPF dispatcher behavior during slow cross-volume or SMB File.Move remains unverified, as the implementation progress notes acknowledge.",
+      "Watcher restart ordering was reviewed by text-level call-site search; no symbol-aware reference tool was available, so dynamically wired or indirect automation callers may exist outside the inspected paths."
+    ],
+    "testing_gaps": [
+      "No test holds JsonStateStore inside WriteCoreAsync while a newer invalid settings request begins, then asserts the final on-disk output root.",
+      "No deterministic UI/runtime test overlaps ToggleWatching with ApplyAutomationSettingsAsync while StopAsync is waiting for an active watcher scan and asserts the user's requested terminal watcher state."
+    ]
+  },
+  {
+    "reviewer": "adversarial",
+    "findings": [],
+    "residual_risks": [],
+    "testing_gaps": []
+  }
+]

@@ -1,0 +1,51 @@
+{
+  "reviewer": "julik-frontend-races",
+  "findings": [
+    {
+      "title": "Superseded invalid edit can persist older settings",
+      "severity": "P1",
+      "file": "src/VrcPicSorter.App/MainWindow.xaml.cs",
+      "line": 931,
+      "why_it_matters": "A user can type a newer invalid output while an older valid save is already writing, yet the older output can still become the persisted active destination. The UI request guard suppresses the old completion message, but its final current-request check runs inside the state mutation callback; JsonStateStore then asynchronously writes that mutated document after the callback returns. A newer Begin during that write cannot revoke it, and an invalid newer draft performs no replacement write. This breaks the stated latest-intent rule at the storage boundary and can send the next scan to a destination the user believed they had superseded.",
+      "autofix_class": "gated_auto",
+      "owner": "downstream-resolver",
+      "requires_verification": true,
+      "suggested_fix": "Move version validation and persistence into one coordinator-owned serialized commit protocol that can distinguish prepared, committing, and committed versions. At minimum, after an obsolete commit completes, enqueue a compensating commit of the newest valid snapshot or saved baseline before releasing the settings operation boundary; cover the invalid-newer-request-during-WriteCoreAsync case with a controllable state-store seam.",
+      "confidence": 75,
+      "evidence": [
+        "src/VrcPicSorter.App/MainWindow.xaml.cs:931 -- if (!_settingsSaves.IsCurrent(request)) return false;",
+        "src/VrcPicSorter.Core/Storage/JsonStateStore.cs:165-166 -- var result = update(state); await WriteCoreAsync(state, requireCurrentRevision: true, cancellationToken).ConfigureAwait(false);",
+        "src/VrcPicSorter.App/MainWindow.xaml.cs:912-917 -- a newer invalid draft refreshes presentation but performs no state update that could replace an older write",
+        "tests/VrcPicSorter.Tests/Services/SettingsSaveCoordinatorTests.cs:13-21 -- the persistence test uses an in-memory apply callback and checks only the false completion result, not the persisted settings"
+      ],
+      "pre_existing": false
+    },
+    {
+      "title": "Watch toggle bypasses restart serialization gate",
+      "severity": "P1",
+      "file": "src/VrcPicSorter.App/MainWindow.xaml.cs",
+      "line": 435,
+      "why_it_matters": "The Watch button can invert the user's intent while a settings save restarts monitoring. ApplyAutomationSettingsAsync temporarily sets IsRunning false while StopAsync waits for an active watcher scan. During that responsive window, a click on the still-present Stop action observes false and enters the start branch; the settings restart can then start monitoring again as well. The user asked monitoring to stop but it remains running, and concurrent Start calls also replace watcher collections and cancellation sources without one UI-level operation ordering them.",
+      "autofix_class": "gated_auto",
+      "owner": "downstream-resolver",
+      "requires_verification": true,
+      "suggested_fix": "Route ToggleWatching, settings-driven ApplyAutomationSettingsAsync, and other UI watcher start/stop/restart paths through the same automation gate. Capture the requested terminal state under that gate instead of deciding from IsRunning before acquiring it, then update the display after the serialized transition. Add a deterministic test that blocks StopAsync on an active scan and clicks Stop during a settings restart.",
+      "confidence": 75,
+      "evidence": [
+        "src/VrcPicSorter.App/MainWindow.xaml.cs:435-437 -- if (_runtime.Watcher.IsRunning) { await _runtime.StopWatchingAsync();",
+        "src/VrcPicSorter.App/MainWindow.xaml.cs:942-948 -- only the settings restart acquires _automationSettingsGate around ApplyAutomationSettingsAsync",
+        "src/VrcPicSorter.App/Services/AppRuntime.cs:128-135 -- ApplyAutomationSettingsAsync stops the running watcher and then starts it again",
+        "src/VrcPicSorter.App/Services/WatchService.cs:197-201 -- StopAsync calls Stop(), which clears IsRunning, before awaiting the active scan gate"
+      ],
+      "pre_existing": false
+    }
+  ],
+  "residual_risks": [
+    "The relocation worker and Stop path are unit-tested with a blocking progress callback, but real WPF dispatcher behavior during slow cross-volume or SMB File.Move remains unverified, as the implementation progress notes acknowledge.",
+    "Watcher restart ordering was reviewed by text-level call-site search; no symbol-aware reference tool was available, so dynamically wired or indirect automation callers may exist outside the inspected paths."
+  ],
+  "testing_gaps": [
+    "No test holds JsonStateStore inside WriteCoreAsync while a newer invalid settings request begins, then asserts the final on-disk output root.",
+    "No deterministic UI/runtime test overlaps ToggleWatching with ApplyAutomationSettingsAsync while StopAsync is waiting for an active watcher scan and asserts the user's requested terminal watcher state."
+  ]
+}

@@ -2,6 +2,33 @@ namespace VrcPicSorter.Core.FileSystem;
 
 public static class PathBoundary
 {
+    public static bool IsConfirmedMissingDirectory(string path)
+    {
+        var normalized = Normalize(path);
+        try
+        {
+            _ = File.GetAttributes(normalized);
+            return false;
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            try
+            {
+                var parent = Path.GetDirectoryName(normalized);
+                return parent is not null && Directory.GetFileSystemEntries(parent)
+                    .All(entry => !string.Equals(Normalize(entry), normalized, StringComparison.OrdinalIgnoreCase));
+            }
+            catch (Exception observationError) when (observationError is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
     public static string Normalize(string path)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);

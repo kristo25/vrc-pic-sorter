@@ -10,6 +10,31 @@ namespace VrcPicSorter.Tests.Imaging;
 public sealed class ImageMatcherTests
 {
     [Fact]
+    public void TransparentPaddingIsRecognizedWithoutBecomingExact()
+    {
+        using var source = ImageFixtureFactory.CreatePattern(811);
+        using var padded = new Image<Rgba32>(source.Width * 2, source.Height * 2);
+        padded.Mutate(context => context.DrawImage(source, new Point(19, 21), 1));
+        var first = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(source));
+        var second = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(padded));
+        var match = Assert.Single(ImageMatcher.RankCandidates(first, [new("padded", second)], SimilarityProfile.Strict));
+        Assert.True(match.SimilarityScore >= .99);
+        Assert.False(ImageMatcher.IsSamePicture(match, first, second));
+        Assert.False((first with { FeatureVersion = 4 }).HasCurrentFeatures);
+    }
+
+    [Fact]
+    public void EmptyTransparentImagesRemainValidAndFinite()
+    {
+        using var source = new Image<Rgba32>(48, 32);
+        using var other = new Image<Rgba32>(96, 64);
+        var first = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(source));
+        var second = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(other));
+        Assert.True(first.HasCurrentFeatures);
+        Assert.True(double.IsFinite(ImageMatcher.MeasureSimilarity(first, second).Score));
+    }
+
+    [Fact]
     public void ExactCandidateRanksFirstWithAnExactReason()
     {
         using var source = ImageFixtureFactory.CreatePattern(11);
@@ -496,14 +521,11 @@ public sealed class ImageMatcherTests
     /// The audit's reproduction, as a test that fails while the defect is present.
     /// </summary>
     /// <remarks>
-    /// Two sixteen-frame animations whose eight sampled frames agree exactly and whose other eight
-    /// are red against blue. They score a flat 100% because the score only ever sees the sampled
-    /// frames - and on the strength of that number the incoming file was recycled unseen. The
-    /// number is asserted too: this is worthless as a regression test if the pair stops scoring
-    /// 100%, because then it would pass for the wrong reason.
+    /// The old eight-frame sampling scored these different animations at 100%. All-frame
+    /// summaries must lower that score, and a forged perfect score must still not imply identity.
     /// </remarks>
     [Fact]
-    public void SamePictureRejectsAHundredPercentScoreOnFramesItNeverLookedAt()
+    public void ChangedUnsampledFramesLowerScoreAndNeverBecomeExact()
     {
         var redFrames = CreateHalfDifferingAnimation(new Rgba32(220, 30, 30, 255));
         var blueFrames = CreateHalfDifferingAnimation(new Rgba32(30, 30, 220, 255));
@@ -520,11 +542,12 @@ public sealed class ImageMatcherTests
                 [new ImageCandidate("archived", archived)],
                 SimilarityProfile.Strict);
 
-            var match = Assert.Single(results);
-            Assert.True(
-                match.SimilarityScore >= ImageMatcher.DisplayedAsIdenticalThreshold,
-                $"the pair must still be shown as 100% for this to prove anything; it scored {match.SimilarityScore}");
-            Assert.False(ImageMatcher.IsSamePicture(match, incoming, archived));
+            Assert.Empty(results);
+            var reloaded = JsonSerializer.Deserialize<ImageFingerprint>(JsonSerializer.Serialize(archived))!;
+            Assert.True(reloaded.HasCurrentFeatures);
+            Assert.Equal(16, reloaded.AnimationFrameSummaries!.Count);
+            Assert.True(ImageMatcher.MeasureSimilarity(incoming, reloaded).Score < .99);
+            Assert.False(ImageMatcher.IsSamePicture(new("archived", MatchKind.Similar, 1, []), incoming, archived));
         }
         finally
         {

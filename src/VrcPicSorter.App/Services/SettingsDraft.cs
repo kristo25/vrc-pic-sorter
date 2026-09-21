@@ -17,7 +17,8 @@ public sealed record SettingsDraft(
     bool BringReviewForwardWhenHeld,
     int WatchScanSeconds = AutomationSettings.DefaultWatchScanSeconds,
     WatchMode WatchMode = WatchMode.OnDetection,
-    OrganizationPolicy OrganizationPolicy = OrganizationPolicy.CategoryRoot)
+    OrganizationPolicy OrganizationPolicy = OrganizationPolicy.CategoryRoot,
+    SimilarityThresholds? CustomSimilarityThresholds = null)
 {
     /// <summary>
     /// Returns the first invariant this draft would break, or <see langword="null"/> when it is
@@ -29,9 +30,20 @@ public sealed record SettingsDraft(
     public string? DescribeBlockingProblem(AppSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
+        if (CustomSimilarityThresholds is { } limits && !limits.IsValid())
+            return "Similarity limits must be numbers from 0 to 100, with minimum no greater than maximum.";
 
         try
         {
+            if (!string.Equals(PathBoundary.Normalize(OutputRootPath), PathBoundary.Normalize(settings.OutputRootPath),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                var archives = settings.CategoryMappings.Select(item => item.ArchivePath)
+                    .Concat(settings.LegacyArchiveMappings.Select(item => item.ArchivePath))
+                    .Where(path => !string.IsNullOrWhiteSpace(path));
+                if (archives.Any(path => PathBoundary.Contains(path, OutputRootPath)))
+                    return "The new output folder cannot be inside an existing or retained archive.";
+            }
             foreach (var category in Categories.Where(item => item.IsEnabled))
             {
                 if (string.IsNullOrWhiteSpace(category.SourcePath))
@@ -86,6 +98,7 @@ public sealed record SettingsDraft(
     public void ApplyTo(AppStateDocument state)
     {
         ArgumentNullException.ThrowIfNull(state);
+        CustomSimilarityThresholds?.Validate();
         var outputRoot = Path.GetFullPath(OutputRootPath);
         var rootChanged = !string.Equals(
             state.Settings.OutputRootPath,
@@ -96,6 +109,19 @@ public sealed record SettingsDraft(
         {
             foreach (var mapping in state.Settings.CategoryMappings)
             {
+                var previousIndex = state.ArchiveIndex.Categories.Single(item => item.Category == mapping.Category);
+                if (mapping.ArchivePathKnownMissing
+                    && PathBoundary.IsConfirmedMissingDirectory(mapping.ArchivePath)
+                    && !previousIndex.Images.Any(image => PathBoundary.Contains(mapping.ArchivePath, image.Path))
+                    && !state.OperationJournal.Any(item => item.Category == mapping.Category))
+                    continue;
+                // An unused generated suggestion is not an archive the user configured.
+                // Never apply this exemption to older saved settings or previously indexed roots.
+                if (state.Settings.OutputRootIsSuggested && previousIndex.LastCompletedUtc is null
+                    && previousIndex.Images.Count == 0 && !Directory.Exists(mapping.ArchivePath)
+                    && !state.History.Any(item => item.Category == mapping.Category)
+                    && !state.OperationJournal.Any(item => item.Category == mapping.Category))
+                    continue;
                 if (string.IsNullOrWhiteSpace(mapping.ArchivePath)
                     || state.Settings.LegacyArchiveMappings.Any(
                         legacy => legacy.Category == mapping.Category
@@ -124,6 +150,7 @@ public sealed record SettingsDraft(
                 StringComparison.OrdinalIgnoreCase);
             mapping.SourcePath = normalizedSource;
             mapping.ArchivePath = Path.Combine(outputRoot, draft.Category.ToString());
+            if (rootChanged) mapping.ArchivePathKnownMissing = PathBoundary.IsConfirmedMissingDirectory(mapping.ArchivePath);
             mapping.IsEnabled = draft.IsEnabled;
 
             if (sourceChanged || rootChanged)
@@ -139,8 +166,10 @@ public sealed record SettingsDraft(
         }
 
         state.Settings.OutputRootPath = outputRoot;
+        if (rootChanged) state.Settings.OutputRootIsSuggested = false;
         state.Settings.OutputRootConfirmed = true;
         state.Settings.SimilarityProfile = SimilarityProfile;
+        state.Settings.CustomSimilarityThresholds = CustomSimilarityThresholds;
         state.Settings.OrganizationPolicy = OrganizationPolicy;
         state.Settings.Automation.WatchWhileOpen = false;
         state.Settings.Automation.StartWithWindows = StartWithWindows;

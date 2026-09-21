@@ -6,6 +6,119 @@ namespace VrcPicSorter.Tests.FileSystem;
 
 public sealed class ArchiveRelocationTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProgressFailurePreservesCompletedMoveReceipt(bool cancelled)
+    {
+        using var directory = new TestDirectory();
+        var from = directory.GetPath("old", "Emoji");
+        var to = directory.GetPath("new", "Emoji");
+        Directory.CreateDirectory(from);
+        var source = Path.Combine(from, "a.png");
+        var destination = Path.Combine(to, "a.png");
+        File.WriteAllText(source, "a");
+        var result = await ArchiveRelocation.RelocateAsync([
+            new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 1, 1)],
+            new CallbackProgress(_ =>
+            {
+                if (cancelled) throw new OperationCanceledException("Progress reporting stopped.");
+                throw new IOException("Progress reporting failed.");
+            }));
+
+        Assert.False(File.Exists(source));
+        Assert.Equal("a", File.ReadAllText(destination));
+        Assert.Equal(1, result.Moved);
+        Assert.Equal(0, result.LeftBehind);
+        Assert.Equal(destination, Assert.Single(result.Moves).To);
+        Assert.NotEmpty(result.Errors);
+        Assert.True(result.Stopped);
+    }
+
+    [Fact]
+    public async Task RelocationReturnsToCallerAndStopsBetweenFiles()
+    {
+        using var directory = new TestDirectory();
+        var from = directory.GetPath("old", "Emoji");
+        var to = directory.GetPath("new", "Emoji");
+        Directory.CreateDirectory(from);
+        File.WriteAllText(Path.Combine(from, "a.png"), "a");
+        File.WriteAllText(Path.Combine(from, "b.png"), "b");
+        using var cancellation = new CancellationTokenSource();
+        using var release = new ManualResetEventSlim();
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var returned = new TaskCompletionSource<Task<ArchiveRelocationResult>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                returned.SetResult(ArchiveRelocation.RelocateAsync([
+                    new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 2, 2)],
+                    new CallbackProgress(_ => { reached.TrySetResult(); release.Wait(TimeSpan.FromSeconds(10)); }), cancellation.Token));
+            }
+            catch (Exception exception) { returned.TrySetException(exception); }
+        }) { IsBackground = true };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        bool callerResponsive;
+        try
+        {
+            await reached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            callerResponsive = await Task.WhenAny(returned.Task, Task.Delay(TimeSpan.FromSeconds(2))) == returned.Task;
+        }
+        finally
+        {
+            cancellation.Cancel();
+            release.Set();
+        }
+        var result = await (await returned.Task.WaitAsync(TimeSpan.FromSeconds(10))).WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(callerResponsive, "Relocation blocked its caller during file work.");
+        Assert.True(result.Stopped);
+        Assert.Equal(1, result.Moved);
+        Assert.Single(result.Moves);
+        Assert.Single(Directory.GetFiles(from));
+        Assert.Single(Directory.GetFiles(to));
+    }
+
+    private sealed class CallbackProgress(Action<ArchiveRelocationProgress> callback) : IProgress<ArchiveRelocationProgress>
+    {
+        public void Report(ArchiveRelocationProgress value) => callback(value);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task OverlappingRelocationMovesNothing(bool reverse)
+    {
+        using var directory = new TestDirectory();
+        var parent = directory.GetPath("old", "Emoji");
+        var child = Path.Combine(parent, "new-output", "Emoji");
+        Directory.CreateDirectory(child);
+        var original = Path.Combine(parent, "old.png");
+        var alreadyNew = Path.Combine(child, "new.png");
+        File.WriteAllText(original, "old");
+        File.WriteAllText(alreadyNew, "new");
+        var step = new ArchiveRelocationStep(VrcImageCategory.Emoji,
+            reverse ? child : parent, reverse ? parent : child, 2, 6);
+        var result = await ArchiveRelocation.RelocateAsync([step]);
+        Assert.Equal(0, result.Moved);
+        Assert.NotEmpty(result.Errors);
+        Assert.Equal("old", File.ReadAllText(original));
+        Assert.Equal("new", File.ReadAllText(alreadyNew));
+    }
+
+    [Fact]
+    public async Task MissingRelocationRootIsNotReportedAsAnEmptySuccess()
+    {
+        using var directory = new TestDirectory();
+        var from = directory.GetPath("offline", "Emoji");
+        var result = await ArchiveRelocation.RelocateAsync([
+            new ArchiveRelocationStep(VrcImageCategory.Emoji, from, directory.GetPath("new", "Emoji"), 25, 100)]);
+        Assert.Equal(0, result.Moved);
+        Assert.NotEmpty(result.Errors);
+        Assert.NotEmpty(ArchiveRelocation.Plan(Settings(from), directory.GetPath("new")));
+    }
+
     [Fact]
     public void ARetainedArchiveStillHoldingFilesIsPlanned()
     {

@@ -6,6 +6,7 @@ using SixLabors.ImageSharp.Processing;
 using SixLabors.ImageSharp.Processing.Processors.Quantization;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Imaging;
+using System.Security.Cryptography;
 
 namespace VrcPicSorter.Core.Atlas;
 
@@ -68,7 +69,9 @@ public sealed class AtlasGifExporter
         string destinationPath,
         EmojiAtlasName name,
         string? allowedDestinationRoot = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool overwrite = true,
+        string? expectedDestinationHash = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sourcePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
@@ -82,6 +85,7 @@ public sealed class AtlasGifExporter
         var temporaryPath = destinationPath + ".tmp";
         EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
         EnsureDestinationIsSafe(temporaryPath, allowedDestinationRoot);
+        await VerifyDestinationAsync(destinationPath, expectedDestinationHash, cancellationToken).ConfigureAwait(false);
 
         // Measured before it is opened, and its header read before it is decoded. Loading first
         // and asking about the size afterwards means the allocation this limit exists to prevent
@@ -214,7 +218,9 @@ public sealed class AtlasGifExporter
             EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
             EnsureDestinationIsSafe(temporaryPath, allowedDestinationRoot);
             await animation.SaveAsync(temporaryPath, Encoder, cancellationToken).ConfigureAwait(false);
-            File.Move(temporaryPath, destinationPath, overwrite: true);
+            EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
+            await VerifyDestinationAsync(destinationPath, expectedDestinationHash, cancellationToken).ConfigureAwait(false);
+            File.Move(temporaryPath, destinationPath, overwrite);
             return new AtlasExportResult(
                 destinationPath,
                 order.Count,
@@ -225,6 +231,24 @@ public sealed class AtlasGifExporter
         finally
         {
             animation?.Dispose();
+        }
+    }
+
+    internal static async Task<string> ReadContentHashAsync(string path, CancellationToken cancellationToken)
+    {
+        PathBoundary.EnsureNoReparsePoints(path, "Existing animation");
+        ImageResourceLimits.EnsureEncodedSizeSafe(path);
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        return Convert.ToHexString(await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false));
+    }
+
+    private static async Task VerifyDestinationAsync(string path, string? expectedHash, CancellationToken cancellationToken)
+    {
+        if (expectedHash is not null && !string.Equals(expectedHash,
+            await ReadContentHashAsync(path, cancellationToken).ConfigureAwait(false), StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("The existing animation changed. Refresh the list and confirm the replacement again.");
         }
     }
 

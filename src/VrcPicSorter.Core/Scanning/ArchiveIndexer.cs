@@ -9,7 +9,7 @@ namespace VrcPicSorter.Core.Scanning;
 /// The outcome of an archive index build.
 /// <para><see cref="Errors"/> reports folder-level failures that make the index unusable.</para>
 /// <para><see cref="SkippedFiles"/> reports individual files that could not be decoded. Skipped
-/// files are excluded from matching but never make the whole category unusable.</para>
+/// files make coverage incomplete, so the category cannot safely route incoming images.</para>
 /// </summary>
 public sealed record ArchiveIndexResult(
     VrcImageCategory Category,
@@ -68,7 +68,6 @@ public sealed class ArchiveIndexer
             .Where(item => item.Category == category)
             .Select(item => item.ArchivePath)
             .Prepend(mapping.ArchivePath)
-            .Where(Directory.Exists)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
         if (archiveRoots.Length == 0)
@@ -107,7 +106,7 @@ public sealed class ArchiveIndexer
                 .Order(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
             await PublishUnavailableAsync(category, exception.Message, cancellationToken).ConfigureAwait(false);
             return new ArchiveIndexResult(
@@ -152,7 +151,7 @@ public sealed class ArchiveIndexer
             var decoded = await _decoder.DecodeAsync(path, cancellationToken).ConfigureAwait(false);
             if (!decoded.IsSuccess)
             {
-                // A single unreadable archive file must not disable the whole category.
+                // Incomplete duplicate coverage cannot establish that incoming media is unique.
                 skipped.Add($"{path}: {decoded.Failure!.Message}");
                 continue;
             }
@@ -174,8 +173,16 @@ public sealed class ArchiveIndexer
             });
         }
 
-        if (skipped.Count == 0
-            && reuseUnchanged
+        if (skipped.Count > 0)
+        {
+            var error = "Archive coverage is incomplete. Incoming files were left unchanged. "
+                + string.Join(Environment.NewLine, skipped.Take(10));
+            await PublishUnavailableAsync(category, error, cancellationToken).ConfigureAwait(false);
+            return new ArchiveIndexResult(category, IndexStatus.Unavailable, previousIndex.Generation,
+                previousIndex.Images.Count, [error], skipped);
+        }
+
+        if (reuseUnchanged
             && previousIndex.Status == IndexStatus.Current
             && HaveSameFileSet(previousIndex.Images, indexed))
         {
@@ -219,23 +226,20 @@ public sealed class ArchiveIndexer
                     }
 
                     index.Images = indexed;
+                    current.Settings.CategoryMappings.Single(item => item.Category == category).ArchivePathKnownMissing = false;
                     index.Status = IndexStatus.Current;
                     index.LastCompletedUtc = _timeProvider.GetUtcNow();
-                    index.LastError = skipped.Count == 0
-                        ? null
-                        : string.Join(Environment.NewLine, skipped.Take(10));
-                    if (!reuseUnchanged || changed || skipped.Count > 0)
+                    index.LastError = null;
+                    if (!reuseUnchanged || changed)
                     {
                         current.History.Add(new ActivityEntry
                         {
                             Id = Guid.NewGuid(),
                             OccurredUtc = _timeProvider.GetUtcNow(),
                             Kind = ActivityKind.Scan,
-                            Level = skipped.Count == 0 ? ActivityLevel.Information : ActivityLevel.Warning,
+                            Level = ActivityLevel.Information,
                             Category = category,
-                            Message = skipped.Count == 0
-                                ? $"Indexed {indexed.Count} archive images."
-                                : $"Indexed {indexed.Count} archive images; skipped {skipped.Count} unreadable file(s).",
+                            Message = $"Indexed {indexed.Count} archive images.",
                         });
                     }
 

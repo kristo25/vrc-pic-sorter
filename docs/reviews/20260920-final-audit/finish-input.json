@@ -1,0 +1,187 @@
+{
+  "run_id": "20260920-final-audit",
+  "run_dir": "C:/Users/krist/Documents/Codex/2026-06-29/i/outputs/VrcImageCurator/docs/reviews/20260920-final-audit",
+  "skill_dir": "C:/Users/krist/.codex/plugins/cache/compound-engineering-plugin/compound-engineering/3.27.0/skills/ce-code-review",
+  "docs_root": "docs",
+  "mode": {
+    "agent": true,
+    "apply_local": false,
+    "grouping": "auto",
+    "depth": "full"
+  },
+  "invocation": {
+    "arguments": "mode:agent base:HEAD plan:docs/plans/2026-09-19-1755-fix-user-audit-safety-plan.md",
+    "constraints": [
+      "Report-only; do not edit app/tests, switch branch, commit, push or use live data.",
+      "Review all tracked and untracked code against HEAD; existing pre-plan dirty changes are relevant too.",
+      "User authorized all nine findings repairs, permanent fallback deletion ONLY verified incoming exact duplicates when recycling unavailable, conservative unavailable-archive handling, preserve current behavior.",
+      "Root runs tests and publish; do not run redundant suites.",
+      "Root repaired relocation candidate during review: successful File.Move receipt immediate, removed File.Exists postcheck, progress exceptions return stopped receipt. Two deterministic regressions red before fix; 15 targeted green and 419 full Release green after.",
+      "Root counterevidence for superseded-invalid draft candidate: U5 plan explicitly permits operations already underway retain captured settings, next operation sees newest successfully applied snapshot; guard immediately before apply, store serializes writes. Invalid new request during ongoing WriteCore is not newer applied state overwritten. Validator must independently judge against source and contract.",
+      "Root watcher fix ready: WatcherLifecycleCoordinator serializes Start/Stop/Restart, records desired flag before gate and rechecks after stop; AppRuntime routes lifecycle through coordinator, MainWindow toggle uses WatchingRequested. Seven targeted tests green review-watcher-green.trx; independently validate current wiring. No pre-fix executable red claimed."
+    ]
+  },
+  "scope": {
+    "mode": "standalone",
+    "base": "HEAD",
+    "diff_a": "HEAD",
+    "diff_b": null,
+    "pr": {
+      "number": null,
+      "url": null,
+      "title": null,
+      "body": null,
+      "base_ref_name": null,
+      "head_ref_oid": null,
+      "head_ref": null,
+      "base_ref": null,
+      "has_prior_comments": false
+    },
+    "branch": "fix/audit-f1-f7",
+    "head_sha": "7d640e231414e880a7e419ef82b64aae7ffd3224",
+    "files": "C:/Users/krist/Documents/Codex/2026-06-29/i/outputs/VrcImageCurator/docs/reviews/20260920-final-audit/files.txt",
+    "diff": "C:/Users/krist/Documents/Codex/2026-06-29/i/outputs/VrcImageCurator/docs/reviews/20260920-final-audit/full.diff",
+    "tree_is_reviewed_head": true,
+    "untracked_excluded": []
+  },
+  "intent": {
+    "summary": "Repair nine user-triggered audit safety findings while preserving verified exact incoming duplicate fallback deletion and existing archive workflow. Keep request scope, conservative unavailable storage, retained GIF ownership, settings/automation ordering, relocation and truthful partial outcomes coherent.",
+    "confidence": "explicit"
+  },
+  "plan": {
+    "path": "C:/Users/krist/Documents/Codex/2026-06-29/i/outputs/VrcImageCurator/docs/plans/2026-09-19-1755-fix-user-audit-safety-plan.md",
+    "source": "explicit",
+    "requirements": [
+      {
+        "id": "R1",
+        "text": "Targeted scans and watchers mutate only captured paths; full reconciliation can process pending queue."
+      },
+      {
+        "id": "R2",
+        "text": "Verified archived keeper survives exact incoming fallback deletion; near matches stay reviewed."
+      },
+      {
+        "id": "R3",
+        "text": "Current/retained dated GIF discovery reuses existing exports."
+      },
+      {
+        "id": "R4",
+        "text": "No self-overlap relocation or false complete inventory success."
+      },
+      {
+        "id": "R5",
+        "text": "Unavailable storage does not prove deletion, emptiness or uniqueness."
+      },
+      {
+        "id": "R6",
+        "text": "Latest settings choice wins with coherent operation snapshots."
+      },
+      {
+        "id": "R7",
+        "text": "Responsive relocation with safe-boundary Stop."
+      },
+      {
+        "id": "R8",
+        "text": "Truthful file effects and unresolved recovery reporting."
+      },
+      {
+        "id": "R9",
+        "text": "Preserve state compatibility, verification, GIF guards and explicit migration."
+      }
+    ],
+    "implementation_units": [
+      "U1 scoped reconciliation",
+      "U2 unavailable storage/recovery",
+      "U3 archive GIF ownership",
+      "U4 relocation boundaries/inventory",
+      "U5 latest-wins settings",
+      "U6 worker relocation",
+      "U7 actual partial outcomes",
+      "U8 integration review isolated publish"
+    ],
+    "settled_decisions": [
+      {
+        "id": "D1",
+        "class": "user-directed",
+        "decision": "Permanent removal of verified incoming exact duplicates when recycling unavailable",
+        "rejected_alternative": "Move incoming exact duplicates into recoverable Duplicates folder"
+      }
+    ]
+  },
+  "roster": {
+    "selected": [
+      {
+        "reviewer": "correctness",
+        "tier": "session",
+        "reason": "always-on"
+      },
+      {
+        "reviewer": "testing",
+        "tier": "mid",
+        "reason": "meaningful behavior/test changes"
+      },
+      {
+        "reviewer": "maintainability",
+        "tier": "mid",
+        "reason": "1061 executable changed lines and new abstractions"
+      },
+      {
+        "reviewer": "reliability",
+        "tier": "mid",
+        "reason": "I/O failure and recovery/cancellation"
+      },
+      {
+        "reviewer": "security",
+        "tier": "session",
+        "reason": "user paths and filesystem mutation boundaries"
+      },
+      {
+        "reviewer": "julik-frontend-races",
+        "tier": "mid",
+        "reason": "async WPF saves, automation and UI races"
+      },
+      {
+        "reviewer": "adversarial",
+        "tier": "session",
+        "reason": "persistence writes, partial failure and concurrency"
+      }
+    ],
+    "standards": {
+      "criteria": [],
+      "fallback_named": false,
+      "not_run_reason": "Successful criteria search found no applicable standards files."
+    },
+    "packs": {
+      "roots": [],
+      "errors": [],
+      "warnings": []
+    }
+  },
+  "collection": {
+    "returns": "C:/Users/krist/Documents/Codex/2026-06-29/i/outputs/VrcImageCurator/docs/reviews/20260920-final-audit/raw-returns.json",
+    "unstructured_returns": [],
+    "failed_reviewers": [],
+    "bound_exceeded": [],
+    "fast_pass": {
+      "emitted_preliminary": false,
+      "candidates": []
+    }
+  },
+  "peer": {
+    "selected": true,
+    "target": "claude",
+    "route": "claude",
+    "preference_source": "default",
+    "outcome": "in-process-fallback",
+    "artifact": null,
+    "coverage": "Cross-model review not run: automatic approval review rejected sending internal repository diff/context to external Claude, stating audit authorization did not authorize that disclosure. No peer job started; local adversarial reviewer completed. Security first attempt hit usage limit; successful fresh retry collected."
+  },
+  "coverage_notes": [
+    "All seven local reviewers collected; one active child slot forced serial batches. All are same-family evidence; no cross-model independence promotion.",
+    "Untracked source/tests included under explicit user scope; docs artifacts excluded from code review.",
+    "Project standards not run: no applicable criteria files. No learnings corpus/packs, API/migration artifacts, Swift or PR comments surface.",
+    "Reviewed tree changed during review: one truthful save-error message, relocation receipt/progress repair, added regression tests, and later watcher lifecycle repair. Validate final source; retain raw findings as review history.",
+    "Root reports full Release 419/419 tests green and diff-check clean after relocation repair; isolated portable publish/startup smoke passed before last repairs; final rebuild pending.",
+    "No live media/state used. Real slow SMB/cross-volume responsiveness and integrated WPF dispatcher interaction remain unverified."
+  ]
+}

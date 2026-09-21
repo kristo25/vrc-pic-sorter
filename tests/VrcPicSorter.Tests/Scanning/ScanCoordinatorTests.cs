@@ -14,6 +14,131 @@ namespace VrcPicSorter.Tests.Scanning;
 
 public sealed class ScanCoordinatorTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RetainedDatedSheetBackfillStaysInItsOwningArchive(bool existing)
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var archive = directory.GetPath("new", "Emoji");
+        var retained = directory.GetPath("old", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(archive);
+        var sheet = Path.Combine(retained, "Animated", "Gif Ref", "2025-09", "player_x_4frames_10fps_linearloopStyle.png");
+        WriteSheet(sheet);
+        var destination = AtlasAnimationWriter.BuildDestination(sheet, retained);
+        if (existing) Assert.True((await new AtlasAnimationWriter().TryWriteAsync(sheet, retained)).Exported);
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        await store.UpdateAsync(state =>
+        {
+            state.Settings.LegacyArchiveMappings.Add(new() { Category = VrcImageCategory.Emoji, ArchivePath = retained });
+            return true;
+        });
+        var decoder = new ImageDecoder();
+        var coordinator = new ScanCoordinator(store, new ArchiveIndexer(store, decoder), decoder,
+            new FileRouter(store, decoder, new FileRouterTests.FakeRecycleBinService()), TimeSpan.Zero);
+        var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Empty(result.Errors);
+        Assert.True(File.Exists(destination));
+        Assert.Single(Directory.GetFiles(retained, "*.gif", SearchOption.AllDirectories));
+        Assert.Empty(Directory.GetFiles(archive, "*", SearchOption.AllDirectories));
+        Assert.True(File.Exists(sheet));
+    }
+
+    [Theory]
+    [InlineData("paths", true)]
+    [InlineData("paths", false)]
+    [InlineData("folder", true)]
+    [InlineData("folder", false)]
+    [InlineData("all", true)]
+    [InlineData("all", false)]
+    public async Task PendingExactReconciliationHonorsRequestedScope(string mode, bool canRecycle)
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var extra = directory.GetPath("selected-folder");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(extra);
+        Directory.CreateDirectory(archive);
+        using var image = ImageFixtureFactory.CreatePattern(21);
+        var requested = Path.Combine(mode == "folder" ? extra : source, "requested.png");
+        var unrelated = directory.GetPath("unselected-folder", "pending.png");
+        Directory.CreateDirectory(Path.GetDirectoryName(unrelated)!);
+        var keeper = Path.Combine(archive, "keeper.png");
+        await image.SaveAsPngAsync(requested);
+        await image.SaveAsPngAsync(unrelated);
+        await image.SaveAsPngAsync(keeper);
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
+        await store.UpdateAsync(state =>
+        {
+            foreach (var path in new[] { requested, unrelated })
+                state.ReviewQueue.Add(new ReviewItem
+                {
+                    Id = Guid.NewGuid(), Category = VrcImageCategory.Emoji,
+                    IncomingOriginalPath = path, HeldFilePath = path,
+                    IncomingFingerprint = fingerprint.ExactIdentity,
+                    IncomingImageFingerprint = fingerprint,
+                    Candidates = [new ReviewCandidate
+                    {
+                        Id = Guid.NewGuid(), ArchivePath = keeper,
+                        ExpectedFingerprint = fingerprint.ExactIdentity, MatchKind = MatchKind.Exact,
+                    }],
+                });
+            return true;
+        });
+        var decoder = new ImageDecoder();
+        var recycle = new FileRouterTests.FakeRecycleBinService(canRecycle: canRecycle);
+        var coordinator = new ScanCoordinator(store, new ArchiveIndexer(store, decoder), decoder,
+            new FileRouter(store, decoder, recycle), TimeSpan.Zero);
+        var result = mode switch
+        {
+            "all" => (await coordinator.ScanAllAsync()).Single(r => r.Category == VrcImageCategory.Emoji),
+            "folder" => await coordinator.ScanFolderAsync(extra, VrcImageCategory.Emoji),
+            _ => await coordinator.ScanIncomingPathsAsync(VrcImageCategory.Emoji, [requested]),
+        };
+        Assert.Empty(result.Errors);
+        Assert.False(File.Exists(requested));
+        Assert.Equal(mode != "all", File.Exists(unrelated));
+        Assert.True(File.Exists(keeper));
+        Assert.Equal(mode == "all" ? 2 : 1, result.AutoKeptArchived);
+        Assert.Equal(canRecycle ? result.AutoKeptArchived : 0, recycle.RecycledPaths.Count);
+        if (mode != "all")
+            Assert.Contains((await store.LoadAsync()).ReviewQueue,
+                item => item.IncomingOriginalPath == unrelated && item.Status == ReviewStatus.Pending);
+    }
+
+    [Fact]
+    public async Task ConcurrentMissingExportsWriteOnceAndIndexTheRetainedAnimation()
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        WriteSheet(Path.Combine(archive, "player_x_4frames_10fps_linearloopStyle.png"));
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        await new ArchiveIndexer(store, new ImageDecoder()).RefreshAsync(VrcImageCategory.Emoji);
+        var coordinator = CreateCoordinator(store);
+        var sheet = Assert.Single(await new AtlasAnimationCatalog(store).ListAsync());
+        var request = new AnimationExportRequest(sheet, sheet.Name, MissingOnly: true);
+        var batches = await Task.WhenAll(
+            coordinator.ExportAnimationsAsync([request]), coordinator.ExportAnimationsAsync([request]));
+        Assert.All(batches, batch => Assert.Empty(batch.FollowUp.Warnings));
+        Assert.Single(batches.SelectMany(batch => batch.Results), result => !result.ReusedExisting);
+        var gif = Assert.Single(Directory.GetFiles(archive, "*.gif", SearchOption.AllDirectories));
+        Assert.Contains((await store.LoadAsync()).ArchiveIndex.Categories
+            .Single(c => c.Category == VrcImageCategory.Emoji).Images, image => image.Path == gif);
+
+        using var canceled = new CancellationTokenSource();
+        canceled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => coordinator.ExportAnimationsAsync([request], canceled.Token));
+        var after = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Equal(0, after.Animated);
+        Assert.Single(Directory.GetFiles(archive, "*.gif", SearchOption.AllDirectories));
+    }
+
     [Fact]
     public async Task FileChangedDuringSettleWindowIsNotMoved()
     {
@@ -82,8 +207,13 @@ public sealed class ScanCoordinatorTests
         Assert.Empty((await store.LoadAsync()).ReviewQueue);
     }
 
-    [Fact]
-    public async Task ExactMatchIsQueuedForReviewWhenTheRecycleBinIsUnavailable()
+    [Theory]
+    [InlineData(false, "exact")]
+    [InlineData(true, "exact")]
+    [InlineData(true, "changed-source")]
+    [InlineData(true, "missing-archive")]
+    [InlineData(true, "non-exact")]
+    public async Task ExactMatchKeepsArchiveWithoutRecycleBinIncludingPreviouslyQueuedItems(bool alreadyQueued, string scenario)
     {
         using var directory = new TestDirectory();
         var sourceRoot = directory.GetPath("incoming");
@@ -98,6 +228,35 @@ public sealed class ScanCoordinatorTests
         using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
         var decoder = new ImageDecoder();
         var recycleBin = new FileRouterTests.FakeRecycleBinService(canRecycle: false);
+        if (alreadyQueued)
+        {
+            var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
+            await store.UpdateAsync(state =>
+            {
+                state.ReviewQueue.Add(new ReviewItem
+                {
+                    Id = Guid.NewGuid(),
+                    Category = VrcImageCategory.Emoji,
+                    IncomingOriginalPath = incoming,
+                    HeldFilePath = incoming,
+                    IncomingFingerprint = fingerprint.ExactIdentity,
+                    IncomingImageFingerprint = fingerprint,
+                    Candidates = [new ReviewCandidate
+                    {
+                        Id = Guid.NewGuid(), ArchivePath = archived,
+                        ExpectedFingerprint = fingerprint.ExactIdentity,
+                        MatchKind = scenario == "non-exact" ? MatchKind.Similar : MatchKind.Exact,
+                    }],
+                });
+                return true;
+            });
+        }
+        if (scenario == "changed-source")
+        {
+            using var changed = ImageFixtureFactory.CreatePattern(23);
+            await changed.SaveAsPngAsync(incoming);
+        }
+        if (scenario == "missing-archive") File.Delete(archived);
         var coordinator = new ScanCoordinator(
             store,
             new ArchiveIndexer(store, decoder),
@@ -107,14 +266,24 @@ public sealed class ScanCoordinatorTests
 
         var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
 
-        // Never delete permanently: without a Recycle Bin the decision goes back to the user.
-        Assert.Equal(0, result.AutoKeptArchived);
-        Assert.Equal(1, result.HeldForReview);
+        if (scenario != "exact")
+        {
+            Assert.Equal(0, result.AutoKeptArchived);
+            Assert.True(File.Exists(incoming));
+            Assert.Contains((await store.LoadAsync()).ReviewQueue, item => item.Status == ReviewStatus.Pending);
+            return;
+        }
+
+        Assert.Equal(1, result.AutoKeptArchived);
+        Assert.Equal(0, result.HeldForReview);
+        Assert.Empty(result.Errors);
         Assert.Empty(recycleBin.RecycledPaths);
-        Assert.True(File.Exists(incoming));
+        Assert.False(File.Exists(incoming));
         Assert.True(File.Exists(archived));
-        var review = Assert.Single((await store.LoadAsync()).ReviewQueue);
-        Assert.Equal(MatchKind.Exact, Assert.Single(review.Candidates).MatchKind);
+        var final = await store.LoadAsync();
+        Assert.DoesNotContain(final.ReviewQueue, item => item.Status != ReviewStatus.Resolved);
+        Assert.Contains(final.History, item => item.Message.Contains("permanently deleted"));
+        Assert.Empty(final.OperationJournal);
     }
 
     [Fact]
@@ -803,7 +972,7 @@ public sealed class ScanCoordinatorTests
     }
 
     [Fact]
-    public async Task UnreadableArchiveFileDoesNotBlockScanningTheCategory()
+    public async Task UnreadableArchiveFileLeavesIncomingUnchangedUntilCoverageIsComplete()
     {
         using var directory = new TestDirectory();
         var sourceRoot = directory.GetPath("incoming");
@@ -827,9 +996,10 @@ public sealed class ScanCoordinatorTests
 
         var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
 
-        Assert.Equal(1, result.Examined);
-        Assert.Equal(1, result.MovedUnique);
-        Assert.True(File.Exists(Path.Combine(archiveRoot, "unique.png")));
+        Assert.Equal(0, result.Examined);
+        Assert.Equal(0, result.MovedUnique);
+        Assert.False(File.Exists(Path.Combine(archiveRoot, "unique.png")));
+        Assert.True(File.Exists(Path.Combine(sourceRoot, "unique.png")));
         Assert.True(File.Exists(unreadable));
         Assert.Contains(result.Errors, error => error.Contains(unreadable, StringComparison.Ordinal));
     }
@@ -1396,8 +1566,10 @@ public sealed class ScanCoordinatorTests
         Assert.False(File.Exists(incoming));
     }
 
-    [Fact]
-    public async Task AnArchivedGifIsNotOverwrittenByTheSheetThatArrivesAfterIt()
+    [Theory]
+    [InlineData("")]
+    [InlineData(" (2)")]
+    public async Task AnArchivedGifIsNotOverwrittenByTheSheetThatArrivesAfterIt(string suffix)
     {
         // The GIF lands first and is archived under the very name the sheet's export would take.
         // The exporter writes with overwrite, so without care the sheet would destroy an archived
@@ -1415,6 +1587,12 @@ public sealed class ScanCoordinatorTests
 
         var archivedGif = Path.Combine(archiveRoot, "Animated", stem + ".gif");
         Assert.True(File.Exists(archivedGif));
+        if (suffix.Length > 0)
+        {
+            var retained = Path.Combine(archiveRoot, "Animated", stem + suffix + ".gif");
+            File.Move(archivedGif, retained);
+            archivedGif = retained;
+        }
         var before = await File.ReadAllBytesAsync(archivedGif);
 
         WriteSheet(Path.Combine(sourceRoot, stem + ".png"));
@@ -1422,6 +1600,7 @@ public sealed class ScanCoordinatorTests
 
         Assert.Equal(1, result.MovedUnique);
         Assert.Equal(before, await File.ReadAllBytesAsync(archivedGif));
+        Assert.Single(Directory.GetFiles(Path.Combine(archiveRoot, "Animated"), "*.gif"));
     }
 
     [Fact]
@@ -1676,12 +1855,12 @@ public sealed class ScanCoordinatorTests
         var catalog = new AtlasAnimationCatalog(store);
         var sheet = Assert.Single(await catalog.ListAsync());
 
-        var exported = await catalog.ExportAsync(sheet, sheet.Name);
-        Assert.True(exported.Exported);
+        var batch = await coordinator.ExportAnimationsAsync([new AnimationExportRequest(sheet, sheet.Name)]);
+        var exported = Assert.Single(batch.Results);
+        Assert.True(exported.Exported, exported.Warning);
         var animationPath = exported.Path!;
 
-        var followUp = await coordinator.FinishExportedAnimationsAsync(
-            [new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, animationPath)]);
+        var followUp = batch.FollowUp;
 
         Assert.Empty(followUp.Warnings);
         Assert.Empty(followUp.Duplicates);

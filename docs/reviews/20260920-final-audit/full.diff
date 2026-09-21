@@ -1,0 +1,3193 @@
+diff --git a/README.md b/README.md
+index 0f3896a..9716cd5 100644
+--- a/README.md
++++ b/README.md
+@@ -6,7 +6,7 @@ VRC Pic Sorter is a local Windows tool for reviewing duplicate and similar image
+ 
+ - Filenames and metadata do not determine image identity.
+ - Exact matches use normalized decoded pixels, dimensions, GIF frame order, and frame timing.
+-- **Images that match an archived image 100% are resolved automatically**: the archived copy is kept and the incoming copy goes to the Windows Recycle Bin, without asking. See *Automatic duplicate resolution* below.
++- **Exact decoded matches are resolved automatically**: the archived copy is kept and the incoming copy is recycled, or permanently deleted when recycling is unavailable. See *Automatic duplicate resolution* below.
+ - Anything below 100%, and any 100% match at a different resolution, is always reviewed by you.
+ - Images are processed in path order. Each unique image moves into the archive immediately, so later files in the same scan are compared against the updated archive.
+ - Possible matches remain in their incoming folders while the Review queue stores references to them; scanning does not create or move a review copy.
+@@ -16,28 +16,33 @@ VRC Pic Sorter is a local Windows tool for reviewing duplicate and similar image
+ - Oversized or unusually frame-heavy images are rejected before full decoding to protect application memory.
+ - Interrupted moves and recycle requests are recorded in a durable operation journal and reconciled on restart.
+ - Archive fingerprints are stored locally and reused when a file's path, size, and modification time are unchanged. Every scan refreshes additions, removals, and changed files before matching.
+-- Settings save automatically when a field is committed. A source folder that does not exist yet is reported inline rather than refused, so a folder that appears later still works; only overlapping source and output folders block a save. Scanning creates the output folder on demand and never creates a source folder.
++- Settings save automatically when a field is committed; the newest choice wins and destination labels show saved settings. Unsafe overlaps with source, holding, or retained archive folders block the change. Scanning creates the output folder on demand and never creates a source folder.
++- An unavailable archive root or unreadable supported archive image pauses changes for that category until coverage is complete. Cached records remain intact. An offline source is not treated as proof that a pending deletion succeeded.
+ - Animating a sheet only adds files. The sheet itself is kept and filed beside the GIF made from it, never deleted, and an existing animation is never overwritten by a sheet arriving later.
+ - Tests use temporary folders and never access the configured VRCX or archive folders.
+ 
+ ## Automatic duplicate resolution
+ 
+ An incoming image is resolved without asking only when it is the *same picture* as one already
+-in the archive. That means either byte-identical decoded pixels, or a similarity score of 100%
+-**at the same resolution and frame count**. In that case the archived copy is kept and the
+-incoming copy is moved to the Windows Recycle Bin.
++in the archive. That requires an exact decoded fingerprint, including every frame and its timing;
++a rounded similarity score of 100% is not enough. In that case the archived copy is kept and the
++incoming copy is moved to the Windows Recycle Bin. When recycling is unavailable (for example,
++on a network share), the exact incoming duplicate is permanently deleted after both copies are
++rechecked. History explicitly records permanent deletion. **Scan now** also retries pending exact
++matches in enabled categories, including those from a previously scanned extra folder. Watcher
++events and **Scan another folder** only resolve incoming files within that scan's captured scope.
+ 
+ Three deliberate limits on this:
+ 
+ - A 100% match at a **different resolution** is never automatic. Choosing between a larger and a
+   smaller copy is your decision, so it goes to the review queue.
+ - The archived copy's fingerprint is re-verified immediately before the incoming copy is
+-  discarded, so the last remaining copy of an image can never be thrown away.
+-- If the Recycle Bin is unavailable, or anything else fails, the image is queued for review
+-  instead. Permanent deletion is never used as a fallback.
++  discarded; changed or missing keepers prevent automatic removal.
++- Changed, unreadable, or missing copies prevent automatic removal and leave the item for review.
++  Non-exact matches never use the permanent-deletion fallback.
+ 
+-Recovering an automatically resolved image means restoring it from the Recycle Bin. Every one is
+-recorded in **History**.
++Recycled copies can be restored from the Recycle Bin. Permanently removed incoming copies cannot;
++the verified archive copy is kept. **History** distinguishes these outcomes.
+ 
+ ## Animated emoji
+ 
+@@ -64,6 +69,17 @@ what gets written.
+ occasional sheet whose name is wrong. **Export GIF** writes it; **Export missing** does every sheet
+ that has no animation yet.
+ 
++Missing-only export and scans recognize retained numbered GIFs such as `name (2).gif`, even
++before they are indexed. They leave that animation unchanged instead of recreating `name.gif`.
++Manual **Export GIF** can replace the displayed animation after confirmation; if its content
++changes after the list was loaded, refresh the list and confirm again. An unreadable archive
++shows an error and disables export instead of presenting an empty queue.
++
++The duplicate report in **Settings** refreshes the archive folders before listing copies.
++Only equal decoded fingerprints qualify for bulk recycling. Same-emoji GIFs with different
++pixels or timing remain listed for comparison and are preserved. An incomplete archive check
++disables bulk recycling and explains which folders or files could not be read.
++
+ **Skip** sets aside a sheet not worth animating. Nothing is moved or deleted - the sheet stops
+ counting as work still to do, and stops being decoded on every scan. A skip is remembered by the
+ image's fingerprint rather than its path, so it survives a rename, a move, and an index rebuild.
+@@ -126,6 +142,12 @@ The app suggests category folders beneath that root. Source paths remain editabl
+ 
+ Changing this decides where new files go. Existing archived files are not moved.
+ 
++Use **Settings > Retained archives > Move them into my archive** to relocate old archives explicitly.
++Overlapping relocation folders are refused, and inaccessible folders remain listed with an error.
++Moving runs in the background; Stop finishes the current file and prevents the next move. Completed
++changes remain after a partial failure or cancellation. Existing GIFs in retained dated folders are
++reused in their original archive until it is explicitly relocated.
++
+ **Start with Windows** launches the app in background watching mode. Ordinary launches begin with watching stopped.
+ 
+ ## Portable installation and removal
+diff --git a/src/VrcPicSorter.App/App.xaml.cs b/src/VrcPicSorter.App/App.xaml.cs
+index 168106d..9b8f643 100644
+--- a/src/VrcPicSorter.App/App.xaml.cs
++++ b/src/VrcPicSorter.App/App.xaml.cs
+@@ -109,7 +109,7 @@ public partial class App : System.Windows.Application
+ 
+             var details = logPath is null ? string.Empty : $"\n\nDetails were written to:\n{logPath}";
+             MessageBox.Show(
+-                $"An unexpected error occurred. No image was deleted as a result.\n\n{e.Exception.Message}{details}",
++                $"{ActionOutcomeText.Interrupted(cancelled: false)}\n\n{e.Exception.Message}{details}",
+                 "VRC Pic Sorter",
+                 MessageBoxButton.OK,
+                 MessageBoxImage.Error);
+diff --git a/src/VrcPicSorter.App/MainWindow.xaml.cs b/src/VrcPicSorter.App/MainWindow.xaml.cs
+index f404dad..5454e77 100644
+--- a/src/VrcPicSorter.App/MainWindow.xaml.cs
++++ b/src/VrcPicSorter.App/MainWindow.xaml.cs
+@@ -21,10 +21,16 @@ public partial class MainWindow : Window
+     private readonly AppRuntime _runtime;
+     private readonly PreviewService _previewService = new();
+     private readonly LatestRequestGuard _reviewDisplayRequests = new();
++    private readonly SettingsSaveCoordinator _settingsSaves = new();
++    private readonly LatestRequestGuard _retainedArchiveRequests = new();
++    // Lock order: UI mutation gate, then scanner gate. Watcher restart and prompts hold neither.
++    private readonly SemaphoreSlim _uiMutationGate = new(1, 1);
++    private readonly SemaphoreSlim _automationSettingsGate = new(1, 1);
+     private readonly KeepIncomingPrompt _keepIncomingPrompt = new();
+     private IReadOnlyList<ArchiveRelocationStep> _retainedArchives = [];
+ 
+     private IReadOnlyList<ArchiveDuplicateGroup> _archiveDuplicates = [];
++    private long _archiveDuplicateRefreshVersion;
+     private bool _busy;
+     private bool _loadingSettings;
+     private CancellationTokenSource? _operationCancellation;
+@@ -370,7 +376,7 @@ public partial class MainWindow : Window
+                 var skipped = results.Sum(result => result.Skipped);
+                 var errors = results.Sum(result => result.Errors.Count);
+                 SetStatus(
+-                    $"Scan complete: {examined} examined, {moved} archived, {autoKept} exact duplicates recycled, "
++                    $"Scan complete: {examined} examined, {moved} archived, {autoKept} exact duplicates resolved, "
+                     + $"{held} queued for review, {skipped} skipped, {errors} failed.");
+                 await ReportScanErrorsAsync(results.SelectMany(result => result.Errors));
+                 await RefreshAsync();
+@@ -411,7 +417,7 @@ public partial class MainWindow : Window
+                     CurrentCancellation);
+                 SetStatus(
+                     $"Folder scan complete: {result.Examined} examined, {result.MovedUnique} archived, "
+-                    + $"{result.AutoKeptArchived} exact duplicates recycled, {result.HeldForReview} queued for review, "
++                    + $"{result.AutoKeptArchived} exact duplicates resolved, {result.HeldForReview} queued for review, "
+                     + $"{result.Skipped} skipped, {result.Errors.Count} failed.");
+                 await ReportScanErrorsAsync(result.Errors);
+                 await RefreshAsync();
+@@ -426,7 +432,7 @@ public partial class MainWindow : Window
+             return;
+         }
+ 
+-        if (_runtime.Watcher.IsRunning)
++        if (_runtime.WatchingRequested)
+         {
+             await _runtime.StopWatchingAsync();
+             UpdateWatchingDisplay();
+@@ -887,7 +893,13 @@ public partial class MainWindow : Window
+             return;
+         }
+ 
+-        _ = AsyncCommandRunner.RunAsync(AutoSaveSettingsAsync, ReportSettingsAutoSaveFailureAsync);
++        // Even invalid new input supersedes an older pending request.
++        var request = _settingsSaves.Begin();
++        var draft = CaptureSettingsDraftOrNull();
++        ShowSettingsNotice("Settings changes are pending; destinations below show the saved settings.", isWarning: false);
++        _ = AsyncCommandRunner.RunAsync(() => AutoSaveSettingsAsync(request, draft),
++            exception => _settingsSaves.IsCurrent(request)
++                ? ReportSettingsAutoSaveFailureAsync(exception, request) : Task.CompletedTask);
+     }
+ 
+     /// <summary>
+@@ -895,126 +907,61 @@ public partial class MainWindow : Window
+     /// are reported inline rather than refused, because a watched folder is allowed to appear
+     /// later; only the overlap invariants that could make the app scan its own archive block a save.
+     /// </summary>
+-    private async Task AutoSaveSettingsAsync()
++    private async Task AutoSaveSettingsAsync(long request, SettingsDraft? draft)
+     {
+-        var draft = CaptureSettingsDraftOrNull();
+         if (draft is null)
+         {
++            await RefreshSavedDestinationsAsync(request);
++            if (!_settingsSaves.IsCurrent(request)) return;
+             ShowSettingsNotice("Choose a main output folder.", isWarning: true);
+             return;
+         }
+ 
+-        var settings = (await _runtime.StateStore.LoadAsync()).Settings;
+-        if (draft.DescribeBlockingProblem(settings) is { } blocking)
+-        {
+-            ShowSettingsNotice(blocking, isWarning: true);
+-            return;
+-        }
+-
+-        // Worked out before the draft is applied, because it is the archive paths as they stand
+-        // that say where the images are now.
+-        IReadOnlyList<ArchiveRelocationStep> relocation = string.Equals(
+-            settings.ArchiveRelocationAnsweredFor,
+-            Path.GetFullPath(draft.OutputRootPath),
+-            StringComparison.OrdinalIgnoreCase)
+-            ? []
+-            : await Task.Run(() => ArchiveRelocation.Plan(settings, draft.OutputRootPath));
+-
+-        var startupChanged = settings.Automation.StartWithWindows != draft.StartWithWindows;
+-        await _runtime.StateStore.UpdateAsync(
+-            state =>
++        var stateApplied = false;
++        var applied = await _settingsSaves.SaveAsync(request, () => Task.FromResult(draft),
++            async action =>
+             {
+-                draft.ApplyTo(state);
+-                return true;
++                await _uiMutationGate.WaitAsync();
++                try { await _runtime.Scanner.RunExclusiveAsync(action); }
++                finally { _uiMutationGate.Release(); }
++            }, async captured =>
++            {
++                stateApplied = await _runtime.StateStore.UpdateAsync(state =>
++                {
++                    if (!_settingsSaves.IsCurrent(request)) return false;
++                    if (captured.DescribeBlockingProblem(state.Settings) is { } blocking)
++                        throw new InvalidOperationException(blocking);
++                    captured.ApplyTo(state);
++                    return true;
++                });
+             });
++        if (!applied && !stateApplied) return;
+ 
+         // A running watcher holds the folders, mode and interval it was started with, so it has
+         // to be restarted for any settings change to take effect.
+-        if (startupChanged || _runtime.Watcher.IsRunning)
++        await _automationSettingsGate.WaitAsync();
++        try
+         {
+-            await _runtime.ApplyAutomationSettingsAsync(updateStartupRegistration: startupChanged);
++            // Load current persisted settings in the runtime; never restart with a captured draft.
++            await _runtime.ApplyAutomationSettingsAsync(updateStartupRegistration: true);
+         }
++        finally { _automationSettingsGate.Release(); }
+ 
+-        await OfferToBringTheArchiveAlongAsync(draft.OutputRootPath, relocation);
++        if (!_settingsSaves.IsCurrent(request)) return;
+         await RefreshRetainedArchivesAsync();
+-
++        if (!_settingsSaves.IsCurrent(request)) return;
+         UpdateResolvedDestinations(draft.OutputRootPath);
+         UpdateStartupStatusText();
+         var missing = draft.DescribeMissingFolders();
+         ShowSettingsNotice(
+-            missing ?? $"Settings saved at {DateTime.Now:t}.",
++            missing ?? $"Settings saved at {DateTime.Now:t}. Old archives stay in place; use 'Move them into my archive' to move them.",
+             isWarning: missing is not null);
+     }
+ 
+-    /// <summary>
+-    /// Offers to move an archive that the new output folder has left behind, and remembers the
+-    /// answer so the question is asked once rather than on every save.
+-    /// </summary>
+-    /// <remarks>
+-    /// Whichever way it is answered, the new location is made ready. Saying no should cost nothing
+-    /// beyond the files staying where they are: both archives go on being indexed, and new images
+-    /// are filed in the new one.
+-    /// </remarks>
+-    private async Task OfferToBringTheArchiveAlongAsync(
+-        string outputRoot,
+-        IReadOnlyList<ArchiveRelocationStep> relocation)
+-    {
+-        if (relocation.Count == 0)
+-        {
+-            return;
+-        }
+-
+-        var files = relocation.Sum(step => step.FileCount);
+-        var gigabytes = relocation.Sum(step => step.TotalBytes) / (double)(1024 * 1024 * 1024);
+-        var folders = string.Join(
+-            Environment.NewLine,
+-            relocation.Select(step => $"    {step.From}  ({step.FileCount} images)"));
+-
+-        var move = MessageBox.Show(
+-            this,
+-            $"{files} images are still filed in your previous archive:{Environment.NewLine}{Environment.NewLine}"
+-                + $"{folders}{Environment.NewLine}{Environment.NewLine}"
+-                + $"Move them into {outputRoot}? ({gigabytes:0.##} GB){Environment.NewLine}{Environment.NewLine}"
+-                + "Either way the new folder is set up and new images are filed there. Moving also "
+-                + "frees the old folders to be scanned like any other.",
+-            "Bring your archive along?",
+-            MessageBoxButton.YesNo,
+-            MessageBoxImage.Question) == MessageBoxResult.Yes;
+-
+-        // Recorded before the move runs. A move interrupted half way still leaves the question
+-        // answered, and what it managed to move is described by the index either way.
+-        await _runtime.StateStore.UpdateAsync(
+-            state =>
+-            {
+-                state.Settings.ArchiveRelocationAnsweredFor = Path.GetFullPath(outputRoot);
+-                return true;
+-            });
+-
+-        if (!move)
+-        {
+-            foreach (var step in relocation)
+-            {
+-                TryCreateFolder(step.To);
+-            }
+-
+-            ShowSettingsNotice(
+-                "Your previous archive was left where it is. Both folders stay indexed, so "
+-                    + "duplicates are still found across them.",
+-                isWarning: false);
+-            return;
+-        }
+-
+-        await MoveArchivesAsync(relocation);
+-    }
+-
+     /// <summary>
+     /// Moves the planned archives, points the index at where the files landed, and forgets the
+     /// folders that emptied.
+     /// </summary>
+-    /// <remarks>
+-    /// Shared by the question asked when the output folder changes and by the button in Settings,
+-    /// so the two cannot drift into doing subtly different things to a person's archive.
+-    /// </remarks>
+     private async Task MoveArchivesAsync(IReadOnlyList<ArchiveRelocationStep> relocation)
+     {
+         if (relocation.Count == 0)
+@@ -1028,14 +975,18 @@ public partial class MainWindow : Window
+             {
+                 var progress = new Progress<ArchiveRelocationProgress>(
+                     value => SetStatus($"Moving your archive: {value.Moved} of {value.Total} - {value.FileName}"));
+-                var result = await ArchiveRelocation.RelocateAsync(relocation, progress, CurrentCancellation);
+-
+-                await _runtime.StateStore.UpdateAsync(
++                ArchiveRelocationResult result = new(0, 0, [], []);
++                await _runtime.Scanner.RunExclusiveAsync(async () =>
++                {
++                    ArchiveRelocation.EnsurePlanMatchesSettings((await _runtime.StateStore.LoadAsync()).Settings, relocation);
++                    result = await ArchiveRelocation.RelocateAsync(relocation, progress, CurrentCancellation);
++                    var emptied = await Task.Run(() => relocation.Where(step => ArchiveRelocation.IsVerifiedEmpty(step.From)).ToArray());
++                    // Completed moves must be persisted even when Stop was requested.
++                    await _runtime.StateStore.UpdateAsync(
+                     state =>
+                     {
+                         // Only the folders that actually emptied are forgotten. One that kept a
+                         // file back is still a place images live.
+-                        var emptied = relocation.Where(step => IsEmptyNow(step.From)).ToArray();
+ 
+                         // Rebased from the files that moved, not from the folders it was tried on.
+                         // A collision or a failure leaves that record where it was, and pointing it
+@@ -1044,18 +995,20 @@ public partial class MainWindow : Window
+                         ArchiveRelocation.RebaseIndex(state, result.Moves);
+                         ArchiveRelocation.ForgetRelocated(state.Settings, emptied);
+                         return true;
+-                    });
++                    }, CancellationToken.None);
++                }, CurrentCancellation);
+ 
+                 await RefreshAsync();
+                 await RefreshRetainedArchivesAsync();
+                 SetStatus(
+-                    (result.Stopped, result.LeftBehind) switch
++                    (result.Stopped, result.InventoryComplete, result.LeftBehind) switch
+                     {
+                         // A stopped run is not a finished one. It reported the same sentence as a
+                         // clean finish, so a move interrupted half way looked like a move that had
+                         // brought everything across.
+-                        (true, _) => $"Stopped after moving {result.Moved} images; the rest are still where they were.",
+-                        (false, 0) => $"Moved {result.Moved} images into your archive.",
++                        (true, _, _) => $"Stopped after moving {result.Moved} images; remaining files need checking.",
++                        (_, false, _) => $"Moved {result.Moved} images; archive inventory is incomplete and the remaining count is unknown.",
++                        (false, true, 0) => $"Moved {result.Moved} images into your archive.",
+                         _ => $"Moved {result.Moved} images; {result.LeftBehind} were left where they are.",
+                     });
+                 await ReportScanErrorsAsync(result.Errors);
+@@ -1073,6 +1026,7 @@ public partial class MainWindow : Window
+             return;
+         }
+ 
++        var request = _retainedArchiveRequests.Begin();
+         var settings = (await _runtime.StateStore.LoadAsync()).Settings;
+ 
+         // Planning counts and measures every file in every retained folder, so it is kept off the
+@@ -1082,12 +1036,16 @@ public partial class MainWindow : Window
+             ? []
+             : await Task.Run(() => ArchiveRelocation.Plan(settings, settings.OutputRootPath));
+ 
++        if (!_retainedArchiveRequests.IsCurrent(request)) return;
++        var saved = (await _runtime.StateStore.LoadAsync()).Settings;
++        if (!_retainedArchiveRequests.IsCurrent(request)
++            || !string.Equals(saved.OutputRootPath, settings.OutputRootPath, StringComparison.OrdinalIgnoreCase)) return;
+         _retainedArchives = steps;
+         RetainedArchivesList.ItemsSource = steps
+             .Select(step => new
+             {
+                 step.From,
+-                Summary = $"{step.FileCount} images, {step.TotalBytes / (double)(1024 * 1024):0.#} MB",
++                Summary = step.InventoryError ?? $"{step.FileCount} images, {step.TotalBytes / (double)(1024 * 1024):0.#} MB",
+             })
+             .ToArray();
+ 
+@@ -1097,9 +1055,7 @@ public partial class MainWindow : Window
+     }
+ 
+     /// <summary>
+-    /// What the archive is holding more than once. Read from the index that is already built, so
+-    /// this costs no disk work - but only what the index knows about is considered, which for a
+-    /// category that has never been scanned is nothing.
++    /// Refreshes archive inventory before reporting duplicate copies and animation variants.
+     /// </summary>
+     private async Task RefreshArchiveDuplicatesAsync()
+     {
+@@ -1108,13 +1064,30 @@ public partial class MainWindow : Window
+             return;
+         }
+ 
+-        var state = await _runtime.StateStore.LoadAsync();
+-        var groups = state.ArchiveIndex.Categories
+-            .SelectMany(ArchiveDuplicateFinder.Find)
+-            .ToArray();
++        var version = ++_archiveDuplicateRefreshVersion;
++        _archiveDuplicates = [];
++        RemoveIdenticalDuplicatesButton.IsEnabled = false;
++        ArchiveDuplicatesList.ItemsSource = null;
++        ArchiveDuplicatesPanel.Visibility = Visibility.Visible;
++        ArchiveDuplicatesSummary.Text = "Checking the archive folders...";
++        ArchiveDuplicateSnapshot snapshot;
++        try
++        {
++            snapshot = await _runtime.Scanner.RefreshArchiveDuplicatesAsync(CurrentCancellation);
++        }
++        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
++            or InvalidOperationException or ArgumentException or OperationCanceledException)
++        {
++            if (version == _archiveDuplicateRefreshVersion)
++                ArchiveDuplicatesSummary.Text = "Archive check incomplete. " + exception.Message;
++            return;
++        }
++        if (version != _archiveDuplicateRefreshVersion)
++            return;
++        var groups = snapshot.Groups.ToArray();
+         _archiveDuplicates = groups;
+ 
+-        var removable = groups.Where(group => IsRemovable(group.Kind)).ToArray();
++        var removable = groups.Where(group => group.IsRemovable).ToArray();
+         var sameEmoji = groups.Length - removable.Length;
+         var extras = removable.Sum(group => group.Extras.Count);
+         var megabytes = removable.Sum(group => group.ReclaimableBytes) / (double)(1024 * 1024);
+@@ -1132,14 +1105,13 @@ public partial class MainWindow : Window
+             ? $"One extra copy is a picture already here, taking {megabytes:0.#} MB."
+             : $"{extras} extra copies are pictures already here, taking {megabytes:0.#} MB.";
+         var sameEmojiText = sameEmoji == 1
+-            ? "One image is the same emoji as another copy here, at a different size."
+-            : $"{sameEmoji} images are the same emoji as another copy here, at a different size.";
++            ? "One group contains versions of the same emoji with different image or animation data."
++            : $"{sameEmoji} groups contain versions of the same emoji with different image or animation data.";
+         var judgement = " Which of those is worth keeping is yours to decide, so nothing here will touch them.";
+ 
+-        // Read from the index, so it describes the archive as the app last saw it. Saying so is
+-        // the difference between "you have three duplicates" and "three is what I can see".
+-        const string provenance = " Counted from the archive index; run a scan first if the folder"
+-            + " has changed outside the app.";
++        var provenance = snapshot.IsComplete
++            ? " Checked against the archive folders."
++            : " Archive check incomplete; removal is disabled. " + string.Join(" ", snapshot.Warnings);
+         ArchiveDuplicatesSummary.Text = (extras, sameEmoji) switch
+         {
+             (0, _) => sameEmojiText + judgement + provenance,
+@@ -1148,8 +1120,10 @@ public partial class MainWindow : Window
+                 + judgement + provenance,
+         };
+ 
+-        RemoveIdenticalDuplicatesButton.IsEnabled = extras > 0;
+-        ArchiveDuplicatesPanel.Visibility = groups.Length == 0
++        RemoveIdenticalDuplicatesButton.IsEnabled = extras > 0 && snapshot.IsComplete;
++        if (!snapshot.IsComplete)
++            _archiveDuplicates = [];
++        ArchiveDuplicatesPanel.Visibility = groups.Length == 0 && snapshot.IsComplete
+             ? Visibility.Collapsed
+             : Visibility.Visible;
+     }
+@@ -1165,7 +1139,7 @@ public partial class MainWindow : Window
+         // passing the extras alone is what let a removal go ahead with the keeper already gone -
+         // the router had nothing to check, so there was nothing to refuse.
+         var removals = _archiveDuplicates
+-            .Where(group => IsRemovable(group.Kind))
++            .Where(group => group.IsRemovable)
+             .SelectMany(group => group.Extras.Select(extra => (group.Kind, group.Keep, Extra: extra)))
+             .ToArray();
+         if (removals.Length == 0)
+@@ -1173,18 +1147,7 @@ public partial class MainWindow : Window
+             return;
+         }
+ 
+-        var identicalCount = removals.Count(item => item.Kind == ArchiveDuplicateKind.Identical);
+-        var animationCount = removals.Length - identicalCount;
+-        var what = (identicalCount, animationCount) switch
+-        {
+-            (0, _) => "Every one is a second copy of an animation already here: the same emoji, "
+-                + "playing the same frames at the same rate, encoded twice. The copy that keeps "
+-                + "the name stays.",
+-            (_, 0) => "Every one is the same picture, byte for byte, as another copy that stays.",
+-            _ => $"{identicalCount} are the same picture byte for byte as a copy that stays; the "
+-                + $"other {animationCount} are second copies of an animation already here - the "
+-                + "same emoji, playing the same frames at the same rate, encoded twice.",
+-        };
++        const string what = "Every one has the same decoded pixels and frame timing as another copy that stays.";
+ 
+         var confirmation = MessageBox.Show(
+             this,
+@@ -1210,20 +1173,8 @@ public partial class MainWindow : Window
+                     CurrentCancellation.ThrowIfCancellationRequested();
+                     try
+                     {
+-                        if (removal.Kind == ArchiveDuplicateKind.Identical)
+-                        {
+-                            await _runtime.Router.RemoveArchivedDuplicateAsync(
+-                                removal.Extra,
+-                                removal.Keep,
+-                                CurrentCancellation);
+-                        }
+-                        else
+-                        {
+-                            await _runtime.Router.RemoveSupersededAnimationAsync(
+-                                removal.Extra,
+-                                removal.Keep,
+-                                CurrentCancellation);
+-                        }
++                        await _runtime.Router.RemoveArchivedDuplicateAsync(
++                            removal.Extra, removal.Keep, CurrentCancellation);
+ 
+                         removed++;
+                     }
+@@ -1245,29 +1196,18 @@ public partial class MainWindow : Window
+                 SetStatus(
+                     failures.Count == 0
+                         ? $"Recycled {removed} duplicate copies."
+-                        : $"Recycled {removed} duplicate copies; {failures.Count} were left alone.");
++                        : $"Recycled {removed} duplicate copies; {failures.Count} failed operations need checking.");
+                 await ReportScanErrorsAsync(failures);
+             });
+     }
+ 
+-    /// <summary>
+-    /// Whether the app can act on a duplicate group, or only report it.
+-    /// </summary>
+-    /// <remarks>
+-    /// Two files it can prove are the same thing - the same decoded picture, or the same animation
+-    /// of the same emoji by VRChat's own account - can be tidied on request. Two files that merely
+-    /// look alike cannot, and never will be.
+-    /// </remarks>
+-    private static bool IsRemovable(ArchiveDuplicateKind kind) =>
+-        kind is ArchiveDuplicateKind.Identical or ArchiveDuplicateKind.SameAnimation;
+-
+     private static string DescribeDuplicate(
+         ArchiveDuplicateKind kind,
+         IndexedImageRecord extra,
+         IndexedImageRecord keep) => kind switch
+         {
+             ArchiveDuplicateKind.Identical => "identical",
+-            ArchiveDuplicateKind.SameAnimation => "same animation, encoded twice",
++            ArchiveDuplicateKind.SameAnimation => "same emoji and filename parameters; image or timing differs",
+             _ => $"{extra.Width}x{extra.Height} beside {keep.Width}x{keep.Height}",
+         };
+ 
+@@ -1280,8 +1220,21 @@ public partial class MainWindow : Window
+             return;
+         }
+ 
++        if (relocation.Any(step => step.InventoryError is not null))
++        {
++            ShowSettingsNotice("Archive inventory is incomplete. Restore access to the listed folders and refresh before moving.", true);
++            return;
++        }
++
+         var images = relocation.Sum(step => step.FileCount);
+         var destination = (await _runtime.StateStore.LoadAsync()).Settings.OutputRootPath;
++        if (relocation.Any(step => !string.Equals(PathBoundary.Normalize(step.To),
++                PathBoundary.Normalize(Path.Combine(destination, step.Category.ToString())), StringComparison.OrdinalIgnoreCase)))
++        {
++            await RefreshRetainedArchivesAsync();
++            ShowSettingsNotice("The archive destination changed. Review the refreshed list before moving.", true);
++            return;
++        }
+         if (MessageBox.Show(
+                 this,
+                 $"Move {images} images into {destination}?{Environment.NewLine}{Environment.NewLine}"
+@@ -1298,44 +1251,25 @@ public partial class MainWindow : Window
+         await MoveArchivesAsync(relocation);
+     }
+ 
+-    /// <summary>True when nothing is left in the folder, and false if that cannot be established.</summary>
+-    /// <remarks>
+-    /// A folder that cannot be read is treated as still holding something. Forgetting an archive
+-    /// that turns out to still have images in it would leave those images unindexed and invisible.
+-    /// </remarks>
+-    private static bool IsEmptyNow(string path)
+-    {
+-        try
+-        {
+-            return !Directory.Exists(path) || !Directory.EnumerateFileSystemEntries(path).Any();
+-        }
+-        catch (Exception exception) when (
+-            exception is IOException or UnauthorizedAccessException)
+-        {
+-            return false;
+-        }
+-    }
+-
+-    private static void TryCreateFolder(string path)
++    private async Task RefreshSavedDestinationsAsync(long request)
+     {
+-        try
++        var saved = await _runtime.StateStore.LoadAsync();
++        await Dispatcher.InvokeAsync(() =>
+         {
+-            Directory.CreateDirectory(path);
+-        }
+-        catch (Exception exception) when (
+-            exception is IOException or UnauthorizedAccessException or NotSupportedException)
+-        {
+-            // Scanning creates the folder on demand anyway; this only saves a person the surprise
+-            // of an output folder that does not exist yet.
+-        }
++            if (_settingsSaves.IsCurrent(request)) UpdateResolvedDestinations(saved.Settings.OutputRootPath);
++        });
+     }
+ 
+-    private async Task ReportSettingsAutoSaveFailureAsync(Exception exception)
++    private async Task ReportSettingsAutoSaveFailureAsync(Exception exception, long? request = null)
+     {
+         var logPath = await DiagnosticLog.TryWriteAsync(_runtime.StateDirectory, exception);
+         var detail = logPath is null ? string.Empty : $" Details: {logPath}";
+-        await Dispatcher.InvokeAsync(
+-            () => ShowSettingsNotice($"Settings were not saved. {exception.Message}{detail}", isWarning: true));
++        if (request is { } version) await RefreshSavedDestinationsAsync(version);
++        await Dispatcher.InvokeAsync(() =>
++        {
++            if (request is null || _settingsSaves.IsCurrent(request.Value))
++                ShowSettingsNotice($"Could not finish applying settings. Destinations below show the saved settings. {exception.Message}{detail}", isWarning: true);
++        });
+     }
+ 
+     private void ShowSettingsNotice(string? message, bool isWarning)
+@@ -1559,18 +1493,18 @@ public partial class MainWindow : Window
+         if (picker.ShowDialog(this) == true)
+         {
+             target.Text = picker.FolderName;
+-            if (ReferenceEquals(target, OutputRoot))
+-            {
+-                UpdateResolvedDestinations(target.Text);
+-            }
++            BeginAutoSaveSettings();
+         }
+     }
+ 
+     private void OutputRootChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+     {
+-        if (EmojiDestinationText is not null)
++        if (!_loadingSettings && EmojiDestinationText is not null)
+         {
+-            UpdateResolvedDestinations(OutputRoot.Text.Trim());
++            var request = _settingsSaves.Begin();
++            ShowSettingsNotice("Unsaved output change. Press Enter or leave the field to save; destinations show saved settings.", false);
++            _ = AsyncCommandRunner.RunAsync(() => RefreshSavedDestinationsAsync(request),
++                exception => ReportSettingsAutoSaveFailureAsync(exception, request));
+         }
+     }
+ 
+@@ -1598,17 +1532,18 @@ public partial class MainWindow : Window
+ 
+         try
+         {
+-            await action();
++            await _uiMutationGate.WaitAsync(CurrentCancellation);
++            try { await action(); }
++            finally { _uiMutationGate.Release(); }
+         }
+         catch (OperationCanceledException)
+         {
+-            // Every file operation is journaled and verified before it runs, so stopping
+-            // between images can never leave one half-moved.
+-            SetStatus("Stopped. Images already handled are done; nothing was left half-moved.");
++            // Cancellation may follow a file effect but precede its state commit.
++            SetStatus(ActionOutcomeText.Interrupted(cancelled: true));
+         }
+         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or InvalidOperationException or NotSupportedException or ArgumentException)
+         {
+-            SetStatus("Action failed. No image was deleted and no permanent deletion fallback was used.");
++            SetStatus(ActionOutcomeText.Interrupted(cancelled: false));
+             var logPath = await DiagnosticLog.TryWriteAsync(_runtime.StateDirectory, exception);
+             var details = logPath is null
+                 ? "\n\nThe diagnostic log could not be written."
+@@ -1965,6 +1900,11 @@ public partial class MainWindow : Window
+         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+         {
+             AnimationsSubtitle.Text = $"The archive could not be read: {exception.Message}";
++            SheetList.ItemsSource = null;
++            ExportSheetButton.IsEnabled = false;
++            ExportMissingButton.IsEnabled = false;
++            ExportMissingButton.Content = "Archive check incomplete";
++            ClearAnimationQueueButton.IsEnabled = false;
+         }
+     }
+ 
+@@ -2313,6 +2253,8 @@ public partial class MainWindow : Window
+ 
+     private async void ExportSelectedAnimation(object sender, RoutedEventArgs e)
+     {
++        if (_busy)
++            return;
+         if (SheetList.SelectedItem is not ArchivedSheet sheet || CurrentAnimationName() is not { } name)
+         {
+             return;
+@@ -2334,28 +2276,17 @@ public partial class MainWindow : Window
+             return;
+         }
+ 
+-        ExportSheetButton.IsEnabled = false;
+-        AtlasAnimationResult result;
++        AtlasAnimationResult? result = null;
+         ExportedAnimationFollowUp? followUp = null;
+-        try
+-        {
+-            result = await AnimationCatalog.ExportAsync(sheet, name);
+-
+-            // Writing the GIF was only ever the first half. A scan goes on to tell the index about
+-            // the new file, file the sheet beside it, and notice when the archive already held that
+-            // picture; this button did none of it, so anything exported here stayed invisible to
+-            // deduplication until the next full index - which is how the same emoji ended up in the
+-            // archive twice.
+-            if (result.Exported && result.Path is { } exportedPath)
+-            {
+-                followUp = await FinishExportAsync(
+-                    [new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, exportedPath)]);
+-            }
+-        }
+-        finally
+-        {
+-            ExportSheetButton.IsEnabled = true;
+-        }
++        await RunBusyAsync("Exporting animation...", async () =>
++        {
++            var batch = await _runtime.Scanner.ExportAnimationsAsync(
++                [new AnimationExportRequest(sheet, name)], CurrentCancellation);
++            result = batch.Results.Single();
++            followUp = batch.FollowUp;
++        });
++        if (result is null)
++            return;
+ 
+         await RefreshAnimationsAsync();
+         await RefreshArchiveDuplicatesAsync();
+@@ -2453,79 +2384,34 @@ public partial class MainWindow : Window
+ 
+     private async void ExportMissingAnimations(object sender, RoutedEventArgs e)
+     {
+-        ExportMissingButton.IsEnabled = false;
+-        var exported = 0;
+-        var failed = 0;
+-        ExportedAnimationFollowUp? followUp = null;
+-        try
+-        {
+-            var sheets = await AnimationCatalog.ListAsync();
+-
+-            // Collected as they are written and handed over in one go at the end. The follow-up
+-            // reads the whole archive once per category, and doing that per file would turn a
+-            // fifty-sheet batch into fifty full reads of the archive.
+-            var written = new List<ExportedAnimation>();
+-            foreach (var sheet in sheets.Where(item => item.NeedsDecision))
+-            {
+-                ExportMissingButton.Content = $"Exporting {exported + failed + 1}...";
+-                var result = await AnimationCatalog.ExportAsync(sheet, sheet.Name);
+-                if (result.Exported && result.Path is { } exportedPath)
+-                {
+-                    exported++;
+-                    written.Add(new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, exportedPath));
+-                }
+-                else
+-                {
+-                    failed++;
+-                }
+-            }
+-
+-            followUp = await FinishExportAsync(written);
+-        }
+-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+-        {
+-            AnimationsSubtitle.Text = $"The archive could not be read: {exception.Message}";
+-        }
+-        finally
+-        {
+-            ExportMissingButton.IsEnabled = true;
+-        }
++        if (_busy)
++            return;
++        AnimationExportBatch? batch = null;
++        await RunBusyAsync("Exporting missing animations...", async () =>
++        {
++            var sheets = await AnimationCatalog.ListAsync(CurrentCancellation);
++            batch = await _runtime.Scanner.ExportAnimationsAsync(sheets.Where(item => item.NeedsDecision)
++                .Select(sheet => new AnimationExportRequest(sheet, sheet.Name, MissingOnly: true)).ToArray(),
++                CurrentCancellation);
++        });
++        if (batch is null)
++            return;
+ 
+         await RefreshAnimationsAsync();
+         await RefreshArchiveDuplicatesAsync();
+ 
+         // Written after the refresh for the same reason as the single export above.
++        var exported = batch.Results.Count(result => result.Exported && !result.ReusedExisting);
++        var failed = batch.Results.Count(result => !result.Exported);
++        var reused = batch.Results.Count(result => result.ReusedExisting);
+         SheetStatusText.Text = failed == 0
+             ? $"Exported {exported} animations."
+             : $"Exported {exported} animations, {failed} could not be exported.";
+-        SheetStatusText.Text += DescribeFollowUp(followUp);
+-    }
+-
+-    /// <summary>
+-    /// Puts freshly exported animations through the rest of what a scan does to one.
+-    /// </summary>
+-    /// <remarks>
+-    /// Never throws. The animations are already on disk and correct by the time this runs, so a
+-    /// failure here is something to say out loud, not a reason to report the export as failed.
+-    /// </remarks>
+-    private async Task<ExportedAnimationFollowUp> FinishExportAsync(IReadOnlyCollection<ExportedAnimation> written)
+-    {
+-        try
+-        {
+-            return await _runtime.Scanner.FinishExportedAnimationsAsync(written, CurrentCancellation);
+-        }
+-        catch (Exception exception) when (
+-            exception is IOException
+-                or UnauthorizedAccessException
+-                or InvalidOperationException
+-                or NotSupportedException
+-                or InvalidDataException)
+-        {
+-            return new ExportedAnimationFollowUp(
+-                [],
+-                [],
+-                [$"The archive could not be brought up to date: {exception.Message}. Run a scan."]);
+-        }
++        if (reused > 0)
++            SheetStatusText.Text += $" Kept {reused} existing animations.";
++        SheetStatusText.Text += DescribeFollowUp(batch.FollowUp);
++        if (failed > 0)
++            SheetStatusText.Text += " " + string.Join(" ", batch.Results.Where(r => r.Warning is not null).Select(r => r.Warning));
+     }
+ 
+     /// <summary>
+diff --git a/src/VrcPicSorter.App/Services/AppRuntime.cs b/src/VrcPicSorter.App/Services/AppRuntime.cs
+index 37da953..06cb8da 100644
+--- a/src/VrcPicSorter.App/Services/AppRuntime.cs
++++ b/src/VrcPicSorter.App/Services/AppRuntime.cs
+@@ -13,6 +13,7 @@ public sealed class AppRuntime : IDisposable
+ 
+     /// <summary>Where this application kept its data before the rename, or null when isolated.</summary>
+     private readonly string? _previousStateDirectory;
++    private readonly WatcherLifecycleCoordinator _watcherLifecycle;
+ 
+     public AppRuntime(string? stateDirectory = null, bool allowStartupRegistration = true)
+     {
+@@ -55,6 +56,7 @@ public sealed class AppRuntime : IDisposable
+             Router,
+             ProductionFileSettleDelay);
+         Watcher = new WatchService(Scanner, Indexer);
++        _watcherLifecycle = new WatcherLifecycleCoordinator(StartWatcherFromSavedSettingsAsync, Watcher.StopAsync);
+         Startup = new StartupRegistrationService();
+     }
+ 
+@@ -74,6 +76,8 @@ public sealed class AppRuntime : IDisposable
+ 
+     public WatchService Watcher { get; }
+ 
++    public bool WatchingRequested => _watcherLifecycle.IsRequested;
++
+     public StartupRegistrationService Startup { get; }
+ 
+     public async Task InitializeAsync(CancellationToken cancellationToken = default)
+@@ -124,16 +128,8 @@ public sealed class AppRuntime : IDisposable
+ 
+     public async Task ApplyAutomationSettingsAsync(bool updateStartupRegistration)
+     {
++        await _watcherLifecycle.RestartAsync().ConfigureAwait(false);
+         var state = await StateStore.LoadAsync().ConfigureAwait(false);
+-        if (Watcher.IsRunning)
+-        {
+-            await Watcher.StopAsync().ConfigureAwait(false);
+-            Watcher.Start(
+-                state.Settings.CategoryMappings,
+-                state.Settings.LegacyArchiveMappings,
+-                SweepInterval(state.Settings.Automation),
+-                state.Settings.Automation.WatchMode == WatchMode.OnDetection);
+-        }
+ 
+         if (updateStartupRegistration && AllowStartupRegistration)
+         {
+@@ -143,7 +139,9 @@ public sealed class AppRuntime : IDisposable
+         }
+     }
+ 
+-    public async Task StartWatchingAsync()
++    public Task StartWatchingAsync() => _watcherLifecycle.StartAsync();
++
++    private async Task StartWatcherFromSavedSettingsAsync()
+     {
+         var state = await StateStore.LoadAsync().ConfigureAwait(false);
+         Watcher.Start(
+@@ -153,7 +151,7 @@ public sealed class AppRuntime : IDisposable
+             state.Settings.Automation.WatchMode == WatchMode.OnDetection);
+     }
+ 
+-    public Task StopWatchingAsync() => Watcher.StopAsync();
++    public Task StopWatchingAsync() => _watcherLifecycle.StopAsync();
+ 
+     private static TimeSpan? SweepInterval(AutomationSettings automation) =>
+         automation.WatchMode == WatchMode.OnInterval ? automation.WatchScanInterval : null;
+diff --git a/src/VrcPicSorter.App/Services/SettingsDraft.cs b/src/VrcPicSorter.App/Services/SettingsDraft.cs
+index a6d4dfb..b441501 100644
+--- a/src/VrcPicSorter.App/Services/SettingsDraft.cs
++++ b/src/VrcPicSorter.App/Services/SettingsDraft.cs
+@@ -32,6 +32,15 @@ public sealed record SettingsDraft(
+ 
+         try
+         {
++            if (!string.Equals(PathBoundary.Normalize(OutputRootPath), PathBoundary.Normalize(settings.OutputRootPath),
++                    StringComparison.OrdinalIgnoreCase))
++            {
++                var archives = settings.CategoryMappings.Select(item => item.ArchivePath)
++                    .Concat(settings.LegacyArchiveMappings.Select(item => item.ArchivePath))
++                    .Where(path => !string.IsNullOrWhiteSpace(path));
++                if (archives.Any(path => PathBoundary.Contains(path, OutputRootPath)))
++                    return "The new output folder cannot be inside an existing or retained archive.";
++            }
+             foreach (var category in Categories.Where(item => item.IsEnabled))
+             {
+                 if (string.IsNullOrWhiteSpace(category.SourcePath))
+@@ -96,6 +105,19 @@ public sealed record SettingsDraft(
+         {
+             foreach (var mapping in state.Settings.CategoryMappings)
+             {
++                var previousIndex = state.ArchiveIndex.Categories.Single(item => item.Category == mapping.Category);
++                if (mapping.ArchivePathKnownMissing
++                    && PathBoundary.IsConfirmedMissingDirectory(mapping.ArchivePath)
++                    && !previousIndex.Images.Any(image => PathBoundary.Contains(mapping.ArchivePath, image.Path))
++                    && !state.OperationJournal.Any(item => item.Category == mapping.Category))
++                    continue;
++                // An unused generated suggestion is not an archive the user configured.
++                // Never apply this exemption to older saved settings or previously indexed roots.
++                if (state.Settings.OutputRootIsSuggested && previousIndex.LastCompletedUtc is null
++                    && previousIndex.Images.Count == 0 && !Directory.Exists(mapping.ArchivePath)
++                    && !state.History.Any(item => item.Category == mapping.Category)
++                    && !state.OperationJournal.Any(item => item.Category == mapping.Category))
++                    continue;
+                 if (string.IsNullOrWhiteSpace(mapping.ArchivePath)
+                     || state.Settings.LegacyArchiveMappings.Any(
+                         legacy => legacy.Category == mapping.Category
+@@ -124,6 +146,7 @@ public sealed record SettingsDraft(
+                 StringComparison.OrdinalIgnoreCase);
+             mapping.SourcePath = normalizedSource;
+             mapping.ArchivePath = Path.Combine(outputRoot, draft.Category.ToString());
++            if (rootChanged) mapping.ArchivePathKnownMissing = PathBoundary.IsConfirmedMissingDirectory(mapping.ArchivePath);
+             mapping.IsEnabled = draft.IsEnabled;
+ 
+             if (sourceChanged || rootChanged)
+@@ -139,6 +162,7 @@ public sealed record SettingsDraft(
+         }
+ 
+         state.Settings.OutputRootPath = outputRoot;
++        if (rootChanged) state.Settings.OutputRootIsSuggested = false;
+         state.Settings.OutputRootConfirmed = true;
+         state.Settings.SimilarityProfile = SimilarityProfile;
+         state.Settings.OrganizationPolicy = OrganizationPolicy;
+diff --git a/src/VrcPicSorter.Core/Atlas/AtlasAnimationCatalog.cs b/src/VrcPicSorter.Core/Atlas/AtlasAnimationCatalog.cs
+index cda93db..ac644ac 100644
+--- a/src/VrcPicSorter.Core/Atlas/AtlasAnimationCatalog.cs
++++ b/src/VrcPicSorter.Core/Atlas/AtlasAnimationCatalog.cs
+@@ -13,7 +13,8 @@ public sealed record ArchivedSheet(
+     bool HasAnimation,
+     EmojiAtlasName Name,
+     string Fingerprint = "",
+-    bool IsSkipped = false)
++    bool IsSkipped = false,
++    string? AnimationFingerprint = null)
+ {
+     public string FileName => System.IO.Path.GetFileName(AtlasPath);
+ 
+@@ -49,8 +50,8 @@ public sealed record ArchivedSheet(
+ /// Lists the animated emoji in the archive and re-exports them on request.
+ /// </summary>
+ /// <remarks>
+-/// Everything here is derived from the file name and the archive index, so the list costs one
+-/// file-exists check per archived sheet and nothing is decoded until an export is asked for.
++/// Sheets come from the index; animation candidates are read from disk once per root so an
++/// unindexed or renamed GIF does not turn an already animated sheet back into missing work.
+ /// </remarks>
+ public sealed class AtlasAnimationCatalog
+ {
+@@ -66,14 +67,12 @@ public sealed class AtlasAnimationCatalog
+     {
+         var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+         var skipped = new HashSet<string>(state.SkippedAnimations, StringComparer.OrdinalIgnoreCase);
+-        var roots = state.Settings.CategoryMappings
+-            .GroupBy(mapping => mapping.Category)
+-            .ToDictionary(group => group.Key, group => group.First().ArchivePath);
+ 
+         var sheets = new List<ArchivedSheet>();
++        var animations = new Dictionary<string, ExistingAnimations>(StringComparer.OrdinalIgnoreCase);
++        var fingerprints = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+         foreach (var category in state.ArchiveIndex.Categories)
+         {
+-            var root = roots.TryGetValue(category.Category, out var mapped) ? mapped : string.Empty;
+             foreach (var image in category.Images)
+             {
+                 if (!EmojiAtlasName.TryParse(image.Path, out var name))
+@@ -82,16 +81,33 @@ public sealed class AtlasAnimationCatalog
+                 }
+ 
+                 string destination;
++                string root;
+                 bool exists;
++                string? animationFingerprint = null;
+                 try
+                 {
++                    root = ArchiveOwner.Resolve(state.Settings, category.Category, image.Path);
+                     destination = AtlasAnimationWriter.BuildDestination(image.Path, root);
+-                    exists = File.Exists(destination);
++                    var searchRoot = AtlasAnimationWriter.DestinationRoot(image.Path, root);
++                    if (!animations.TryGetValue(searchRoot, out var existing))
++                    {
++                        existing = new ExistingAnimations(searchRoot);
++                        animations.Add(searchRoot, existing);
++                    }
++                    var retained = existing.Find(image.Path, root);
++                    exists = retained is not null;
++                    destination = retained ?? destination;
++                    if (retained is not null && !fingerprints.TryGetValue(retained, out animationFingerprint))
++                    {
++                        animationFingerprint = await AtlasGifExporter.ReadContentHashAsync(retained, cancellationToken).ConfigureAwait(false);
++                        fingerprints.Add(retained, animationFingerprint);
++                    }
+                 }
+                 catch (Exception exception) when (
+-                    exception is ArgumentException or IOException or UnauthorizedAccessException)
++                    exception is ArgumentException or IOException or UnauthorizedAccessException
++                        or InvalidOperationException or NotSupportedException)
+                 {
+-                    continue;
++                    throw new IOException($"Could not check the animation for {image.Path}: {exception.Message}", exception);
+                 }
+ 
+                 sheets.Add(new ArchivedSheet(
+@@ -103,7 +119,8 @@ public sealed class AtlasAnimationCatalog
+                     exists,
+                     name,
+                     image.ExactFingerprint,
+-                    skipped.Contains(image.ExactFingerprint)));
++                    skipped.Contains(image.ExactFingerprint),
++                    animationFingerprint));
+             }
+         }
+ 
+@@ -123,9 +140,26 @@ public sealed class AtlasAnimationCatalog
+     {
+         ArgumentNullException.ThrowIfNull(sheet);
+         ArgumentNullException.ThrowIfNull(name);
+-        return _writer.TryWriteAsync(sheet.AtlasPath, sheet.ArchiveRoot, name, cancellationToken);
++        var current = AtlasAnimationWriter.FindExistingAnimation(sheet.AtlasPath, sheet.ArchiveRoot);
++        if (sheet.HasAnimation && !string.Equals(current, sheet.AnimationPath, StringComparison.OrdinalIgnoreCase)
++            || !sheet.HasAnimation && current is not null)
++        {
++            return Task.FromResult(new AtlasAnimationResult(false, null,
++                "The existing animation changed. Refresh the list and confirm the replacement again."));
++        }
++
++        return sheet.HasAnimation
++            ? sheet.AnimationFingerprint is null
++                ? Task.FromResult(new AtlasAnimationResult(false, null, "Refresh the list before replacing an existing animation."))
++                : _writer.TryWriteAsync(sheet.AtlasPath, sheet.ArchiveRoot, name, cancellationToken,
++                    sheet.AnimationPath, sheet.AnimationFingerprint)
++            : _writer.TryWriteMissingAsync(sheet.AtlasPath, sheet.ArchiveRoot, name, cancellationToken);
+     }
+ 
++    public Task<AtlasAnimationResult> ExportMissingAsync(
++        ArchivedSheet sheet, CancellationToken cancellationToken = default) =>
++        _writer.TryWriteMissingAsync(sheet.AtlasPath, sheet.ArchiveRoot, sheet.Name, cancellationToken);
++
+     /// <summary>
+     /// Marks sheets as skipped, so they stop counting as work still to do. Nothing on disk moves
+     /// or is deleted: a skip is a note that this sheet is not worth animating.
+diff --git a/src/VrcPicSorter.Core/Atlas/AtlasAnimationWriter.cs b/src/VrcPicSorter.Core/Atlas/AtlasAnimationWriter.cs
+index 473ce76..d1d0faa 100644
+--- a/src/VrcPicSorter.Core/Atlas/AtlasAnimationWriter.cs
++++ b/src/VrcPicSorter.Core/Atlas/AtlasAnimationWriter.cs
+@@ -16,7 +16,8 @@ public sealed record AtlasAnimationResult(
+     bool Exported,
+     string? Path,
+     string? Warning,
+-    string? Note = null)
++    string? Note = null,
++    bool ReusedExisting = false)
+ {
+     public static readonly AtlasAnimationResult NotASheet = new(false, null, null);
+ }
+@@ -197,7 +198,41 @@ public sealed class AtlasAnimationWriter
+             return AtlasAnimationResult.NotASheet;
+         }
+ 
+-        return await TryWriteAsync(archivedPath, archiveRoot, name, cancellationToken).ConfigureAwait(false);
++        return await TryWriteMissingAsync(archivedPath, archiveRoot, name, cancellationToken).ConfigureAwait(false);
++    }
++
++    public static string? FindExistingAnimation(string archivedPath, string archiveRoot) =>
++        new ExistingAnimations(DestinationRoot(archivedPath, archiveRoot)).Find(archivedPath, archiveRoot);
++
++    /// <summary>Automatic export never replaces a retained animation, even when the index is stale.</summary>
++    public async Task<AtlasAnimationResult> TryWriteMissingAsync(
++        string archivedPath,
++        string archiveRoot,
++        EmojiAtlasName name,
++        CancellationToken cancellationToken = default)
++    {
++        try
++        {
++            cancellationToken.ThrowIfCancellationRequested();
++            if (FindExistingAnimation(archivedPath, archiveRoot) is { } existing)
++            {
++                var decoded = await new Imaging.ImageDecoder().DecodeAsync(existing, cancellationToken).ConfigureAwait(false);
++                if (!decoded.IsSuccess)
++                {
++                    return new AtlasAnimationResult(false, null,
++                        $"The existing animation could not be read: {existing}. It was left unchanged.");
++                }
++                return new AtlasAnimationResult(true, existing, null, "kept the existing animation", true);
++            }
++
++            return await WriteAsync(archivedPath, archiveRoot, name, null, false, cancellationToken, null)
++                .ConfigureAwait(false);
++        }
++        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
++            or InvalidOperationException or ArgumentException or NotSupportedException)
++        {
++            return new AtlasAnimationResult(false, null, $"could not check existing animations ({exception.Message})");
++        }
+     }
+ 
+     /// <summary>
+@@ -205,20 +240,27 @@ public sealed class AtlasAnimationWriter
+     /// file name. VRChat's name is right on all but a couple of sheets, and this is how those are
+     /// corrected by hand.
+     /// </summary>
+-    public async Task<AtlasAnimationResult> TryWriteAsync(
++    public Task<AtlasAnimationResult> TryWriteAsync(
+         string archivedPath,
+         string archiveRoot,
+         EmojiAtlasName name,
+-        CancellationToken cancellationToken = default)
++        CancellationToken cancellationToken = default,
++        string? destinationPath = null,
++        string? expectedDestinationHash = null) =>
++        WriteAsync(archivedPath, archiveRoot, name, destinationPath, true, cancellationToken, expectedDestinationHash);
++
++    private async Task<AtlasAnimationResult> WriteAsync(
++        string archivedPath, string archiveRoot, EmojiAtlasName name,
++        string? destinationPath, bool overwrite, CancellationToken cancellationToken, string? expectedDestinationHash)
+     {
+         ArgumentNullException.ThrowIfNull(name);
+ 
+         try
+         {
+-            var destination = BuildDestination(archivedPath, archiveRoot);
++            var destination = destinationPath ?? BuildDestination(archivedPath, archiveRoot);
+             var destinationRoot = DestinationRoot(archivedPath, archiveRoot);
+             var exported = await _exporter
+-                .ExportAsync(archivedPath, destination, name, destinationRoot, cancellationToken)
++                .ExportAsync(archivedPath, destination, name, destinationRoot, cancellationToken, overwrite, expectedDestinationHash)
+                 .ConfigureAwait(false);
+             return new AtlasAnimationResult(true, exported.Path, null, exported.Note);
+         }
+diff --git a/src/VrcPicSorter.Core/Atlas/AtlasGifExporter.cs b/src/VrcPicSorter.Core/Atlas/AtlasGifExporter.cs
+index e22e56e..040ea9e 100644
+--- a/src/VrcPicSorter.Core/Atlas/AtlasGifExporter.cs
++++ b/src/VrcPicSorter.Core/Atlas/AtlasGifExporter.cs
+@@ -6,6 +6,7 @@ using SixLabors.ImageSharp.Processing;
+ using SixLabors.ImageSharp.Processing.Processors.Quantization;
+ using VrcPicSorter.Core.FileSystem;
+ using VrcPicSorter.Core.Imaging;
++using System.Security.Cryptography;
+ 
+ namespace VrcPicSorter.Core.Atlas;
+ 
+@@ -68,7 +69,9 @@ public sealed class AtlasGifExporter
+         string destinationPath,
+         EmojiAtlasName name,
+         string? allowedDestinationRoot = null,
+-        CancellationToken cancellationToken = default)
++        CancellationToken cancellationToken = default,
++        bool overwrite = true,
++        string? expectedDestinationHash = null)
+     {
+         ArgumentException.ThrowIfNullOrWhiteSpace(sourcePath);
+         ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+@@ -82,6 +85,7 @@ public sealed class AtlasGifExporter
+         var temporaryPath = destinationPath + ".tmp";
+         EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
+         EnsureDestinationIsSafe(temporaryPath, allowedDestinationRoot);
++        await VerifyDestinationAsync(destinationPath, expectedDestinationHash, cancellationToken).ConfigureAwait(false);
+ 
+         // Measured before it is opened, and its header read before it is decoded. Loading first
+         // and asking about the size afterwards means the allocation this limit exists to prevent
+@@ -214,7 +218,9 @@ public sealed class AtlasGifExporter
+             EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
+             EnsureDestinationIsSafe(temporaryPath, allowedDestinationRoot);
+             await animation.SaveAsync(temporaryPath, Encoder, cancellationToken).ConfigureAwait(false);
+-            File.Move(temporaryPath, destinationPath, overwrite: true);
++            EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
++            await VerifyDestinationAsync(destinationPath, expectedDestinationHash, cancellationToken).ConfigureAwait(false);
++            File.Move(temporaryPath, destinationPath, overwrite);
+             return new AtlasExportResult(
+                 destinationPath,
+                 order.Count,
+@@ -228,6 +234,24 @@ public sealed class AtlasGifExporter
+         }
+     }
+ 
++    internal static async Task<string> ReadContentHashAsync(string path, CancellationToken cancellationToken)
++    {
++        PathBoundary.EnsureNoReparsePoints(path, "Existing animation");
++        ImageResourceLimits.EnsureEncodedSizeSafe(path);
++        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
++            bufferSize: 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
++        return Convert.ToHexString(await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false));
++    }
++
++    private static async Task VerifyDestinationAsync(string path, string? expectedHash, CancellationToken cancellationToken)
++    {
++        if (expectedHash is not null && !string.Equals(expectedHash,
++            await ReadContentHashAsync(path, cancellationToken).ConfigureAwait(false), StringComparison.Ordinal))
++        {
++            throw new InvalidOperationException("The existing animation changed. Refresh the list and confirm the replacement again.");
++        }
++    }
++
+     /// <summary>
+     /// Refuses a destination a link would redirect, and one outside the folder the caller allowed.
+     /// </summary>
+diff --git a/src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs b/src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs
+index 17f3db3..ed6c35b 100644
+--- a/src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs
++++ b/src/VrcPicSorter.Core/FileSystem/ArchiveRelocation.cs
+@@ -8,7 +8,8 @@ public sealed record ArchiveRelocationStep(
+     string From,
+     string To,
+     int FileCount,
+-    long TotalBytes);
++    long TotalBytes,
++    string? InventoryError = null);
+ 
+ /// <summary>One file that really did move, and where it landed.</summary>
+ /// <remarks>
+@@ -32,7 +33,8 @@ public sealed record ArchiveRelocationResult(
+     int LeftBehind,
+     IReadOnlyList<string> Errors,
+     IReadOnlyList<ArchiveRelocationMove> Moves,
+-    bool Stopped = false);
++    bool Stopped = false,
++    bool InventoryComplete = true);
+ 
+ public sealed record ArchiveRelocationProgress(int Moved, int Total, string FileName);
+ 
+@@ -52,6 +54,19 @@ public sealed record ArchiveRelocationProgress(int Moved, int Total, string File
+ /// </remarks>
+ public static class ArchiveRelocation
+ {
++    public static void EnsurePlanMatchesSettings(AppSettings settings, IEnumerable<ArchiveRelocationStep> steps)
++    {
++        foreach (var step in steps)
++        {
++            var mapping = settings.CategoryMappings.SingleOrDefault(item => item.Category == step.Category);
++            var sources = settings.LegacyArchiveMappings.Where(item => item.Category == step.Category)
++                .Select(item => item.ArchivePath).Append(mapping?.ArchivePath ?? string.Empty);
++            if (mapping is null || !mapping.IsEnabled || !SameRoot(mapping.ArchivePath, step.To)
++                || !sources.Any(source => !string.IsNullOrWhiteSpace(source) && SameRoot(source, step.From)))
++                throw new InvalidOperationException("Archive settings changed. Refresh the retained archives and confirm the move again.");
++        }
++    }
++
+     /// <summary>
+     /// Works out which known archive folders hold files that do not sit under
+     /// <paramref name="newOutputRoot"/> yet.
+@@ -81,13 +96,14 @@ public static class ArchiveRelocation
+ 
+             foreach (var candidate in candidates)
+             {
+-                if (PathBoundary.Contains(destination, candidate) || !Directory.Exists(candidate))
++                if (string.Equals(PathBoundary.Normalize(destination), PathBoundary.Normalize(candidate), StringComparison.OrdinalIgnoreCase))
+                 {
+                     continue;
+                 }
+ 
+-                var files = SafeEnumerate(candidate);
+-                if (files.Count == 0)
++                EnsureSeparateRoots(candidate, destination);
++                var inventory = ReadInventory(candidate);
++                if (inventory.Error is null && inventory.Files.Count == 0)
+                 {
+                     continue;
+                 }
+@@ -96,8 +112,9 @@ public static class ArchiveRelocation
+                     mapping.Category,
+                     PathBoundary.Normalize(candidate),
+                     destination,
+-                    files.Count,
+-                    files.Sum(SafeLength)));
++                    inventory.Files.Count,
++                    inventory.Bytes,
++                    inventory.Error));
+             }
+         }
+ 
+@@ -119,10 +136,21 @@ public static class ArchiveRelocation
+     /// sitting at the destination under the same name, with the old fingerprint still attached.
+     /// </para>
+     /// </remarks>
+-    public static async Task<ArchiveRelocationResult> RelocateAsync(
++    public static Task<ArchiveRelocationResult> RelocateAsync(
+         IEnumerable<ArchiveRelocationStep> steps,
+         IProgress<ArchiveRelocationProgress>? progress = null,
+         CancellationToken cancellationToken = default)
++    {
++        ArgumentNullException.ThrowIfNull(steps);
++        // Do not cancel scheduling: a pre-cancelled request still returns a truthful stopped
++        // result. Synchronous filesystem work must never run on the WPF calling thread.
++        return Task.Run(() => RelocateCore(steps, progress, cancellationToken));
++    }
++
++    private static ArchiveRelocationResult RelocateCore(
++        IEnumerable<ArchiveRelocationStep> steps,
++        IProgress<ArchiveRelocationProgress>? progress,
++        CancellationToken cancellationToken)
+     {
+         ArgumentNullException.ThrowIfNull(steps);
+         var planned = steps.ToArray();
+@@ -131,6 +159,20 @@ public static class ArchiveRelocation
+         var leftBehind = 0;
+         var errors = new List<string>();
+         var moves = new List<ArchiveRelocationMove>();
++        var inventoryComplete = true;
++        // Validate every pair before the first move, including cross-step nesting.
++        try
++        {
++            foreach (var step in planned)
++            {
++                if (SameRoot(step.From, step.To)) continue;
++                foreach (var other in planned) EnsureSeparateRoots(other.From, step.To);
++            }
++        }
++        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
++        {
++            return new ArchiveRelocationResult(0, 0, [exception.Message], [], InventoryComplete: false);
++        }
+ 
+         foreach (var step in planned)
+         {
+@@ -139,7 +181,15 @@ public static class ArchiveRelocation
+                 return Stop(moved, leftBehind, errors, moves);
+             }
+ 
+-            foreach (var file in SafeEnumerate(step.From))
++            if (SameRoot(step.From, step.To)) continue;
++            var inventory = ReadInventory(step.From);
++            if (inventory.Error is { } inventoryError)
++            {
++                inventoryComplete = false;
++                errors.Add(inventoryError);
++                continue;
++            }
++            foreach (var file in inventory.Files)
+             {
+                 if (cancellationToken.IsCancellationRequested)
+                 {
+@@ -158,18 +208,10 @@ public static class ArchiveRelocation
+                     }
+ 
+                     PathBoundary.EnsureSafeDestination(step.To, destination, "Relocated archive file");
++                    PathBoundary.EnsureContained(step.From, file, "Relocation source");
++                    PathBoundary.EnsureNoReparsePoints(file, "Relocation source");
+                     Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                     File.Move(file, destination);
+-                    if (!File.Exists(destination))
+-                    {
+-                        leftBehind++;
+-                        errors.Add($"{file}: the move reported success but nothing arrived.");
+-                        continue;
+-                    }
+-
+-                    moved++;
+-                    moves.Add(new ArchiveRelocationMove(step.Category, file, destination));
+-                    progress?.Report(new ArchiveRelocationProgress(moved, total, Path.GetFileName(file)));
+                 }
+                 catch (Exception exception) when (
+                     exception is IOException
+@@ -179,13 +221,28 @@ public static class ArchiveRelocation
+                 {
+                     leftBehind++;
+                     errors.Add($"{file}: {exception.Message}");
++                    continue;
++                }
++
++                // A successful move is a completed effect even if the destination goes offline
++                // immediately afterwards. Preserve its receipt before reporting progress.
++                moved++;
++                moves.Add(new ArchiveRelocationMove(step.Category, file, destination));
++                try
++                {
++                    progress?.Report(new ArchiveRelocationProgress(moved, total, Path.GetFileName(file)));
++                }
++                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
++                    or NotSupportedException or InvalidOperationException or OperationCanceledException)
++                {
++                    errors.Add($"Progress reporting failed after moving {file}: {exception.Message}");
++                    return Stop(moved, leftBehind, errors, moves);
+                 }
+ 
+-                await Task.Yield();
+             }
+         }
+ 
+-        return new ArchiveRelocationResult(moved, leftBehind, errors, moves);
++        return new ArchiveRelocationResult(moved, leftBehind, errors, moves, InventoryComplete: inventoryComplete);
+     }
+ 
+     /// <summary>What a cancelled relocation hands back.</summary>
+@@ -202,7 +259,7 @@ public static class ArchiveRelocation
+         List<ArchiveRelocationMove> moves)
+     {
+         errors.Add("Moving your archive was stopped. The files that had already moved are recorded.");
+-        return new ArchiveRelocationResult(moved, leftBehind, errors, moves, Stopped: true);
++        return new ArchiveRelocationResult(moved, leftBehind, errors, moves, Stopped: true, InventoryComplete: false);
+     }
+ 
+     /// <summary>
+@@ -357,28 +414,41 @@ public static class ArchiveRelocation
+                 && moved.Contains(PathBoundary.Normalize(legacy.ArchivePath)));
+     }
+ 
+-    private static IReadOnlyList<string> SafeEnumerate(string root)
++    public static bool IsVerifiedEmpty(string root)
+     {
+         try
+         {
+-            return PathBoundary.EnumerateFilesWithoutReparsePoints(root);
++            PathBoundary.EnsureNoReparsePoints(root, "Archive folder");
++            return !Directory.EnumerateFileSystemEntries(root).Any();
+         }
+         catch (Exception exception) when (
+             exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+         {
+-            return [];
++            return false;
+         }
+     }
+ 
+-    private static long SafeLength(string path)
++    private static bool SameRoot(string first, string second) =>
++        string.Equals(PathBoundary.Normalize(first), PathBoundary.Normalize(second), StringComparison.OrdinalIgnoreCase);
++
++    private static void EnsureSeparateRoots(string source, string destination)
++    {
++        if (PathBoundary.Overlaps(source, destination))
++            throw new InvalidOperationException($"Archive relocation folders cannot overlap: {source} and {destination}");
++        PathBoundary.EnsureNoReparsePoints(source, "Relocation source");
++        PathBoundary.EnsureNoReparsePoints(destination, "Relocation destination");
++    }
++
++    private static (IReadOnlyList<string> Files, long Bytes, string? Error) ReadInventory(string root)
+     {
+         try
+         {
+-            return new FileInfo(path).Length;
++            var files = PathBoundary.EnumerateFilesWithoutReparsePoints(root);
++            return (files, files.Sum(path => new FileInfo(path).Length), null);
+         }
+-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
++        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+         {
+-            return 0;
++            return ([], 0, $"Archive inventory is unavailable or incomplete: {root}. {exception.Message}");
+         }
+     }
+ }
+diff --git a/src/VrcPicSorter.Core/FileSystem/FileRouter.cs b/src/VrcPicSorter.Core/FileSystem/FileRouter.cs
+index 2904988..6cb2ce8 100644
+--- a/src/VrcPicSorter.Core/FileSystem/FileRouter.cs
++++ b/src/VrcPicSorter.Core/FileSystem/FileRouter.cs
+@@ -192,9 +192,8 @@ public sealed class FileRouter
+ 
+     /// <summary>
+     /// Resolves an exact duplicate without review: the archived image is kept and the incoming
+-    /// copy goes to the Recycle Bin. Throws <see cref="NotSupportedException"/> when the Recycle
+-    /// Bin is unavailable for the incoming path, so the caller can fall back to a review instead
+-    /// of ever deleting permanently.
++    /// copy goes to the Recycle Bin, or is permanently deleted when recycling is unavailable.
++    /// Both decoded identities and the surviving archived copy are verified before removal.
+     /// </summary>
+     public async Task AutoKeepArchivedAsync(
+         string incomingPath,
+@@ -202,10 +201,16 @@ public sealed class FileRouter
+         ImageFingerprint incomingFingerprint,
+         string archivePath,
+         string archiveFingerprint,
+-        CancellationToken cancellationToken = default)
++        CancellationToken cancellationToken = default,
++        Guid? reviewItemId = null)
+     {
+         ArgumentNullException.ThrowIfNull(incomingFingerprint);
+ 
++        if (!string.Equals(incomingFingerprint.ExactIdentity, archiveFingerprint, StringComparison.Ordinal))
++        {
++            throw new InvalidOperationException("Automatic resolution requires an exact archived copy.");
++        }
++
+         // The archived copy must still be exactly what was indexed before the incoming one is
+         // discarded, otherwise this would delete the only remaining copy.
+         await VerifyImageFingerprintAsync(
+@@ -222,7 +227,23 @@ public sealed class FileRouter
+             JournalOperationPurpose.AutoKeepArchived);
+         entry.SurvivingPath = archivePath;
+         entry.SurvivingFingerprint = archiveFingerprint;
+-        await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
++        entry.ReviewItemId = reviewItemId;
++        await VerifySurvivingCopyAsync(entry, cancellationToken).ConfigureAwait(false);
++        if (_recycleBin.CanRecycle(incomingPath))
++        {
++            await ExecuteRecycleAsync(entry, cancellationToken).ConfigureAwait(false);
++        }
++        else
++        {
++            entry.OperationType = JournalOperationType.DeleteExactIncoming;
++            await VerifySurvivingCopyAsync(entry, cancellationToken).ConfigureAwait(false);
++            await VerifyExpectedSourceAsync(entry, cancellationToken).ConfigureAwait(false);
++            await _journal.RecordIntentAsync(entry, cancellationToken).ConfigureAwait(false);
++            await _journal.AdvanceAsync(entry.Id, JournalPhase.SideEffectStarted, cancellationToken: cancellationToken)
++                .ConfigureAwait(false);
++            await ApplySideEffectAsync(entry, cancellationToken).ConfigureAwait(false);
++            await CommitMutationAsync(entry, cancellationToken).ConfigureAwait(false);
++        }
+     }
+ 
+     /// <summary>
+@@ -868,6 +889,7 @@ public sealed class FileRouter
+                         await CommitMutationAsync(entry, cancellationToken).ConfigureAwait(false);
+                         break;
+                     case JournalReconciliationAction.CommitState:
++                        await VerifySurvivingCopyAsync(entry, cancellationToken).ConfigureAwait(false);
+                         await RestoreCarriedFingerprintAsync(entry, cancellationToken).ConfigureAwait(false);
+                         await CommitMutationAsync(entry, cancellationToken).ConfigureAwait(false);
+                         break;
+@@ -900,6 +922,8 @@ public sealed class FileRouter
+                     or NotSupportedException)
+             {
+                 await MarkNeedsAttentionAsync(entry.Id, exception.Message, cancellationToken).ConfigureAwait(false);
++                decisions[^1] = new JournalReconciliationDecision(entry.Id,
++                    JournalReconciliationAction.NeedsAttention, exception.Message);
+             }
+         }
+ 
+@@ -987,6 +1011,21 @@ public sealed class FileRouter
+ 
+     private async Task ApplySideEffectAsync(JournalEntry entry, CancellationToken cancellationToken)
+     {
++        if (entry.OperationType == JournalOperationType.DeleteExactIncoming)
++        {
++            if (entry.Purpose != JournalOperationPurpose.AutoKeepArchived
++                || !string.Equals(entry.ExpectedSource.Fingerprint, entry.SurvivingFingerprint, StringComparison.Ordinal))
++            {
++                throw new InvalidOperationException("Permanent deletion requires an exact archived survivor.");
++            }
++
++            await VerifySurvivingCopyAsync(entry, cancellationToken).ConfigureAwait(false);
++            await VerifyExpectedSourceAsync(entry, cancellationToken).ConfigureAwait(false);
++            cancellationToken.ThrowIfCancellationRequested();
++            File.Delete(entry.SourcePath);
++            return;
++        }
++
+         if (entry.OperationType == JournalOperationType.Recycle)
+         {
+             await _recycleBin.RecycleAsync(entry.SourcePath, cancellationToken).ConfigureAwait(false);
+@@ -1030,14 +1069,14 @@ public sealed class FileRouter
+         if (PathsMatch(entry.SourcePath, path))
+         {
+             throw new InvalidOperationException(
+-                "This pending operation names the same file as the copy it would keep, so nothing was discarded.");
++                "This pending operation names the same file as the copy it would keep. No further removal was attempted.");
+         }
+ 
+         await VerifyImageFingerprintAsync(
+                 path,
+                 fingerprint,
+                 "The copy this one would have been discarded in favour of is no longer there, "
+-                    + "so nothing was discarded.",
++                    + "so no further removal was attempted.",
+                 cancellationToken)
+             .ConfigureAwait(false);
+     }
+@@ -1256,6 +1295,8 @@ public sealed class FileRouter
+             Category = entry.Category,
+             Message = entry.Purpose switch
+             {
++                JournalOperationPurpose.AutoKeepArchived when entry.OperationType == JournalOperationType.DeleteExactIncoming =>
++                    "Exact duplicate: kept the archived image and permanently deleted the incoming copy (Recycle Bin unavailable).",
+                 JournalOperationPurpose.AutoKeepArchived =>
+                     "Exact duplicate: kept the archived image and recycled the incoming copy.",
+                 JournalOperationPurpose.AutoKeepHeld =>
+@@ -1493,7 +1534,7 @@ public sealed class FileRouter
+     {
+         var source = await ObservePathAsync(entry.SourcePath, entry.ExpectedSource.Fingerprint, cancellationToken)
+             .ConfigureAwait(false);
+-        if (entry.OperationType == JournalOperationType.Recycle)
++        if (entry.OperationType is JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming)
+         {
+             return new JournalFileObservation(source);
+         }
+@@ -1511,15 +1552,36 @@ public sealed class FileRouter
+         string expectedFingerprint,
+         CancellationToken cancellationToken)
+     {
+-        if (!File.Exists(path))
++        try
++        {
++            PathBoundary.EnsureNoReparsePoints(path, "Recovery path");
++            _ = File.GetAttributes(path);
++        }
++        catch (FileNotFoundException)
++        {
++            // A failed Exists check also means denied/offline. Only a successful complete
++            // parent enumeration establishes absence; a missing parent remains ambiguous.
++            try
++            {
++                var parent = Path.GetDirectoryName(Path.GetFullPath(path))!;
++                var entries = Directory.GetFileSystemEntries(parent);
++                return entries.Any(entry => string.Equals(Path.GetFullPath(entry), Path.GetFullPath(path),
++                    StringComparison.OrdinalIgnoreCase)) ? JournalPathState.Unavailable : JournalPathState.Missing;
++            }
++            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
++            {
++                return JournalPathState.Unavailable;
++            }
++        }
++        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+         {
+-            return JournalPathState.Missing;
++            return JournalPathState.Unavailable;
+         }
+ 
+         var decoded = await _decoder.DecodeAsync(path, cancellationToken).ConfigureAwait(false);
+         if (!decoded.IsSuccess)
+         {
+-            return JournalPathState.DifferentFile;
++            return JournalPathState.Unavailable;
+         }
+ 
+         return ImageFingerprint.Create(decoded.Image!).ExactIdentity == expectedFingerprint
+diff --git a/src/VrcPicSorter.Core/FileSystem/PathBoundary.cs b/src/VrcPicSorter.Core/FileSystem/PathBoundary.cs
+index d4df9df..399918c 100644
+--- a/src/VrcPicSorter.Core/FileSystem/PathBoundary.cs
++++ b/src/VrcPicSorter.Core/FileSystem/PathBoundary.cs
+@@ -2,6 +2,33 @@ namespace VrcPicSorter.Core.FileSystem;
+ 
+ public static class PathBoundary
+ {
++    public static bool IsConfirmedMissingDirectory(string path)
++    {
++        var normalized = Normalize(path);
++        try
++        {
++            _ = File.GetAttributes(normalized);
++            return false;
++        }
++        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
++        {
++            try
++            {
++                var parent = Path.GetDirectoryName(normalized);
++                return parent is not null && Directory.GetFileSystemEntries(parent)
++                    .All(entry => !string.Equals(Normalize(entry), normalized, StringComparison.OrdinalIgnoreCase));
++            }
++            catch (Exception observationError) when (observationError is IOException or UnauthorizedAccessException)
++            {
++                return false;
++            }
++        }
++        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
++        {
++            return false;
++        }
++    }
++
+     public static string Normalize(string path)
+     {
+         ArgumentException.ThrowIfNullOrWhiteSpace(path);
+diff --git a/src/VrcPicSorter.Core/Models/AppModels.cs b/src/VrcPicSorter.Core/Models/AppModels.cs
+index 7682652..0e27d61 100644
+--- a/src/VrcPicSorter.Core/Models/AppModels.cs
++++ b/src/VrcPicSorter.Core/Models/AppModels.cs
+@@ -85,6 +85,7 @@ public enum JournalOperationType
+ {
+     Move,
+     Recycle,
++    DeleteExactIncoming,
+ }
+ 
+ public enum JournalOperationPurpose
+@@ -165,6 +166,10 @@ public sealed class AppSettings
+ 
+     public bool OutputRootConfirmed { get; set; } = true;
+ 
++    // Only freshly generated defaults are suggestions. Older state omits this flag and
++    // remains authoritative, including temporarily unavailable archives.
++    public bool OutputRootIsSuggested { get; set; }
++
+     public List<LegacyArchiveMapping> LegacyArchiveMappings { get; set; } = [];
+ 
+     public OrganizationPolicy OrganizationPolicy { get; set; } = OrganizationPolicy.CategoryRoot;
+@@ -190,6 +195,10 @@ public sealed class AppSettings
+ 
+ public sealed class CategoryMapping
+ {
++    // False for old state. True only when a newly selected category folder was
++    // positively absent beneath a readable parent, not merely unreachable.
++    public bool ArchivePathKnownMissing { get; set; }
++
+     public VrcImageCategory Category { get; set; }
+ 
+     public string SourcePath { get; set; } = string.Empty;
+@@ -477,6 +486,7 @@ public static class AppStateDefaults
+             Settings = new AppSettings
+             {
+                 OutputRootPath = archiveRoot,
++                OutputRootIsSuggested = true,
+                 CategoryMappings = FixedCategories
+                     .Select(category => new CategoryMapping
+                     {
+diff --git a/src/VrcPicSorter.Core/Scanning/ArchiveDuplicateFinder.cs b/src/VrcPicSorter.Core/Scanning/ArchiveDuplicateFinder.cs
+index ec527f6..5a115f5 100644
+--- a/src/VrcPicSorter.Core/Scanning/ArchiveDuplicateFinder.cs
++++ b/src/VrcPicSorter.Core/Scanning/ArchiveDuplicateFinder.cs
+@@ -10,10 +10,8 @@ public enum ArchiveDuplicateKind
+     Identical,
+ 
+     /// <summary>
+-    /// The same animation of the same emoji, encoded twice: VRChat's own GIF beside the one this
+-    /// app exported from the sheet. Not the same bytes, but the same emoji and the same frame
+-    /// count, rate and loop direction - which is VRChat's own account of its own inventory item,
+-    /// not a resemblance anything guessed at.
++    /// Animations whose names describe the same emoji, frame count, rate and loop direction.
++    /// Naming metadata does not prove equal decoded content; these are review suggestions only.
+     /// </summary>
+     SameAnimation,
+ 
+@@ -32,6 +30,8 @@ public sealed record ArchiveDuplicateGroup(
+     IndexedImageRecord Keep,
+     IReadOnlyList<IndexedImageRecord> Extras)
+ {
++    public bool IsRemovable => Kind == ArchiveDuplicateKind.Identical;
++
+     public long ReclaimableBytes => Extras.Sum(item => item.FileSize);
+ }
+ 
+@@ -97,10 +97,8 @@ public static class ArchiveDuplicateFinder
+                 continue;
+             }
+ 
+-            // Animations whose names agree on every animation parameter are the same animation,
+-            // whatever their bytes say. Separated out because that is a thing the app can act on:
+-            // one of them is the file every other part of the app addresses by name, and the other
+-            // is the copy that could not have that name. Anything else stays a report.
++            // Matching names help a person review likely copies, but do not establish decoded
++            // equality. SameAnimation groups remain advisory and cannot authorize removal.
+             foreach (var byAnimation in sameEmoji.GroupBy(AnimationParameters))
+             {
+                 if (byAnimation.Count() < 2)
+@@ -139,8 +137,8 @@ public static class ArchiveDuplicateFinder
+     /// parameters in its name.
+     /// </summary>
+     /// <remarks>
+-    /// Grouping by this is what separates "the same animation twice" from "the same emoji at two
+-    /// sizes". A null is its own group per file - a name that says nothing about what it plays
++    /// Grouping by this distinguishes matching animation metadata from other same-emoji
++    /// suggestions. An unknown is its own group per file - a name that says nothing about what it plays
+     /// cannot be used to say two files play the same thing.
+     /// </remarks>
+     private static object AnimationParameters(IndexedImageRecord image)
+diff --git a/src/VrcPicSorter.Core/Scanning/ArchiveIndexer.cs b/src/VrcPicSorter.Core/Scanning/ArchiveIndexer.cs
+index 37bdcb9..72505b2 100644
+--- a/src/VrcPicSorter.Core/Scanning/ArchiveIndexer.cs
++++ b/src/VrcPicSorter.Core/Scanning/ArchiveIndexer.cs
+@@ -9,7 +9,7 @@ namespace VrcPicSorter.Core.Scanning;
+ /// The outcome of an archive index build.
+ /// <para><see cref="Errors"/> reports folder-level failures that make the index unusable.</para>
+ /// <para><see cref="SkippedFiles"/> reports individual files that could not be decoded. Skipped
+-/// files are excluded from matching but never make the whole category unusable.</para>
++/// files make coverage incomplete, so the category cannot safely route incoming images.</para>
+ /// </summary>
+ public sealed record ArchiveIndexResult(
+     VrcImageCategory Category,
+@@ -68,7 +68,6 @@ public sealed class ArchiveIndexer
+             .Where(item => item.Category == category)
+             .Select(item => item.ArchivePath)
+             .Prepend(mapping.ArchivePath)
+-            .Where(Directory.Exists)
+             .Distinct(StringComparer.OrdinalIgnoreCase)
+             .ToArray();
+         if (archiveRoots.Length == 0)
+@@ -107,7 +106,7 @@ public sealed class ArchiveIndexer
+                 .Order(StringComparer.OrdinalIgnoreCase)
+                 .ToArray();
+         }
+-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
++        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+         {
+             await PublishUnavailableAsync(category, exception.Message, cancellationToken).ConfigureAwait(false);
+             return new ArchiveIndexResult(
+@@ -152,7 +151,7 @@ public sealed class ArchiveIndexer
+             var decoded = await _decoder.DecodeAsync(path, cancellationToken).ConfigureAwait(false);
+             if (!decoded.IsSuccess)
+             {
+-                // A single unreadable archive file must not disable the whole category.
++                // Incomplete duplicate coverage cannot establish that incoming media is unique.
+                 skipped.Add($"{path}: {decoded.Failure!.Message}");
+                 continue;
+             }
+@@ -174,8 +173,16 @@ public sealed class ArchiveIndexer
+             });
+         }
+ 
+-        if (skipped.Count == 0
+-            && reuseUnchanged
++        if (skipped.Count > 0)
++        {
++            var error = "Archive coverage is incomplete. Incoming files were left unchanged. "
++                + string.Join(Environment.NewLine, skipped.Take(10));
++            await PublishUnavailableAsync(category, error, cancellationToken).ConfigureAwait(false);
++            return new ArchiveIndexResult(category, IndexStatus.Unavailable, previousIndex.Generation,
++                previousIndex.Images.Count, [error], skipped);
++        }
++
++        if (reuseUnchanged
+             && previousIndex.Status == IndexStatus.Current
+             && HaveSameFileSet(previousIndex.Images, indexed))
+         {
+@@ -219,23 +226,20 @@ public sealed class ArchiveIndexer
+                     }
+ 
+                     index.Images = indexed;
++                    current.Settings.CategoryMappings.Single(item => item.Category == category).ArchivePathKnownMissing = false;
+                     index.Status = IndexStatus.Current;
+                     index.LastCompletedUtc = _timeProvider.GetUtcNow();
+-                    index.LastError = skipped.Count == 0
+-                        ? null
+-                        : string.Join(Environment.NewLine, skipped.Take(10));
+-                    if (!reuseUnchanged || changed || skipped.Count > 0)
++                    index.LastError = null;
++                    if (!reuseUnchanged || changed)
+                     {
+                         current.History.Add(new ActivityEntry
+                         {
+                             Id = Guid.NewGuid(),
+                             OccurredUtc = _timeProvider.GetUtcNow(),
+                             Kind = ActivityKind.Scan,
+-                            Level = skipped.Count == 0 ? ActivityLevel.Information : ActivityLevel.Warning,
++                            Level = ActivityLevel.Information,
+                             Category = category,
+-                            Message = skipped.Count == 0
+-                                ? $"Indexed {indexed.Count} archive images."
+-                                : $"Indexed {indexed.Count} archive images; skipped {skipped.Count} unreadable file(s).",
++                            Message = $"Indexed {indexed.Count} archive images.",
+                         });
+                     }
+ 
+diff --git a/src/VrcPicSorter.Core/Scanning/ScanCoordinator.cs b/src/VrcPicSorter.Core/Scanning/ScanCoordinator.cs
+index 0fccebe..ede1233 100644
+--- a/src/VrcPicSorter.Core/Scanning/ScanCoordinator.cs
++++ b/src/VrcPicSorter.Core/Scanning/ScanCoordinator.cs
+@@ -60,7 +60,7 @@ public sealed record ArchivedAnimationDuplicate(
+     string AnimationPath,
+     IReadOnlyList<string> ExistingCopies);
+ 
+-public sealed class ScanCoordinator
++public sealed partial class ScanCoordinator
+ {
+     /// <summary>
+     /// How many images may be read and fingerprinted at once. Reading is pure - it touches no
+@@ -92,6 +92,15 @@ public sealed class ScanCoordinator
+     private readonly TimeProvider _timeProvider;
+     private readonly TimeSpan _settleDelay;
+     private readonly SemaphoreSlim _scanGate = new(1, 1);
++
++    /// <summary>Runs a settings application or relocation between scanner operations.
++    /// The callback must not call another scanner entry point or stop the watcher.</summary>
++    public async Task RunExclusiveAsync(Func<Task> action, CancellationToken cancellationToken = default)
++    {
++        await _scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
++        try { await action().ConfigureAwait(false); }
++        finally { _scanGate.Release(); }
++    }
+     private readonly AtlasAnimationWriter _animationWriter = new();
+ 
+     public ScanCoordinator(
+@@ -169,7 +178,8 @@ public sealed class ScanCoordinator
+                                 processingProgress?.Report(
+                                     new ScanProcessingProgress(processedImages, totalImages, activity, file));
+                             },
+-                            cancellationToken)
++                            cancellationToken,
++                            reconcileAllPending: true)
+                         .ConfigureAwait(false));
+                 }
+                 catch (Exception exception) when (
+@@ -361,7 +371,8 @@ public sealed class ScanCoordinator
+         SourceSnapshot? sourceSnapshot,
+         Action<string, string?>? onImageScanned,
+         Action<string, string?>? onImageProcessed,
+-        CancellationToken cancellationToken)
++        CancellationToken cancellationToken,
++        bool reconcileAllPending = false)
+     {
+         await _stateStore.HoldFingerprintWritesAsync(cancellationToken).ConfigureAwait(false);
+         try
+@@ -373,7 +384,8 @@ public sealed class ScanCoordinator
+                     sourceSnapshot,
+                     onImageScanned,
+                     onImageProcessed,
+-                    cancellationToken)
++                    cancellationToken,
++                    reconcileAllPending)
+                 .ConfigureAwait(false);
+         }
+         finally
+@@ -391,7 +403,8 @@ public sealed class ScanCoordinator
+         SourceSnapshot? sourceSnapshot,
+         Action<string, string?>? onImageScanned,
+         Action<string, string?>? onImageProcessed,
+-        CancellationToken cancellationToken)
++        CancellationToken cancellationToken,
++        bool reconcileAllPending)
+     {
+         var initial = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+         if (!initial.Settings.OutputRootConfirmed)
+@@ -501,7 +514,48 @@ public sealed class ScanCoordinator
+             }
+         }
+ 
+-        var paths = sourceSnapshot.Paths;
++        var resolvedQueuedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++        var requestedPaths = sourceSnapshot.Paths.Select(PathBoundary.Normalize)
++            .ToHashSet(StringComparer.OrdinalIgnoreCase);
++        var refreshed = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
++        var archivedImages = refreshed.ArchiveIndex.Categories.Single(item => item.Category == category).Images;
++        foreach (var waiting in refreshed.ReviewQueue.Where(item =>
++                     item.Category == category && item.Status == ReviewStatus.Pending
++                     && (reconcileAllPending || requestedPaths.Contains(PathBoundary.Normalize(item.IncomingOriginalPath)))
++                     && item.IncomingImageFingerprint is not null
++                     && item.Candidates.Any(candidate => candidate.MatchKind == MatchKind.Exact)))
++        {
++            var duplicate = archivedImages.FirstOrDefault(image =>
++                image.ExactFingerprint == waiting.IncomingFingerprint);
++            if (duplicate is null)
++            {
++                continue;
++            }
++
++            try
++            {
++                await _router.AutoKeepArchivedAsync(
++                    waiting.HeldFilePath, category, waiting.IncomingImageFingerprint!,
++                    duplicate.Path, duplicate.ExactFingerprint, cancellationToken, waiting.Id).ConfigureAwait(false);
++                resolvedQueuedPaths.Add(waiting.IncomingOriginalPath);
++                autoKept++;
++                if (sourceSnapshot.Paths.Contains(waiting.IncomingOriginalPath, StringComparer.OrdinalIgnoreCase))
++                {
++                    examined++;
++                    var name = Path.GetFileName(waiting.IncomingOriginalPath);
++                    onImageScanned?.Invoke("Resolved queued exact match", name);
++                    onImageProcessed?.Invoke("Resolved queued exact match", name);
++                }
++            }
++            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
++                                                 or InvalidOperationException or NotSupportedException)
++            {
++                errors.Add($"{waiting.HeldFilePath}: could not resolve queued exact match ({exception.Message}).");
++            }
++        }
++
++        initial = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
++        var paths = sourceSnapshot.Paths.Where(path => !resolvedQueuedPaths.Contains(path)).ToList();
+         skipped = sourceSnapshot.UnsupportedFiles;
+         var settledPaths = await FindSettledPathsAsync(paths, cancellationToken).ConfigureAwait(false);
+         var queuedPaths = initial.ReviewQueue
+@@ -749,7 +803,7 @@ public sealed class ScanCoordinator
+                                     cancellationToken)
+                                 .ConfigureAwait(false);
+                             autoKept++;
+-                            outcome = "Exact duplicate recycled";
++                            outcome = "Exact duplicate resolved; archived copy kept";
+                             continue;
+                         }
+                         catch (Exception exception) when (
+@@ -758,9 +812,7 @@ public sealed class ScanCoordinator
+                                 or IOException
+                                 or UnauthorizedAccessException)
+                         {
+-                            // The Recycle Bin was unavailable, or the archived copy changed
+-                            // between indexing and now. Never delete and never drop the image:
+-                            // fall through and let the user decide.
++                            // A copy changed or removal failed. Keep the incoming file in review.
+                             errors.Add($"{path}: could not resolve automatically ({exception.Message}).");
+                         }
+                     }
+@@ -919,7 +971,7 @@ public sealed class ScanCoordinator
+                         Kind = ActivityKind.Scan,
+                         Level = errors.Count == 0 ? ActivityLevel.Information : ActivityLevel.Warning,
+                         Category = category,
+-                        Message = $"Scanned {sourceRoot}: {examined} examined, {moved} moved, {animated} animated, {autoKept} exact duplicates recycled, {held} queued, {skipped} skipped, {errors.Count} failed.",
++                        Message = $"Scanned {sourceRoot}: {examined} examined, {moved} moved, {animated} animated, {autoKept} exact duplicates resolved, {held} queued, {skipped} skipped, {errors.Count} failed.",
+                         SourcePath = sourceRoot,
+                     });
+                     return true;
+@@ -950,8 +1002,7 @@ public sealed class ScanCoordinator
+ 
+         try
+         {
+-            var destination = AtlasAnimationWriter.BuildDestination(archivedPath, archiveRoot);
+-            if (File.Exists(destination))
++            if (AtlasAnimationWriter.FindExistingAnimation(archivedPath, archiveRoot) is { } destination)
+             {
+                 return await AdoptAsync(destination, name, cancellationToken).ConfigureAwait(false);
+             }
+@@ -1033,7 +1084,10 @@ public sealed class ScanCoordinator
+ 
+         try
+         {
+-            var companionPath = AtlasAnimationWriter.BuildDestination(sheet.Path, archiveRoot);
++            var ownerState = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
++            archiveRoot = ArchiveOwner.Resolve(ownerState.Settings, index.Category, sheet.Path);
++            var companionPath = AtlasAnimationWriter.FindExistingAnimation(sheet.Path, archiveRoot)
++                ?? AtlasAnimationWriter.BuildDestination(sheet.Path, archiveRoot);
+ 
+             // Animations are indexed, so the sheet's own is usually already a candidate. Adding a
+             // second record for the same file would put two rows with one path into the review,
+@@ -1119,6 +1173,21 @@ public sealed class ScanCoordinator
+     public async Task<ExportedAnimationFollowUp> FinishExportedAnimationsAsync(
+         IReadOnlyCollection<ExportedAnimation> exported,
+         CancellationToken cancellationToken = default)
++    {
++        await _scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
++        try
++        {
++            return await FinishExportedAnimationsCoreAsync(exported, cancellationToken).ConfigureAwait(false);
++        }
++        finally
++        {
++            _scanGate.Release();
++        }
++    }
++
++    private async Task<ExportedAnimationFollowUp> FinishExportedAnimationsCoreAsync(
++        IReadOnlyCollection<ExportedAnimation> exported,
++        CancellationToken cancellationToken = default)
+     {
+         ArgumentNullException.ThrowIfNull(exported);
+ 
+@@ -1142,6 +1211,7 @@ public sealed class ScanCoordinator
+                     $"{category}: the new animation could not be added to the archive index "
+                         + $"({string.Join("; ", refreshed.Errors)}). Run a scan to pick it up.");
+             }
++            warnings.AddRange(refreshed.SkippedFiles.Select(error => $"{category}: {error}"));
+         }
+ 
+         var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+@@ -1298,7 +1368,13 @@ public sealed class ScanCoordinator
+     {
+         try
+         {
++            var ownerState = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
++            archiveRoot = ArchiveOwner.Resolve(ownerState.Settings, category, archivedPath);
+             var reference = AtlasAnimationWriter.BuildReferenceDestination(archivedPath, archiveRoot);
++            if (string.Equals(Path.GetFullPath(archivedPath), Path.GetFullPath(reference), StringComparison.OrdinalIgnoreCase))
++            {
++                return null;
++            }
+ 
+             // Two different sheets can carry the same file name - the archive root disambiguates
+             // them, but the first one filed vacates that name, so the second arrives thinking it is
+@@ -1369,7 +1445,24 @@ public sealed class ScanCoordinator
+         // Which emoji already have an animation, whatever their file happens to be called. Read
+         // from the folder rather than from the index, because this is a question about what is on
+         // disk and the index can be a scan behind it.
+-        var animated = ReadAnimatedEmoji(archiveRoot);
++        var owners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
++        foreach (var image in index.Images.Where(image => EmojiAtlasName.TryParse(image.Path, out _)))
++        {
++            try
++            {
++                owners[image.Path] = ArchiveOwner.Resolve(state.Settings, category, image.Path);
++            }
++            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
++                or InvalidOperationException or ArgumentException or NotSupportedException)
++            {
++                errors.Add($"{image.Path}: could not resolve archive ownership ({exception.Message})");
++                return new BackfillResult(0, 0);
++            }
++        }
++        var animatedByRoot = owners.Values.Distinct(StringComparer.OrdinalIgnoreCase)
++            .ToDictionary(root => root, ReadAnimatedEmoji, StringComparer.OrdinalIgnoreCase);
++        var animated = new HashSet<string>(animatedByRoot.SelectMany(pair =>
++            pair.Value.Select(key => pair.Key + "|" + key)), StringComparer.OrdinalIgnoreCase);
+         var existing = animated.Count;
+ 
+         var pending = new List<IndexedImageRecord>();
+@@ -1396,7 +1489,7 @@ public sealed class ScanCoordinator
+ 
+             // Add answers both questions at once: is this emoji already animated, and has an
+             // earlier sheet in this same run already claimed it.
+-            if (!animated.Add(EmojiIdentity.KeyFor(image.Path)))
++            if (!animated.Add(owners[image.Path] + "|" + EmojiIdentity.KeyFor(image.Path)))
+             {
+                 if (!AtlasAnimationWriter.IsReferenceFolder(image.Path))
+                 {
+@@ -1425,6 +1518,7 @@ public sealed class ScanCoordinator
+         var written = 0;
+         foreach (var image in pending)
+         {
++            archiveRoot = owners[image.Path];
+             cancellationToken.ThrowIfCancellationRequested();
+             try
+             {
+diff --git a/src/VrcPicSorter.Core/Storage/OperationJournal.cs b/src/VrcPicSorter.Core/Storage/OperationJournal.cs
+index 52a6777..8d28637 100644
+--- a/src/VrcPicSorter.Core/Storage/OperationJournal.cs
++++ b/src/VrcPicSorter.Core/Storage/OperationJournal.cs
+@@ -8,6 +8,7 @@ public enum JournalPathState
+     Missing,
+     ExpectedFile,
+     DifferentFile,
++    Unavailable,
+ }
+ 
+ public enum JournalReconciliationAction
+@@ -121,10 +122,16 @@ public sealed class OperationJournal
+             return Decision(entry, JournalReconciliationAction.None, "The operation is already complete.");
+         }
+ 
++        if (observation.Source == JournalPathState.Unavailable || observation.Destination == JournalPathState.Unavailable)
++        {
++            return Decision(entry, JournalReconciliationAction.NeedsAttention,
++                "Storage could not be read reliably. The operation remains pending until its paths can be verified.");
++        }
++
+         return entry.OperationType switch
+         {
+             JournalOperationType.Move => ReconcileMove(entry, observation),
+-            JournalOperationType.Recycle => ReconcileRecycle(entry, observation),
++            JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming => ReconcileRemoval(entry, observation),
+             _ => Decision(entry, JournalReconciliationAction.NeedsAttention, "The operation type is unknown."),
+         };
+     }
+@@ -172,20 +179,20 @@ public sealed class OperationJournal
+         return Decision(entry, JournalReconciliationAction.NeedsAttention, "The observed move paths do not prove a safe retry or completion.");
+     }
+ 
+-    private static JournalReconciliationDecision ReconcileRecycle(
++    private static JournalReconciliationDecision ReconcileRemoval(
+         JournalEntry entry,
+         JournalFileObservation observation)
+     {
+         if (observation.Destination != JournalPathState.NotApplicable)
+         {
+-            return Decision(entry, JournalReconciliationAction.NeedsAttention, "Recycle operations do not have a destination path.");
++            return Decision(entry, JournalReconciliationAction.NeedsAttention, "Removal operations do not have a destination path.");
+         }
+ 
+         if (observation.Source == JournalPathState.ExpectedFile)
+         {
+             return entry.Phase is JournalPhase.IntentRecorded or JournalPhase.SideEffectStarted or JournalPhase.NeedsAttention
+-                ? Decision(entry, JournalReconciliationAction.RetrySideEffect, "The expected source is intact and can be recycled once.")
+-                : Decision(entry, JournalReconciliationAction.NeedsAttention, "The journal says recycling was applied, but the source is still present.");
++                ? Decision(entry, JournalReconciliationAction.RetrySideEffect, "The expected source is intact; removal can be retried after verifying the retained copy.")
++                : Decision(entry, JournalReconciliationAction.NeedsAttention, "The journal says removal was applied, but the source is still present.");
+         }
+ 
+         if (observation.Source == JournalPathState.Missing)
+@@ -195,12 +202,12 @@ public sealed class OperationJournal
+                 return Decision(
+                     entry,
+                     JournalReconciliationAction.NeedsAttention,
+-                    "The source changed before the journal recorded that recycling started.");
++                    "The source changed before the journal recorded that removal started.");
+             }
+ 
+             return entry.Phase == JournalPhase.StateCommitted
+                 ? Decision(entry, JournalReconciliationAction.MarkCompleted, "The source is absent and durable state was committed.")
+-                : Decision(entry, JournalReconciliationAction.CommitState, "The source is absent, so the recycle side effect must not be repeated.");
++                : Decision(entry, JournalReconciliationAction.CommitState, "The source is absent, so removal must not be repeated.");
+         }
+ 
+         return Decision(entry, JournalReconciliationAction.NeedsAttention, "The source path contains a different file and cannot be reconciled automatically.");
+@@ -267,7 +274,14 @@ public sealed class OperationJournal
+             throw new ArgumentException("Move journal entries require a destination path.", nameof(entry));
+         }
+ 
+-        if (entry.OperationType == JournalOperationType.Recycle
++        if (entry.OperationType == JournalOperationType.DeleteExactIncoming
++            && (entry.Purpose != JournalOperationPurpose.AutoKeepArchived
++                || !string.Equals(entry.ExpectedSource.Fingerprint, entry.SurvivingFingerprint, StringComparison.Ordinal)))
++        {
++            throw new ArgumentException("Permanent deletion requires an exact archived survivor.", nameof(entry));
++        }
++
++        if (entry.OperationType is JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming
+             && entry.DestinationPath is not null)
+         {
+             throw new ArgumentException("Recycle journal entries cannot have a destination path.", nameof(entry));
+@@ -286,7 +300,7 @@ public sealed class OperationJournal
+     public static bool RequiresSurvivingCopy(JournalEntry entry)
+     {
+         ArgumentNullException.ThrowIfNull(entry);
+-        return entry.OperationType == JournalOperationType.Recycle
++        return entry.OperationType is JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming
+             && entry.Purpose is JournalOperationPurpose.AutoKeepArchived
+                 or JournalOperationPurpose.AutoKeepHeld
+                 or JournalOperationPurpose.RemoveArchiveDuplicate
+diff --git a/tests/VrcPicSorter.Tests/Atlas/AtlasAnimationCatalogTests.cs b/tests/VrcPicSorter.Tests/Atlas/AtlasAnimationCatalogTests.cs
+index c22e5a6..fbc98b5 100644
+--- a/tests/VrcPicSorter.Tests/Atlas/AtlasAnimationCatalogTests.cs
++++ b/tests/VrcPicSorter.Tests/Atlas/AtlasAnimationCatalogTests.cs
+@@ -2,11 +2,210 @@ using VrcPicSorter.Core.Atlas;
+ using VrcPicSorter.Core.Models;
+ using VrcPicSorter.Core.Storage;
+ using VrcPicSorter.Tests.FileSystem;
++using VrcPicSorter.Tests.Imaging;
++using SixLabors.ImageSharp;
+ 
+ namespace VrcPicSorter.Tests.Atlas;
+ 
+ public sealed class AtlasAnimationCatalogTests
+ {
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task RetainedDatedReferenceUsesItsOriginalArchive(bool existing)
++    {
++        using var directory = new TestDirectory();
++        var root = directory.GetPath("old", "Emoji");
++        using var store = CreateStoreWithSheet(directory, root, "a", out var path);
++        using (var pixels = ImageFixtureFactory.CreatePattern(17, 64, 64))
++            await pixels.SaveAsPngAsync(path);
++        var reference = Path.Combine(root, "Animated", "Gif Ref", "2025-09", Path.GetFileName(path));
++        Directory.CreateDirectory(Path.GetDirectoryName(reference)!);
++        File.Move(path, reference);
++        var destination = Path.Combine(root, "Animated", "2025-09", Path.GetFileNameWithoutExtension(path) + ".gif");
++        if (existing)
++            Assert.True((await new AtlasAnimationWriter().TryWriteAsync(reference, root)).Exported);
++        await store.UpdateAsync(state =>
++        {
++            state.ArchiveIndex.Categories.Single(x => x.Category == VrcImageCategory.Emoji).Images.Single().Path = reference;
++            state.Settings.CategoryMappings.Single(x => x.Category == VrcImageCategory.Emoji).ArchivePath = directory.GetPath("new", "Emoji");
++            state.Settings.LegacyArchiveMappings.Add(new LegacyArchiveMapping { Category = VrcImageCategory.Emoji, ArchivePath = root });
++            return true;
++        });
++        var catalog = new AtlasAnimationCatalog(store);
++        var sheet = Assert.Single(await catalog.ListAsync());
++        Assert.Equal(root, sheet.ArchiveRoot);
++        Assert.Equal(destination, sheet.AnimationPath);
++        var result = await catalog.ExportMissingAsync(sheet);
++        Assert.True(result.Exported, result.Warning);
++        Assert.Equal(existing, result.ReusedExisting);
++        Assert.Equal(destination, result.Path);
++        Assert.Single(Directory.GetFiles(root, "*.gif", SearchOption.AllDirectories));
++    }
++
++    [Fact]
++    public async Task LockedRetainedGifReportsAnIncompleteCatalogInsteadOfAnEmptyQueue()
++    {
++        using var directory = new TestDirectory();
++        var root = directory.GetPath("archive", "Emoji");
++        using var store = CreateStoreWithSheet(directory, root, "a", out var path);
++        var retained = Path.ChangeExtension(AtlasAnimationWriter.BuildDestination(path, root), null) + " (2).gif";
++        Directory.CreateDirectory(Path.GetDirectoryName(retained)!);
++        await File.WriteAllBytesAsync(retained, [1, 2, 3]);
++        using var locked = new FileStream(retained, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
++        await Assert.ThrowsAsync<IOException>(() => new AtlasAnimationCatalog(store).ListAsync());
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task RetainedNumberedAnimationDoesNotReturnToTheMissingQueue(bool indexed)
++    {
++        using var directory = new TestDirectory();
++        var root = directory.GetPath("archive", "Emoji");
++        using var store = CreateStoreWithSheet(directory, root, "a", out var path);
++        using (var pixels = ImageFixtureFactory.CreatePattern(17, 64, 64))
++            await pixels.SaveAsPngAsync(path);
++        var catalog = new AtlasAnimationCatalog(store);
++        var sheet = Assert.Single(await catalog.ListAsync());
++        var first = await catalog.ExportAsync(sheet, sheet.Name);
++        Assert.True(first.Exported, first.Warning);
++        var retained = Path.ChangeExtension(first.Path, null) + " (2).gif";
++        File.Move(first.Path!, retained);
++        if (indexed)
++            await store.UpdateAsync(state =>
++            {
++                state.ArchiveIndex.Categories.Single(x => x.Category == VrcImageCategory.Emoji).Images.Add(
++                    new IndexedImageRecord
++                    {
++                        Id = Guid.NewGuid(),
++                        Category = VrcImageCategory.Emoji,
++                        Path = retained,
++                        ExactFingerprint = "retained"
++                    });
++                return true;
++            });
++        var listed = Assert.Single(await catalog.ListAsync());
++        Assert.False(listed.NeedsDecision);
++        Assert.Equal(retained, listed.AnimationPath);
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task MissingExportRechecksDiskAndPreservesTheRetainedGif(bool filed)
++    {
++        using var directory = new TestDirectory();
++        var root = directory.GetPath("archive", "Emoji");
++        using var store = CreateStoreWithSheet(directory, root, "a", out var path);
++        using (var pixels = ImageFixtureFactory.CreatePattern(17, 64, 64))
++            await pixels.SaveAsPngAsync(path);
++        if (filed)
++        {
++            var reference = AtlasAnimationWriter.BuildReferenceDestination(path, root);
++            Directory.CreateDirectory(Path.GetDirectoryName(reference)!);
++            File.Move(path, reference);
++            await store.UpdateAsync(state =>
++            {
++                state.ArchiveIndex.Categories.Single(x => x.Category == VrcImageCategory.Emoji).Images.Single().Path = reference;
++                return true;
++            });
++        }
++        var catalog = new AtlasAnimationCatalog(store);
++        var stale = Assert.Single(await catalog.ListAsync());
++        var first = await catalog.ExportAsync(stale, stale.Name);
++        Assert.True(first.Exported, first.Warning);
++        var retained = Path.ChangeExtension(first.Path, null) + " (3).gif";
++        File.Move(first.Path!, retained);
++        var bytes = await File.ReadAllBytesAsync(retained);
++
++        for (var i = 0; i < 2; i++)
++        {
++            var result = await catalog.ExportMissingAsync(stale);
++            Assert.True(result.ReusedExisting);
++            Assert.Equal(retained, result.Path);
++            Assert.Single(Directory.GetFiles(root, "*.gif", SearchOption.AllDirectories));
++            Assert.Equal(bytes, await File.ReadAllBytesAsync(retained));
++        }
++        Assert.False((await catalog.ExportAsync(stale, stale.Name)).Exported);
++        var current = Assert.Single(await catalog.ListAsync());
++        var corrected = await catalog.ExportAsync(current, current.Name with { FramesPerSecond = 20 });
++        Assert.True(corrected.Exported, corrected.Warning);
++        Assert.Equal(retained, corrected.Path);
++        var correctedBytes = await File.ReadAllBytesAsync(retained);
++        Assert.False(bytes.SequenceEqual(correctedBytes));
++        Assert.Single(Directory.GetFiles(root, "*.gif", SearchOption.AllDirectories));
++        var staleReplacement = await catalog.ExportAsync(current, current.Name);
++        Assert.False(staleReplacement.Exported);
++        Assert.Contains("changed", staleReplacement.Warning);
++        Assert.Equal(correctedBytes, await File.ReadAllBytesAsync(retained));
++        File.Delete(retained);
++        Assert.False((await catalog.ExportAsync(current, current.Name)).Exported);
++        Assert.True((await catalog.ExportMissingAsync(stale)).Exported);
++    }
++
++    [Fact]
++    public async Task CorruptRetainedGifIsNotOverwrittenOrDuplicated()
++    {
++        using var directory = new TestDirectory();
++        var root = directory.GetPath("archive", "Emoji");
++        using var store = CreateStoreWithSheet(directory, root, "a", out var path);
++        var catalog = new AtlasAnimationCatalog(store);
++        var sheet = Assert.Single(await catalog.ListAsync());
++        var retained = Path.ChangeExtension(AtlasAnimationWriter.BuildDestination(path, root), null) + " (2).gif";
++        Directory.CreateDirectory(Path.GetDirectoryName(retained)!);
++        await File.WriteAllTextAsync(retained, "not a gif");
++        var result = await catalog.ExportMissingAsync(sheet);
++        Assert.False(result.Exported);
++        Assert.Contains("could not be read", result.Warning);
++        Assert.Equal("not a gif", await File.ReadAllTextAsync(retained));
++        Assert.Single(Directory.GetFiles(root, "*.gif", SearchOption.AllDirectories));
++    }
++
++    [Fact]
++    public async Task AnotherEmojiDoesNotSuppressAnExport()
++    {
++        using var directory = new TestDirectory();
++        var root = directory.GetPath("archive", "Emoji");
++        using var store = CreateStoreWithSheet(directory, root, "a", out var path);
++        using (var pixels = ImageFixtureFactory.CreatePattern(17, 64, 64))
++        {
++            await pixels.SaveAsPngAsync(path);
++            await pixels.SaveAsGifAsync(Path.Combine(root, "unrelated.gif"));
++        }
++        var catalog = new AtlasAnimationCatalog(store);
++        var sheet = Assert.Single(await catalog.ListAsync());
++        Assert.True(sheet.NeedsDecision);
++        var result = await catalog.ExportMissingAsync(sheet);
++        Assert.True(result.Exported, result.Warning);
++        Assert.False(result.ReusedExisting);
++        Assert.Equal(2, Directory.GetFiles(root, "*.gif", SearchOption.AllDirectories).Length);
++    }
++
++    [Fact]
++    public async Task RedirectedAnimationFolderIsNeverWrittenThrough()
++    {
++        using var directory = new TestDirectory();
++        var root = directory.GetPath("archive", "Emoji");
++        using var store = CreateStoreWithSheet(directory, root, "a", out var path);
++        var sheet = Assert.Single(await new AtlasAnimationCatalog(store).ListAsync());
++        var outside = directory.GetPath("outside");
++        Directory.CreateDirectory(outside);
++        var linked = Path.Combine(root, "Animated");
++        Assert.True(await PathBoundaryTests.TryCreateJunctionAsync(linked, outside));
++        try
++        {
++            var result = await new AtlasAnimationCatalog(store).ExportMissingAsync(sheet);
++            Assert.False(result.Exported);
++            Assert.NotNull(result.Warning);
++            Assert.Empty(Directory.GetFiles(outside));
++        }
++        finally
++        {
++            Directory.Delete(linked);
++        }
++    }
++
+     [Fact]
+     public async Task SkippingASheetTakesItOutOfTheQueueWithoutTouchingIt()
+     {
+diff --git a/tests/VrcPicSorter.Tests/FileSystem/ArchiveRelocationTests.cs b/tests/VrcPicSorter.Tests/FileSystem/ArchiveRelocationTests.cs
+index eda8bc4..1d2bc03 100644
+--- a/tests/VrcPicSorter.Tests/FileSystem/ArchiveRelocationTests.cs
++++ b/tests/VrcPicSorter.Tests/FileSystem/ArchiveRelocationTests.cs
+@@ -6,6 +6,119 @@ namespace VrcPicSorter.Tests.FileSystem;
+ 
+ public sealed class ArchiveRelocationTests
+ {
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task ProgressFailurePreservesCompletedMoveReceipt(bool cancelled)
++    {
++        using var directory = new TestDirectory();
++        var from = directory.GetPath("old", "Emoji");
++        var to = directory.GetPath("new", "Emoji");
++        Directory.CreateDirectory(from);
++        var source = Path.Combine(from, "a.png");
++        var destination = Path.Combine(to, "a.png");
++        File.WriteAllText(source, "a");
++        var result = await ArchiveRelocation.RelocateAsync([
++            new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 1, 1)],
++            new CallbackProgress(_ =>
++            {
++                if (cancelled) throw new OperationCanceledException("Progress reporting stopped.");
++                throw new IOException("Progress reporting failed.");
++            }));
++
++        Assert.False(File.Exists(source));
++        Assert.Equal("a", File.ReadAllText(destination));
++        Assert.Equal(1, result.Moved);
++        Assert.Equal(0, result.LeftBehind);
++        Assert.Equal(destination, Assert.Single(result.Moves).To);
++        Assert.NotEmpty(result.Errors);
++        Assert.True(result.Stopped);
++    }
++
++    [Fact]
++    public async Task RelocationReturnsToCallerAndStopsBetweenFiles()
++    {
++        using var directory = new TestDirectory();
++        var from = directory.GetPath("old", "Emoji");
++        var to = directory.GetPath("new", "Emoji");
++        Directory.CreateDirectory(from);
++        File.WriteAllText(Path.Combine(from, "a.png"), "a");
++        File.WriteAllText(Path.Combine(from, "b.png"), "b");
++        using var cancellation = new CancellationTokenSource();
++        using var release = new ManualResetEventSlim();
++        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var returned = new TaskCompletionSource<Task<ArchiveRelocationResult>>(TaskCreationOptions.RunContinuationsAsynchronously);
++        var thread = new Thread(() =>
++        {
++            try
++            {
++                returned.SetResult(ArchiveRelocation.RelocateAsync([
++                    new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 2, 2)],
++                    new CallbackProgress(_ => { reached.TrySetResult(); release.Wait(TimeSpan.FromSeconds(10)); }), cancellation.Token));
++            }
++            catch (Exception exception) { returned.TrySetException(exception); }
++        }) { IsBackground = true };
++        thread.SetApartmentState(ApartmentState.STA);
++        thread.Start();
++        bool callerResponsive;
++        try
++        {
++            await reached.Task.WaitAsync(TimeSpan.FromSeconds(10));
++            callerResponsive = await Task.WhenAny(returned.Task, Task.Delay(TimeSpan.FromSeconds(2))) == returned.Task;
++        }
++        finally
++        {
++            cancellation.Cancel();
++            release.Set();
++        }
++        var result = await (await returned.Task.WaitAsync(TimeSpan.FromSeconds(10))).WaitAsync(TimeSpan.FromSeconds(10));
++        Assert.True(callerResponsive, "Relocation blocked its caller during file work.");
++        Assert.True(result.Stopped);
++        Assert.Equal(1, result.Moved);
++        Assert.Single(result.Moves);
++        Assert.Single(Directory.GetFiles(from));
++        Assert.Single(Directory.GetFiles(to));
++    }
++
++    private sealed class CallbackProgress(Action<ArchiveRelocationProgress> callback) : IProgress<ArchiveRelocationProgress>
++    {
++        public void Report(ArchiveRelocationProgress value) => callback(value);
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task OverlappingRelocationMovesNothing(bool reverse)
++    {
++        using var directory = new TestDirectory();
++        var parent = directory.GetPath("old", "Emoji");
++        var child = Path.Combine(parent, "new-output", "Emoji");
++        Directory.CreateDirectory(child);
++        var original = Path.Combine(parent, "old.png");
++        var alreadyNew = Path.Combine(child, "new.png");
++        File.WriteAllText(original, "old");
++        File.WriteAllText(alreadyNew, "new");
++        var step = new ArchiveRelocationStep(VrcImageCategory.Emoji,
++            reverse ? child : parent, reverse ? parent : child, 2, 6);
++        var result = await ArchiveRelocation.RelocateAsync([step]);
++        Assert.Equal(0, result.Moved);
++        Assert.NotEmpty(result.Errors);
++        Assert.Equal("old", File.ReadAllText(original));
++        Assert.Equal("new", File.ReadAllText(alreadyNew));
++    }
++
++    [Fact]
++    public async Task MissingRelocationRootIsNotReportedAsAnEmptySuccess()
++    {
++        using var directory = new TestDirectory();
++        var from = directory.GetPath("offline", "Emoji");
++        var result = await ArchiveRelocation.RelocateAsync([
++            new ArchiveRelocationStep(VrcImageCategory.Emoji, from, directory.GetPath("new", "Emoji"), 25, 100)]);
++        Assert.Equal(0, result.Moved);
++        Assert.NotEmpty(result.Errors);
++        Assert.NotEmpty(ArchiveRelocation.Plan(Settings(from), directory.GetPath("new")));
++    }
++
+     [Fact]
+     public void ARetainedArchiveStillHoldingFilesIsPlanned()
+     {
+diff --git a/tests/VrcPicSorter.Tests/FileSystem/FileRouterTests.cs b/tests/VrcPicSorter.Tests/FileSystem/FileRouterTests.cs
+index 35cae4b..67fea21 100644
+--- a/tests/VrcPicSorter.Tests/FileSystem/FileRouterTests.cs
++++ b/tests/VrcPicSorter.Tests/FileSystem/FileRouterTests.cs
+@@ -11,6 +11,114 @@ namespace VrcPicSorter.Tests.FileSystem;
+ 
+ public sealed class FileRouterTests
+ {
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task RecoveryDoesNotCommitRemovalWhenSourceParentIsUnavailable(bool permanent)
++    {
++        using var directory = new TestDirectory();
++        var sourceRoot = directory.GetPath("incoming");
++        var archiveRoot = directory.GetPath("archive", "Emoji");
++        Directory.CreateDirectory(archiveRoot);
++        var keeper = Path.Combine(archiveRoot, "keeper.png");
++        using var image = ImageFixtureFactory.CreatePattern(23);
++        await image.SaveAsPngAsync(keeper);
++        var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
++        using var store = CreateStore(directory, sourceRoot, archiveRoot);
++        var journal = new OperationJournal(store);
++        var entry = await journal.RecordIntentAsync(new JournalEntry
++        {
++            Category = VrcImageCategory.Emoji,
++            OperationType = permanent ? JournalOperationType.DeleteExactIncoming : JournalOperationType.Recycle,
++            Purpose = JournalOperationPurpose.AutoKeepArchived,
++            SourcePath = Path.Combine(sourceRoot, "unavailable", "copy.png"),
++            SurvivingPath = keeper, SurvivingFingerprint = fingerprint.ExactIdentity,
++            ExpectedSource = new ExpectedFileIdentity { Fingerprint = fingerprint.ExactIdentity },
++        });
++        await journal.AdvanceAsync(entry.Id, JournalPhase.SideEffectStarted);
++        var router = new FileRouter(store, new ImageDecoder(), new FakeRecycleBinService());
++        var decision = Assert.Single(await router.RecoverPendingOperationsAsync());
++        Assert.Equal(JournalReconciliationAction.NeedsAttention, decision.Action);
++        var state = await store.LoadAsync();
++        Assert.Equal(JournalPhase.NeedsAttention, Assert.Single(state.OperationJournal).Phase);
++        Assert.Empty(state.History);
++        Assert.True(File.Exists(keeper));
++    }
++
++    [Theory]
++    [InlineData("archive-changed", false)]
++    [InlineData("archive-missing", false)]
++    [InlineData("source-changed", false)]
++    [InlineData("same-path", false)]
++    [InlineData("archive-changed", true)]
++    [InlineData("archive-missing", true)]
++    [InlineData("source-changed", true)]
++    [InlineData("same-path", true)]
++    [InlineData("unchanged", true)]
++    [InlineData("already-deleted", true)]
++    public async Task PermanentExactDeletionRevalidatesBothCopiesIncludingRecovery(string scenario, bool recover)
++    {
++        using var directory = new TestDirectory();
++        var sourceRoot = directory.GetPath("incoming");
++        var archiveRoot = directory.GetPath("archive", "Emoji");
++        Directory.CreateDirectory(sourceRoot);
++        Directory.CreateDirectory(archiveRoot);
++        var source = Path.Combine(sourceRoot, "copy.png");
++        var archive = Path.Combine(archiveRoot, "original.png");
++        using var image = ImageFixtureFactory.CreatePattern(21);
++        using var changed = ImageFixtureFactory.CreatePattern(22);
++        await image.SaveAsPngAsync(source);
++        await image.SaveAsPngAsync(archive);
++        var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
++        using var store = CreateStore(directory, sourceRoot, archiveRoot);
++        var router = new FileRouter(store, new ImageDecoder(), new FakeRecycleBinService(canRecycle: false));
++        if (scenario == "archive-changed") await changed.SaveAsPngAsync(archive);
++        if (scenario == "archive-missing") File.Delete(archive);
++        if (scenario == "source-changed") await changed.SaveAsPngAsync(source);
++        if (scenario == "same-path") archive = source;
++
++        if (recover)
++        {
++            var entry = new JournalEntry
++            {
++                Id = Guid.NewGuid(),
++                Category = VrcImageCategory.Emoji,
++                OperationType = JournalOperationType.DeleteExactIncoming,
++                Purpose = JournalOperationPurpose.AutoKeepArchived,
++                SourcePath = source,
++                SurvivingPath = archive,
++                SurvivingFingerprint = fingerprint.ExactIdentity,
++                ExpectedSource = new ExpectedFileIdentity { Fingerprint = fingerprint.ExactIdentity },
++            };
++            var journal = new OperationJournal(store);
++            await journal.RecordIntentAsync(entry);
++            if (scenario == "already-deleted")
++            {
++                await journal.AdvanceAsync(entry.Id, JournalPhase.SideEffectStarted);
++                File.Delete(source);
++            }
++            await router.RecoverPendingOperationsAsync();
++            if (scenario is "unchanged" or "already-deleted")
++            {
++                Assert.False(File.Exists(source));
++                Assert.True(File.Exists(archive));
++                Assert.Empty((await store.LoadAsync()).OperationJournal);
++                await router.RecoverPendingOperationsAsync();
++                Assert.Single((await store.LoadAsync()).History);
++                return;
++            }
++
++            Assert.Equal(JournalPhase.NeedsAttention, Assert.Single((await store.LoadAsync()).OperationJournal).Phase);
++        }
++        else
++        {
++            await Assert.ThrowsAsync<InvalidOperationException>(() => router.AutoKeepArchivedAsync(
++                source, VrcImageCategory.Emoji, fingerprint, archive, fingerprint.ExactIdentity));
++        }
++
++        Assert.True(File.Exists(source));
++    }
++
+     [Fact]
+     public async Task UniqueMoveUsesDeterministicCollisionSuffixAndCommitsJournal()
+     {
+diff --git a/tests/VrcPicSorter.Tests/Scanning/ArchiveDuplicateFinderTests.cs b/tests/VrcPicSorter.Tests/Scanning/ArchiveDuplicateFinderTests.cs
+index bd24549..526210c 100644
+--- a/tests/VrcPicSorter.Tests/Scanning/ArchiveDuplicateFinderTests.cs
++++ b/tests/VrcPicSorter.Tests/Scanning/ArchiveDuplicateFinderTests.cs
+@@ -5,6 +5,17 @@ namespace VrcPicSorter.Tests.Scanning;
+ 
+ public sealed class ArchiveDuplicateFinderTests
+ {
++    [Theory]
++    [InlineData(ArchiveDuplicateKind.Identical, true)]
++    [InlineData(ArchiveDuplicateKind.SameAnimation, false)]
++    [InlineData(ArchiveDuplicateKind.SameEmoji, false)]
++    public void OnlyDecodedIdenticalCopiesCanBeRemoved(ArchiveDuplicateKind kind, bool removable)
++    {
++        var group = new ArchiveDuplicateGroup(kind, Record(@"C:\a\original.gif", "A"),
++            [Record(@"C:\a\copy.gif", "B")]);
++        Assert.Equal(removable, group.IsRemovable);
++    }
++
+     private const string Id = "11111111-2222-3333-4444-555555555555";
+ 
+     [Fact]
+@@ -88,14 +99,11 @@ public sealed class ArchiveDuplicateFinderTests
+     /// exported from the sheet, under the very same name plus a copy number.
+     /// </summary>
+     /// <remarks>
+-    /// Names taken verbatim from the archive this was reported against, where about forty pairs of
+-    /// them had accumulated. They are not the same bytes and never will be - one is VRChat's
+-    /// encoding and the other this app's - so nothing that compares pixels could ever offer to
+-    /// tidy them. What says they are the same animation is VRChat's own account of its own
+-    /// inventory item: the emoji id, and the frame count, rate and loop direction in both names.
++    /// The inventory ID and animation parameters in the names support a review suggestion.
++    /// Different decoded fingerprints mean the app cannot safely remove either copy on that basis.
+     /// </remarks>
+     [Fact]
+-    public void TheSameAnimationEncodedTwiceIsSomethingTheAppCanActOn()
++    public void MatchingAnimationNamesWithDifferentFingerprintsAreOnlyAReviewSuggestion()
+     {
+         const string original =
+             @"C:\Animated\_ShadowRogue__inv_b191ba0d-fdcd-427b-8386-3daab2b8cff9"
+@@ -109,8 +117,9 @@ public sealed class ArchiveDuplicateFinderTests
+             Record(original, "BBB", size: 569889))));
+ 
+         Assert.Equal(ArchiveDuplicateKind.SameAnimation, group.Kind);
++        Assert.False(group.IsRemovable);
+ 
+-        // The copy that kept the name stays: it is the one every other part of the app addresses.
++        // The tidier name is only the suggested keeper; this group cannot authorize recycling.
+         Assert.Equal(original, group.Keep.Path);
+         Assert.Equal(copy, Assert.Single(group.Extras).Path);
+         Assert.Equal(694109, group.ReclaimableBytes);
+diff --git a/tests/VrcPicSorter.Tests/Scanning/ArchiveIndexerTests.cs b/tests/VrcPicSorter.Tests/Scanning/ArchiveIndexerTests.cs
+index 8565ae1..3f93e07 100644
+--- a/tests/VrcPicSorter.Tests/Scanning/ArchiveIndexerTests.cs
++++ b/tests/VrcPicSorter.Tests/Scanning/ArchiveIndexerTests.cs
+@@ -9,6 +9,36 @@ namespace VrcPicSorter.Tests.Scanning;
+ 
+ public sealed class ArchiveIndexerTests
+ {
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task UnavailableConfiguredRootPreservesCachedIndex(bool currentUnavailable)
++    {
++        using var directory = new TestDirectory();
++        var source = directory.GetPath("incoming");
++        var current = directory.GetPath("archive", "Emoji");
++        var retained = directory.GetPath("retained");
++        Directory.CreateDirectory(source);
++        Directory.CreateDirectory(current);
++        Directory.CreateDirectory(retained);
++        using var image = ImageFixtureFactory.CreatePattern(207);
++        var original = Path.Combine(currentUnavailable ? current : retained, "keeper.png");
++        await image.SaveAsPngAsync(original);
++        using var store = FileRouterTests.CreateStore(directory, source, current);
++        await store.UpdateAsync(state => { state.Settings.LegacyArchiveMappings.Add(
++            new LegacyArchiveMapping { Category = VrcImageCategory.Emoji, ArchivePath = retained }); return true; });
++        var indexer = new ArchiveIndexer(store, new ImageDecoder());
++        Assert.Equal(IndexStatus.Current, (await indexer.RefreshAsync(VrcImageCategory.Emoji)).Status);
++        var unavailable = currentUnavailable ? current : retained;
++        Directory.Move(unavailable, unavailable + "-offline");
++        var result = await indexer.RefreshAsync(VrcImageCategory.Emoji);
++        Assert.Equal(IndexStatus.Unavailable, result.Status);
++        Assert.NotEmpty(result.Errors);
++        Assert.Equal(original, Assert.Single((await store.LoadAsync()).ArchiveIndex.Categories[0].Images).Path);
++        Directory.Move(unavailable + "-offline", unavailable);
++        Assert.Equal(IndexStatus.Current, (await indexer.RefreshAsync(VrcImageCategory.Emoji)).Status);
++    }
++
+     [Fact]
+     public async Task RefreshReusesPersistedFingerprintForUnchangedFile()
+     {
+@@ -119,7 +149,7 @@ public sealed class ArchiveIndexerTests
+     }
+ 
+     [Fact]
+-    public async Task UnreadableArchiveFileIsSkippedWithoutDisablingTheCategory()
++    public async Task UnreadableArchiveFilePreventsClaimingCompleteCoverage()
+     {
+         using var directory = new TestDirectory();
+         var sourceRoot = directory.GetPath("incoming");
+@@ -141,11 +171,11 @@ public sealed class ArchiveIndexerTests
+         var result = await indexer.RefreshAsync(VrcImageCategory.Emoji);
+         var index = (await store.LoadAsync()).ArchiveIndex.Categories[0];
+ 
+-        Assert.Equal(IndexStatus.Current, result.Status);
+-        Assert.Equal(IndexStatus.Current, index.Status);
+-        Assert.Empty(result.Errors);
++        Assert.Equal(IndexStatus.Unavailable, result.Status);
++        Assert.Equal(IndexStatus.Unavailable, index.Status);
++        Assert.NotEmpty(result.Errors);
+         Assert.Contains(unreadable, Assert.Single(result.SkippedFiles));
+-        Assert.Equal(readable, Assert.Single(index.Images).Path);
++        Assert.Empty(index.Images);
+         Assert.NotNull(index.LastError);
+     }
+ }
+diff --git a/tests/VrcPicSorter.Tests/Scanning/ScanCoordinatorTests.cs b/tests/VrcPicSorter.Tests/Scanning/ScanCoordinatorTests.cs
+index 1908773..33ae2e8 100644
+--- a/tests/VrcPicSorter.Tests/Scanning/ScanCoordinatorTests.cs
++++ b/tests/VrcPicSorter.Tests/Scanning/ScanCoordinatorTests.cs
+@@ -14,6 +14,131 @@ namespace VrcPicSorter.Tests.Scanning;
+ 
+ public sealed class ScanCoordinatorTests
+ {
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task RetainedDatedSheetBackfillStaysInItsOwningArchive(bool existing)
++    {
++        using var directory = new TestDirectory();
++        var source = directory.GetPath("incoming");
++        var archive = directory.GetPath("new", "Emoji");
++        var retained = directory.GetPath("old", "Emoji");
++        Directory.CreateDirectory(source);
++        Directory.CreateDirectory(archive);
++        var sheet = Path.Combine(retained, "Animated", "Gif Ref", "2025-09", "player_x_4frames_10fps_linearloopStyle.png");
++        WriteSheet(sheet);
++        var destination = AtlasAnimationWriter.BuildDestination(sheet, retained);
++        if (existing) Assert.True((await new AtlasAnimationWriter().TryWriteAsync(sheet, retained)).Exported);
++        using var store = FileRouterTests.CreateStore(directory, source, archive);
++        await store.UpdateAsync(state =>
++        {
++            state.Settings.LegacyArchiveMappings.Add(new() { Category = VrcImageCategory.Emoji, ArchivePath = retained });
++            return true;
++        });
++        var decoder = new ImageDecoder();
++        var coordinator = new ScanCoordinator(store, new ArchiveIndexer(store, decoder), decoder,
++            new FileRouter(store, decoder, new FileRouterTests.FakeRecycleBinService()), TimeSpan.Zero);
++        var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
++        Assert.Empty(result.Errors);
++        Assert.True(File.Exists(destination));
++        Assert.Single(Directory.GetFiles(retained, "*.gif", SearchOption.AllDirectories));
++        Assert.Empty(Directory.GetFiles(archive, "*", SearchOption.AllDirectories));
++        Assert.True(File.Exists(sheet));
++    }
++
++    [Theory]
++    [InlineData("paths", true)]
++    [InlineData("paths", false)]
++    [InlineData("folder", true)]
++    [InlineData("folder", false)]
++    [InlineData("all", true)]
++    [InlineData("all", false)]
++    public async Task PendingExactReconciliationHonorsRequestedScope(string mode, bool canRecycle)
++    {
++        using var directory = new TestDirectory();
++        var source = directory.GetPath("incoming");
++        var extra = directory.GetPath("selected-folder");
++        var archive = directory.GetPath("archive", "Emoji");
++        Directory.CreateDirectory(source);
++        Directory.CreateDirectory(extra);
++        Directory.CreateDirectory(archive);
++        using var image = ImageFixtureFactory.CreatePattern(21);
++        var requested = Path.Combine(mode == "folder" ? extra : source, "requested.png");
++        var unrelated = directory.GetPath("unselected-folder", "pending.png");
++        Directory.CreateDirectory(Path.GetDirectoryName(unrelated)!);
++        var keeper = Path.Combine(archive, "keeper.png");
++        await image.SaveAsPngAsync(requested);
++        await image.SaveAsPngAsync(unrelated);
++        await image.SaveAsPngAsync(keeper);
++        using var store = FileRouterTests.CreateStore(directory, source, archive);
++        var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
++        await store.UpdateAsync(state =>
++        {
++            foreach (var path in new[] { requested, unrelated })
++                state.ReviewQueue.Add(new ReviewItem
++                {
++                    Id = Guid.NewGuid(), Category = VrcImageCategory.Emoji,
++                    IncomingOriginalPath = path, HeldFilePath = path,
++                    IncomingFingerprint = fingerprint.ExactIdentity,
++                    IncomingImageFingerprint = fingerprint,
++                    Candidates = [new ReviewCandidate
++                    {
++                        Id = Guid.NewGuid(), ArchivePath = keeper,
++                        ExpectedFingerprint = fingerprint.ExactIdentity, MatchKind = MatchKind.Exact,
++                    }],
++                });
++            return true;
++        });
++        var decoder = new ImageDecoder();
++        var recycle = new FileRouterTests.FakeRecycleBinService(canRecycle: canRecycle);
++        var coordinator = new ScanCoordinator(store, new ArchiveIndexer(store, decoder), decoder,
++            new FileRouter(store, decoder, recycle), TimeSpan.Zero);
++        var result = mode switch
++        {
++            "all" => (await coordinator.ScanAllAsync()).Single(r => r.Category == VrcImageCategory.Emoji),
++            "folder" => await coordinator.ScanFolderAsync(extra, VrcImageCategory.Emoji),
++            _ => await coordinator.ScanIncomingPathsAsync(VrcImageCategory.Emoji, [requested]),
++        };
++        Assert.Empty(result.Errors);
++        Assert.False(File.Exists(requested));
++        Assert.Equal(mode != "all", File.Exists(unrelated));
++        Assert.True(File.Exists(keeper));
++        Assert.Equal(mode == "all" ? 2 : 1, result.AutoKeptArchived);
++        Assert.Equal(canRecycle ? result.AutoKeptArchived : 0, recycle.RecycledPaths.Count);
++        if (mode != "all")
++            Assert.Contains((await store.LoadAsync()).ReviewQueue,
++                item => item.IncomingOriginalPath == unrelated && item.Status == ReviewStatus.Pending);
++    }
++
++    [Fact]
++    public async Task ConcurrentMissingExportsWriteOnceAndIndexTheRetainedAnimation()
++    {
++        using var directory = new TestDirectory();
++        var source = directory.GetPath("incoming");
++        var archive = directory.GetPath("archive", "Emoji");
++        Directory.CreateDirectory(source);
++        WriteSheet(Path.Combine(archive, "player_x_4frames_10fps_linearloopStyle.png"));
++        using var store = FileRouterTests.CreateStore(directory, source, archive);
++        await new ArchiveIndexer(store, new ImageDecoder()).RefreshAsync(VrcImageCategory.Emoji);
++        var coordinator = CreateCoordinator(store);
++        var sheet = Assert.Single(await new AtlasAnimationCatalog(store).ListAsync());
++        var request = new AnimationExportRequest(sheet, sheet.Name, MissingOnly: true);
++        var batches = await Task.WhenAll(
++            coordinator.ExportAnimationsAsync([request]), coordinator.ExportAnimationsAsync([request]));
++        Assert.All(batches, batch => Assert.Empty(batch.FollowUp.Warnings));
++        Assert.Single(batches.SelectMany(batch => batch.Results), result => !result.ReusedExisting);
++        var gif = Assert.Single(Directory.GetFiles(archive, "*.gif", SearchOption.AllDirectories));
++        Assert.Contains((await store.LoadAsync()).ArchiveIndex.Categories
++            .Single(c => c.Category == VrcImageCategory.Emoji).Images, image => image.Path == gif);
++
++        using var canceled = new CancellationTokenSource();
++        canceled.Cancel();
++        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => coordinator.ExportAnimationsAsync([request], canceled.Token));
++        var after = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
++        Assert.Equal(0, after.Animated);
++        Assert.Single(Directory.GetFiles(archive, "*.gif", SearchOption.AllDirectories));
++    }
++
+     [Fact]
+     public async Task FileChangedDuringSettleWindowIsNotMoved()
+     {
+@@ -82,8 +207,13 @@ public sealed class ScanCoordinatorTests
+         Assert.Empty((await store.LoadAsync()).ReviewQueue);
+     }
+ 
+-    [Fact]
+-    public async Task ExactMatchIsQueuedForReviewWhenTheRecycleBinIsUnavailable()
++    [Theory]
++    [InlineData(false, "exact")]
++    [InlineData(true, "exact")]
++    [InlineData(true, "changed-source")]
++    [InlineData(true, "missing-archive")]
++    [InlineData(true, "non-exact")]
++    public async Task ExactMatchKeepsArchiveWithoutRecycleBinIncludingPreviouslyQueuedItems(bool alreadyQueued, string scenario)
+     {
+         using var directory = new TestDirectory();
+         var sourceRoot = directory.GetPath("incoming");
+@@ -98,6 +228,35 @@ public sealed class ScanCoordinatorTests
+         using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+         var decoder = new ImageDecoder();
+         var recycleBin = new FileRouterTests.FakeRecycleBinService(canRecycle: false);
++        if (alreadyQueued)
++        {
++            var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
++            await store.UpdateAsync(state =>
++            {
++                state.ReviewQueue.Add(new ReviewItem
++                {
++                    Id = Guid.NewGuid(),
++                    Category = VrcImageCategory.Emoji,
++                    IncomingOriginalPath = incoming,
++                    HeldFilePath = incoming,
++                    IncomingFingerprint = fingerprint.ExactIdentity,
++                    IncomingImageFingerprint = fingerprint,
++                    Candidates = [new ReviewCandidate
++                    {
++                        Id = Guid.NewGuid(), ArchivePath = archived,
++                        ExpectedFingerprint = fingerprint.ExactIdentity,
++                        MatchKind = scenario == "non-exact" ? MatchKind.Similar : MatchKind.Exact,
++                    }],
++                });
++                return true;
++            });
++        }
++        if (scenario == "changed-source")
++        {
++            using var changed = ImageFixtureFactory.CreatePattern(23);
++            await changed.SaveAsPngAsync(incoming);
++        }
++        if (scenario == "missing-archive") File.Delete(archived);
+         var coordinator = new ScanCoordinator(
+             store,
+             new ArchiveIndexer(store, decoder),
+@@ -107,14 +266,24 @@ public sealed class ScanCoordinatorTests
+ 
+         var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+ 
+-        // Never delete permanently: without a Recycle Bin the decision goes back to the user.
+-        Assert.Equal(0, result.AutoKeptArchived);
+-        Assert.Equal(1, result.HeldForReview);
++        if (scenario != "exact")
++        {
++            Assert.Equal(0, result.AutoKeptArchived);
++            Assert.True(File.Exists(incoming));
++            Assert.Contains((await store.LoadAsync()).ReviewQueue, item => item.Status == ReviewStatus.Pending);
++            return;
++        }
++
++        Assert.Equal(1, result.AutoKeptArchived);
++        Assert.Equal(0, result.HeldForReview);
++        Assert.Empty(result.Errors);
+         Assert.Empty(recycleBin.RecycledPaths);
+-        Assert.True(File.Exists(incoming));
++        Assert.False(File.Exists(incoming));
+         Assert.True(File.Exists(archived));
+-        var review = Assert.Single((await store.LoadAsync()).ReviewQueue);
+-        Assert.Equal(MatchKind.Exact, Assert.Single(review.Candidates).MatchKind);
++        var final = await store.LoadAsync();
++        Assert.DoesNotContain(final.ReviewQueue, item => item.Status != ReviewStatus.Resolved);
++        Assert.Contains(final.History, item => item.Message.Contains("permanently deleted"));
++        Assert.Empty(final.OperationJournal);
+     }
+ 
+     [Fact]
+@@ -803,7 +972,7 @@ public sealed class ScanCoordinatorTests
+     }
+ 
+     [Fact]
+-    public async Task UnreadableArchiveFileDoesNotBlockScanningTheCategory()
++    public async Task UnreadableArchiveFileLeavesIncomingUnchangedUntilCoverageIsComplete()
+     {
+         using var directory = new TestDirectory();
+         var sourceRoot = directory.GetPath("incoming");
+@@ -827,9 +996,10 @@ public sealed class ScanCoordinatorTests
+ 
+         var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+ 
+-        Assert.Equal(1, result.Examined);
+-        Assert.Equal(1, result.MovedUnique);
+-        Assert.True(File.Exists(Path.Combine(archiveRoot, "unique.png")));
++        Assert.Equal(0, result.Examined);
++        Assert.Equal(0, result.MovedUnique);
++        Assert.False(File.Exists(Path.Combine(archiveRoot, "unique.png")));
++        Assert.True(File.Exists(Path.Combine(sourceRoot, "unique.png")));
+         Assert.True(File.Exists(unreadable));
+         Assert.Contains(result.Errors, error => error.Contains(unreadable, StringComparison.Ordinal));
+     }
+@@ -1396,8 +1566,10 @@ public sealed class ScanCoordinatorTests
+         Assert.False(File.Exists(incoming));
+     }
+ 
+-    [Fact]
+-    public async Task AnArchivedGifIsNotOverwrittenByTheSheetThatArrivesAfterIt()
++    [Theory]
++    [InlineData("")]
++    [InlineData(" (2)")]
++    public async Task AnArchivedGifIsNotOverwrittenByTheSheetThatArrivesAfterIt(string suffix)
+     {
+         // The GIF lands first and is archived under the very name the sheet's export would take.
+         // The exporter writes with overwrite, so without care the sheet would destroy an archived
+@@ -1415,6 +1587,12 @@ public sealed class ScanCoordinatorTests
+ 
+         var archivedGif = Path.Combine(archiveRoot, "Animated", stem + ".gif");
+         Assert.True(File.Exists(archivedGif));
++        if (suffix.Length > 0)
++        {
++            var retained = Path.Combine(archiveRoot, "Animated", stem + suffix + ".gif");
++            File.Move(archivedGif, retained);
++            archivedGif = retained;
++        }
+         var before = await File.ReadAllBytesAsync(archivedGif);
+ 
+         WriteSheet(Path.Combine(sourceRoot, stem + ".png"));
+@@ -1422,6 +1600,7 @@ public sealed class ScanCoordinatorTests
+ 
+         Assert.Equal(1, result.MovedUnique);
+         Assert.Equal(before, await File.ReadAllBytesAsync(archivedGif));
++        Assert.Single(Directory.GetFiles(Path.Combine(archiveRoot, "Animated"), "*.gif"));
+     }
+ 
+     [Fact]
+@@ -1676,12 +1855,12 @@ public sealed class ScanCoordinatorTests
+         var catalog = new AtlasAnimationCatalog(store);
+         var sheet = Assert.Single(await catalog.ListAsync());
+ 
+-        var exported = await catalog.ExportAsync(sheet, sheet.Name);
+-        Assert.True(exported.Exported);
++        var batch = await coordinator.ExportAnimationsAsync([new AnimationExportRequest(sheet, sheet.Name)]);
++        var exported = Assert.Single(batch.Results);
++        Assert.True(exported.Exported, exported.Warning);
+         var animationPath = exported.Path!;
+ 
+-        var followUp = await coordinator.FinishExportedAnimationsAsync(
+-            [new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, animationPath)]);
++        var followUp = batch.FollowUp;
+ 
+         Assert.Empty(followUp.Warnings);
+         Assert.Empty(followUp.Duplicates);
+diff --git a/tests/VrcPicSorter.Tests/Services/AppRuntimeTests.cs b/tests/VrcPicSorter.Tests/Services/AppRuntimeTests.cs
+index 9c3c2d9..1fecc65 100644
+--- a/tests/VrcPicSorter.Tests/Services/AppRuntimeTests.cs
++++ b/tests/VrcPicSorter.Tests/Services/AppRuntimeTests.cs
+@@ -1,10 +1,38 @@
+ using VrcPicSorter.App.Services;
+ using VrcPicSorter.Core.FileSystem;
++using VrcPicSorter.Core.Models;
++using VrcPicSorter.Tests.Imaging;
++using SixLabors.ImageSharp;
+ 
+ namespace VrcPicSorter.Tests.Services;
+ 
+ public sealed class AppRuntimeTests
+ {
++    [Fact]
++    public async Task FirstOutputSelectionDoesNotRetainUnusedSuggestedArchives()
++    {
++        using var directory = new TestDirectory();
++        using var runtime = new AppRuntime(directory.Path, allowStartupRegistration: false);
++        await runtime.InitializeAsync();
++        var source = directory.GetPath("incoming");
++        Directory.CreateDirectory(source);
++        using var image = ImageFixtureFactory.CreatePattern(210);
++        await image.SaveAsPngAsync(Path.Combine(source, "unique.png"));
++        var output = directory.GetPath("chosen-output");
++        Directory.CreateDirectory(output);
++        var draft = new SettingsDraft(AppStateDefaults.FixedCategories.Select(category =>
++            new CategorySettingsDraft(category, source, category == VrcImageCategory.Emoji)).ToArray(),
++            output, SimilarityProfile.Conservative, false, true);
++        await runtime.StateStore.UpdateAsync(state => { draft.ApplyTo(state); return true; });
++        var finalOutput = directory.GetPath("final-output");
++        Directory.CreateDirectory(finalOutput);
++        await runtime.StateStore.UpdateAsync(state => { (draft with { OutputRootPath = finalOutput }).ApplyTo(state); return true; });
++        var result = Assert.Single(await runtime.Scanner.ScanAllAsync());
++        Assert.Empty(result.Errors);
++        Assert.Equal(1, result.MovedUnique);
++        Assert.True(File.Exists(Path.Combine(finalOutput, "Emoji", "unique.png")));
++    }
++
+     [Fact]
+     public async Task IsolatedRuntimeKeepsEveryDefaultPathInsideItsDataDirectory()
+     {
+diff --git a/tests/VrcPicSorter.Tests/Services/SettingsDraftTests.cs b/tests/VrcPicSorter.Tests/Services/SettingsDraftTests.cs
+index 2a32e8d..85daa03 100644
+--- a/tests/VrcPicSorter.Tests/Services/SettingsDraftTests.cs
++++ b/tests/VrcPicSorter.Tests/Services/SettingsDraftTests.cs
+@@ -5,6 +5,16 @@ namespace VrcPicSorter.Tests.Services;
+ 
+ public sealed class SettingsDraftTests
+ {
++    [Fact]
++    public void OutputNestedInExistingArchiveIsRejected()
++    {
++        using var directory = new TestDirectory();
++        var state = AppStateDefaults.Create(directory.GetPath("profile"), directory.GetPath("local"));
++        var archive = state.Settings.CategoryMappings.Single(m => m.Category == VrcImageCategory.Emoji).ArchivePath;
++        var draft = Draft(Path.Combine(archive, "new-output"), VrcImageCategory.Emoji, directory.GetPath("incoming"));
++        Assert.NotNull(draft.DescribeBlockingProblem(state.Settings));
++    }
++
+     [Fact]
+     public void ApplyUsesOneOutputRootAndOnlyStalesChangedCategories()
+     {
+@@ -49,6 +59,7 @@ public sealed class SettingsDraftTests
+     {
+         using var directory = new TestDirectory();
+         var state = AppStateDefaults.Create(directory.GetPath("profile"), directory.GetPath("local"));
++        state.Settings.OutputRootIsSuggested = false; // Previously selected archive, possibly offline.
+         foreach (var index in state.ArchiveIndex.Categories)
+         {
+             index.Status = IndexStatus.Current;
+@@ -76,6 +87,25 @@ public sealed class SettingsDraftTests
+                 legacy => legacy.Category == pair.Key && legacy.ArchivePath == pair.Value));
+     }
+ 
++    [Fact]
++    public void PreviouslyUnusedOutputIsRetainedWhenItsParentBecomesUnavailable()
++    {
++        using var directory = new TestDirectory();
++        var state = AppStateDefaults.Create(directory.GetPath("profile"), directory.GetPath("local"));
++        var firstOutput = directory.GetPath("first-output");
++        Directory.CreateDirectory(firstOutput);
++        Draft(firstOutput, VrcImageCategory.Emoji, directory.GetPath("incoming")).ApplyTo(state);
++        var previousArchive = state.Settings.CategoryMappings.Single(item => item.Category == VrcImageCategory.Emoji).ArchivePath;
++        Assert.True(state.Settings.CategoryMappings.Single(item => item.Category == VrcImageCategory.Emoji).ArchivePathKnownMissing);
++
++        // Loss of access to the parent no longer proves the category folder is absent.
++        Directory.Move(firstOutput, directory.GetPath("temporarily-offline-output"));
++        Draft(directory.GetPath("second-output"), VrcImageCategory.Emoji, directory.GetPath("incoming")).ApplyTo(state);
++
++        Assert.Contains(state.Settings.LegacyArchiveMappings,
++            item => item.Category == VrcImageCategory.Emoji && item.ArchivePath == previousArchive);
++    }
++
+     private static SettingsDraft Draft(
+         string outputRoot,
+         VrcImageCategory enabledCategory,

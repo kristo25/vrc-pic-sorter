@@ -11,6 +11,114 @@ namespace VrcPicSorter.Tests.FileSystem;
 
 public sealed class FileRouterTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RecoveryDoesNotCommitRemovalWhenSourceParentIsUnavailable(bool permanent)
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(archiveRoot);
+        var keeper = Path.Combine(archiveRoot, "keeper.png");
+        using var image = ImageFixtureFactory.CreatePattern(23);
+        await image.SaveAsPngAsync(keeper);
+        var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var journal = new OperationJournal(store);
+        var entry = await journal.RecordIntentAsync(new JournalEntry
+        {
+            Category = VrcImageCategory.Emoji,
+            OperationType = permanent ? JournalOperationType.DeleteExactIncoming : JournalOperationType.Recycle,
+            Purpose = JournalOperationPurpose.AutoKeepArchived,
+            SourcePath = Path.Combine(sourceRoot, "unavailable", "copy.png"),
+            SurvivingPath = keeper, SurvivingFingerprint = fingerprint.ExactIdentity,
+            ExpectedSource = new ExpectedFileIdentity { Fingerprint = fingerprint.ExactIdentity },
+        });
+        await journal.AdvanceAsync(entry.Id, JournalPhase.SideEffectStarted);
+        var router = new FileRouter(store, new ImageDecoder(), new FakeRecycleBinService());
+        var decision = Assert.Single(await router.RecoverPendingOperationsAsync());
+        Assert.Equal(JournalReconciliationAction.NeedsAttention, decision.Action);
+        var state = await store.LoadAsync();
+        Assert.Equal(JournalPhase.NeedsAttention, Assert.Single(state.OperationJournal).Phase);
+        Assert.Empty(state.History);
+        Assert.True(File.Exists(keeper));
+    }
+
+    [Theory]
+    [InlineData("archive-changed", false)]
+    [InlineData("archive-missing", false)]
+    [InlineData("source-changed", false)]
+    [InlineData("same-path", false)]
+    [InlineData("archive-changed", true)]
+    [InlineData("archive-missing", true)]
+    [InlineData("source-changed", true)]
+    [InlineData("same-path", true)]
+    [InlineData("unchanged", true)]
+    [InlineData("already-deleted", true)]
+    public async Task PermanentExactDeletionRevalidatesBothCopiesIncludingRecovery(string scenario, bool recover)
+    {
+        using var directory = new TestDirectory();
+        var sourceRoot = directory.GetPath("incoming");
+        var archiveRoot = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(sourceRoot);
+        Directory.CreateDirectory(archiveRoot);
+        var source = Path.Combine(sourceRoot, "copy.png");
+        var archive = Path.Combine(archiveRoot, "original.png");
+        using var image = ImageFixtureFactory.CreatePattern(21);
+        using var changed = ImageFixtureFactory.CreatePattern(22);
+        await image.SaveAsPngAsync(source);
+        await image.SaveAsPngAsync(archive);
+        var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
+        using var store = CreateStore(directory, sourceRoot, archiveRoot);
+        var router = new FileRouter(store, new ImageDecoder(), new FakeRecycleBinService(canRecycle: false));
+        if (scenario == "archive-changed") await changed.SaveAsPngAsync(archive);
+        if (scenario == "archive-missing") File.Delete(archive);
+        if (scenario == "source-changed") await changed.SaveAsPngAsync(source);
+        if (scenario == "same-path") archive = source;
+
+        if (recover)
+        {
+            var entry = new JournalEntry
+            {
+                Id = Guid.NewGuid(),
+                Category = VrcImageCategory.Emoji,
+                OperationType = JournalOperationType.DeleteExactIncoming,
+                Purpose = JournalOperationPurpose.AutoKeepArchived,
+                SourcePath = source,
+                SurvivingPath = archive,
+                SurvivingFingerprint = fingerprint.ExactIdentity,
+                ExpectedSource = new ExpectedFileIdentity { Fingerprint = fingerprint.ExactIdentity },
+            };
+            var journal = new OperationJournal(store);
+            await journal.RecordIntentAsync(entry);
+            if (scenario == "already-deleted")
+            {
+                await journal.AdvanceAsync(entry.Id, JournalPhase.SideEffectStarted);
+                File.Delete(source);
+            }
+            await router.RecoverPendingOperationsAsync();
+            if (scenario is "unchanged" or "already-deleted")
+            {
+                Assert.False(File.Exists(source));
+                Assert.True(File.Exists(archive));
+                Assert.Empty((await store.LoadAsync()).OperationJournal);
+                await router.RecoverPendingOperationsAsync();
+                Assert.Single((await store.LoadAsync()).History);
+                return;
+            }
+
+            Assert.Equal(JournalPhase.NeedsAttention, Assert.Single((await store.LoadAsync()).OperationJournal).Phase);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => router.AutoKeepArchivedAsync(
+                source, VrcImageCategory.Emoji, fingerprint, archive, fingerprint.ExactIdentity));
+        }
+
+        Assert.True(File.Exists(source));
+    }
+
     [Fact]
     public async Task UniqueMoveUsesDeterministicCollisionSuffixAndCommitsJournal()
     {

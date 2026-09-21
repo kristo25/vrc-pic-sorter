@@ -13,6 +13,7 @@ public sealed class AppRuntime : IDisposable
 
     /// <summary>Where this application kept its data before the rename, or null when isolated.</summary>
     private readonly string? _previousStateDirectory;
+    private readonly WatcherLifecycleCoordinator _watcherLifecycle;
 
     public AppRuntime(string? stateDirectory = null, bool allowStartupRegistration = true)
     {
@@ -55,6 +56,7 @@ public sealed class AppRuntime : IDisposable
             Router,
             ProductionFileSettleDelay);
         Watcher = new WatchService(Scanner, Indexer);
+        _watcherLifecycle = new WatcherLifecycleCoordinator(StartWatcherFromSavedSettingsAsync, Watcher.StopAsync);
         Startup = new StartupRegistrationService();
     }
 
@@ -73,6 +75,8 @@ public sealed class AppRuntime : IDisposable
     public ScanCoordinator Scanner { get; }
 
     public WatchService Watcher { get; }
+
+    public bool WatchingRequested => _watcherLifecycle.IsRequested;
 
     public StartupRegistrationService Startup { get; }
 
@@ -124,16 +128,8 @@ public sealed class AppRuntime : IDisposable
 
     public async Task ApplyAutomationSettingsAsync(bool updateStartupRegistration)
     {
+        await _watcherLifecycle.RestartAsync().ConfigureAwait(false);
         var state = await StateStore.LoadAsync().ConfigureAwait(false);
-        if (Watcher.IsRunning)
-        {
-            await Watcher.StopAsync().ConfigureAwait(false);
-            Watcher.Start(
-                state.Settings.CategoryMappings,
-                state.Settings.LegacyArchiveMappings,
-                SweepInterval(state.Settings.Automation),
-                state.Settings.Automation.WatchMode == WatchMode.OnDetection);
-        }
 
         if (updateStartupRegistration && AllowStartupRegistration)
         {
@@ -143,7 +139,9 @@ public sealed class AppRuntime : IDisposable
         }
     }
 
-    public async Task StartWatchingAsync()
+    public Task StartWatchingAsync() => _watcherLifecycle.StartAsync();
+
+    private async Task StartWatcherFromSavedSettingsAsync()
     {
         var state = await StateStore.LoadAsync().ConfigureAwait(false);
         Watcher.Start(
@@ -153,7 +151,7 @@ public sealed class AppRuntime : IDisposable
             state.Settings.Automation.WatchMode == WatchMode.OnDetection);
     }
 
-    public Task StopWatchingAsync() => Watcher.StopAsync();
+    public Task StopWatchingAsync() => _watcherLifecycle.StopAsync();
 
     private static TimeSpan? SweepInterval(AutomationSettings automation) =>
         automation.WatchMode == WatchMode.OnInterval ? automation.WatchScanInterval : null;

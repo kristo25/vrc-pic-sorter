@@ -21,10 +21,15 @@ public partial class MainWindow : Window
     private readonly AppRuntime _runtime;
     private readonly PreviewService _previewService = new();
     private readonly LatestRequestGuard _reviewDisplayRequests = new();
-    private readonly KeepIncomingPrompt _keepIncomingPrompt = new();
+    private readonly SettingsSaveCoordinator _settingsSaves = new();
+    private readonly LatestRequestGuard _retainedArchiveRequests = new();
+    // Lock order: UI mutation gate, then scanner gate. Watcher restart and prompts hold neither.
+    private readonly SemaphoreSlim _uiMutationGate = new(1, 1);
+    private readonly SemaphoreSlim _automationSettingsGate = new(1, 1);
     private IReadOnlyList<ArchiveRelocationStep> _retainedArchives = [];
 
     private IReadOnlyList<ArchiveDuplicateGroup> _archiveDuplicates = [];
+    private long _archiveDuplicateRefreshVersion;
     private bool _busy;
     private bool _loadingSettings;
     private CancellationTokenSource? _operationCancellation;
@@ -142,6 +147,9 @@ public partial class MainWindow : Window
             OutputRoot.Text = settings.OutputRootPath;
             UpdateResolvedDestinations(settings.OutputRootPath);
             SimilarityCombo.SelectedItem = settings.SimilarityProfile;
+            CustomSimilarityLimits.IsChecked = settings.CustomSimilarityThresholds is not null;
+            MinimumSimilarity.Text = (settings.CustomSimilarityThresholds?.MinimumPercent ?? 82).ToString(System.Globalization.CultureInfo.CurrentCulture);
+            MaximumSimilarity.Text = (settings.CustomSimilarityThresholds?.MaximumPercent ?? 99).ToString(System.Globalization.CultureInfo.CurrentCulture);
             OrganizationCombo.SelectedItem = settings.OrganizationPolicy;
             StartWithWindowsCheck.IsChecked = settings.Automation.StartWithWindows;
             StartWithWindowsCheck.IsEnabled = _runtime.AllowStartupRegistration;
@@ -370,7 +378,7 @@ public partial class MainWindow : Window
                 var skipped = results.Sum(result => result.Skipped);
                 var errors = results.Sum(result => result.Errors.Count);
                 SetStatus(
-                    $"Scan complete: {examined} examined, {moved} archived, {autoKept} exact duplicates recycled, "
+                    $"Scan complete: {examined} examined, {moved} archived, {autoKept} archive copies kept automatically, "
                     + $"{held} queued for review, {skipped} skipped, {errors} failed.");
                 await ReportScanErrorsAsync(results.SelectMany(result => result.Errors));
                 await RefreshAsync();
@@ -411,7 +419,7 @@ public partial class MainWindow : Window
                     CurrentCancellation);
                 SetStatus(
                     $"Folder scan complete: {result.Examined} examined, {result.MovedUnique} archived, "
-                    + $"{result.AutoKeptArchived} exact duplicates recycled, {result.HeldForReview} queued for review, "
+                    + $"{result.AutoKeptArchived} archive copies kept automatically, {result.HeldForReview} queued for review, "
                     + $"{result.Skipped} skipped, {result.Errors.Count} failed.");
                 await ReportScanErrorsAsync(result.Errors);
                 await RefreshAsync();
@@ -426,7 +434,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_runtime.Watcher.IsRunning)
+        if (_runtime.WatchingRequested)
         {
             await _runtime.StopWatchingAsync();
             UpdateWatchingDisplay();
@@ -501,28 +509,6 @@ public partial class MainWindow : Window
                     return;
                 }
 
-                // Asked once per review, not once per match. Settling a review with several
-                // matches takes one press each, and putting the same question behind every one of
-                // them only makes a person dismiss dialogs they have already answered.
-                var canRecycle = _runtime.Router.CanRecycle(candidate.ArchivePath);
-                if (_keepIncomingPrompt.MustAsk(review.Id, canRecycle))
-                {
-                    if (MessageBox.Show(
-                            this,
-                            canRecycle
-                                ? "Recycle this archived match and keep the incoming image? If other matches remain, the review stays open and keeping the incoming over them will not ask again."
-                                : "Windows Recycle Bin is unavailable for this archive drive. Move the archived match into the VRC Pic Sorter Replaced folder and keep the incoming image? If other matches on this drive remain, they will not ask again.",
-                            "Keep incoming",
-                            MessageBoxButton.OKCancel,
-                            MessageBoxImage.Warning) != MessageBoxResult.OK)
-                    {
-                        SetStatus("Keep incoming canceled.");
-                        return;
-                    }
-
-                    _keepIncomingPrompt.Agreed(review.Id, canRecycle);
-                }
-
                 KeepIncomingResult result;
                 try
                 {
@@ -532,11 +518,6 @@ public partial class MainWindow : Window
                 {
                     await RefreshAsync();
                     throw;
-                }
-
-                if (result.ReviewResolved)
-                {
-                    _keepIncomingPrompt.Forget();
                 }
 
                 await RefreshAsync(result.ReviewResolved ? null : review.Id);
@@ -802,7 +783,8 @@ public partial class MainWindow : Window
         var ranked = ImageMatcher.RankCandidates(
             incomingFingerprint,
             indexedByKey.Select(pair => new ImageCandidate(pair.Key, pair.Value.Fingerprint!)),
-            currentState.Settings.SimilarityProfile);
+            currentState.Settings.SimilarityProfile,
+            currentState.Settings.CustomSimilarityThresholds?.MinimumPercent / 100);
         var refreshedCandidates = ranked
             .Select(match =>
             {
@@ -861,7 +843,12 @@ public partial class MainWindow : Window
             });
     }
 
-    private void SettingsToggled(object sender, RoutedEventArgs e) => BeginAutoSaveSettings();
+    private void SettingsToggled(object sender, RoutedEventArgs e)
+    {
+        if (SimilarityCombo is not null && CustomSimilarityLimits is not null)
+            SimilarityCombo.IsEnabled = CustomSimilarityLimits.IsChecked != true;
+        BeginAutoSaveSettings();
+    }
 
     private void SettingsSelectionChanged(
         object sender,
@@ -887,7 +874,13 @@ public partial class MainWindow : Window
             return;
         }
 
-        _ = AsyncCommandRunner.RunAsync(AutoSaveSettingsAsync, ReportSettingsAutoSaveFailureAsync);
+        // Even invalid new input supersedes an older pending request.
+        var request = _settingsSaves.Begin();
+        var draft = CaptureSettingsDraftOrNull();
+        ShowSettingsNotice("Settings changes are pending; destinations below show the saved settings.", isWarning: false);
+        _ = AsyncCommandRunner.RunAsync(() => AutoSaveSettingsAsync(request, draft),
+            exception => _settingsSaves.IsCurrent(request)
+                ? ReportSettingsAutoSaveFailureAsync(exception, request) : Task.CompletedTask);
     }
 
     /// <summary>
@@ -895,126 +888,61 @@ public partial class MainWindow : Window
     /// are reported inline rather than refused, because a watched folder is allowed to appear
     /// later; only the overlap invariants that could make the app scan its own archive block a save.
     /// </summary>
-    private async Task AutoSaveSettingsAsync()
+    private async Task AutoSaveSettingsAsync(long request, SettingsDraft? draft)
     {
-        var draft = CaptureSettingsDraftOrNull();
         if (draft is null)
         {
+            await RefreshSavedDestinationsAsync(request);
+            if (!_settingsSaves.IsCurrent(request)) return;
             ShowSettingsNotice("Choose a main output folder.", isWarning: true);
             return;
         }
 
-        var settings = (await _runtime.StateStore.LoadAsync()).Settings;
-        if (draft.DescribeBlockingProblem(settings) is { } blocking)
-        {
-            ShowSettingsNotice(blocking, isWarning: true);
-            return;
-        }
-
-        // Worked out before the draft is applied, because it is the archive paths as they stand
-        // that say where the images are now.
-        IReadOnlyList<ArchiveRelocationStep> relocation = string.Equals(
-            settings.ArchiveRelocationAnsweredFor,
-            Path.GetFullPath(draft.OutputRootPath),
-            StringComparison.OrdinalIgnoreCase)
-            ? []
-            : await Task.Run(() => ArchiveRelocation.Plan(settings, draft.OutputRootPath));
-
-        var startupChanged = settings.Automation.StartWithWindows != draft.StartWithWindows;
-        await _runtime.StateStore.UpdateAsync(
-            state =>
+        var stateApplied = false;
+        var applied = await _settingsSaves.SaveAsync(request, () => Task.FromResult(draft),
+            async action =>
             {
-                draft.ApplyTo(state);
-                return true;
+                await _uiMutationGate.WaitAsync();
+                try { await _runtime.Scanner.RunExclusiveAsync(action); }
+                finally { _uiMutationGate.Release(); }
+            }, async captured =>
+            {
+                stateApplied = await _runtime.StateStore.UpdateAsync(state =>
+                {
+                    if (!_settingsSaves.IsCurrent(request)) return false;
+                    if (captured.DescribeBlockingProblem(state.Settings) is { } blocking)
+                        throw new InvalidOperationException(blocking);
+                    captured.ApplyTo(state);
+                    return true;
+                });
             });
+        if (!applied && !stateApplied) return;
 
         // A running watcher holds the folders, mode and interval it was started with, so it has
         // to be restarted for any settings change to take effect.
-        if (startupChanged || _runtime.Watcher.IsRunning)
+        await _automationSettingsGate.WaitAsync();
+        try
         {
-            await _runtime.ApplyAutomationSettingsAsync(updateStartupRegistration: startupChanged);
+            // Load current persisted settings in the runtime; never restart with a captured draft.
+            await _runtime.ApplyAutomationSettingsAsync(updateStartupRegistration: true);
         }
+        finally { _automationSettingsGate.Release(); }
 
-        await OfferToBringTheArchiveAlongAsync(draft.OutputRootPath, relocation);
+        if (!_settingsSaves.IsCurrent(request)) return;
         await RefreshRetainedArchivesAsync();
-
+        if (!_settingsSaves.IsCurrent(request)) return;
         UpdateResolvedDestinations(draft.OutputRootPath);
         UpdateStartupStatusText();
         var missing = draft.DescribeMissingFolders();
         ShowSettingsNotice(
-            missing ?? $"Settings saved at {DateTime.Now:t}.",
+            missing ?? $"Settings saved at {DateTime.Now:t}. Old archives stay in place; use 'Move them into my archive' to move them.",
             isWarning: missing is not null);
-    }
-
-    /// <summary>
-    /// Offers to move an archive that the new output folder has left behind, and remembers the
-    /// answer so the question is asked once rather than on every save.
-    /// </summary>
-    /// <remarks>
-    /// Whichever way it is answered, the new location is made ready. Saying no should cost nothing
-    /// beyond the files staying where they are: both archives go on being indexed, and new images
-    /// are filed in the new one.
-    /// </remarks>
-    private async Task OfferToBringTheArchiveAlongAsync(
-        string outputRoot,
-        IReadOnlyList<ArchiveRelocationStep> relocation)
-    {
-        if (relocation.Count == 0)
-        {
-            return;
-        }
-
-        var files = relocation.Sum(step => step.FileCount);
-        var gigabytes = relocation.Sum(step => step.TotalBytes) / (double)(1024 * 1024 * 1024);
-        var folders = string.Join(
-            Environment.NewLine,
-            relocation.Select(step => $"    {step.From}  ({step.FileCount} images)"));
-
-        var move = MessageBox.Show(
-            this,
-            $"{files} images are still filed in your previous archive:{Environment.NewLine}{Environment.NewLine}"
-                + $"{folders}{Environment.NewLine}{Environment.NewLine}"
-                + $"Move them into {outputRoot}? ({gigabytes:0.##} GB){Environment.NewLine}{Environment.NewLine}"
-                + "Either way the new folder is set up and new images are filed there. Moving also "
-                + "frees the old folders to be scanned like any other.",
-            "Bring your archive along?",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Question) == MessageBoxResult.Yes;
-
-        // Recorded before the move runs. A move interrupted half way still leaves the question
-        // answered, and what it managed to move is described by the index either way.
-        await _runtime.StateStore.UpdateAsync(
-            state =>
-            {
-                state.Settings.ArchiveRelocationAnsweredFor = Path.GetFullPath(outputRoot);
-                return true;
-            });
-
-        if (!move)
-        {
-            foreach (var step in relocation)
-            {
-                TryCreateFolder(step.To);
-            }
-
-            ShowSettingsNotice(
-                "Your previous archive was left where it is. Both folders stay indexed, so "
-                    + "duplicates are still found across them.",
-                isWarning: false);
-            return;
-        }
-
-        await MoveArchivesAsync(relocation);
     }
 
     /// <summary>
     /// Moves the planned archives, points the index at where the files landed, and forgets the
     /// folders that emptied.
     /// </summary>
-    /// <remarks>
-    /// Shared by the question asked when the output folder changes and by the button in Settings,
-    /// so the two cannot drift into doing subtly different things to a person's archive.
-    /// </remarks>
     private async Task MoveArchivesAsync(IReadOnlyList<ArchiveRelocationStep> relocation)
     {
         if (relocation.Count == 0)
@@ -1028,14 +956,18 @@ public partial class MainWindow : Window
             {
                 var progress = new Progress<ArchiveRelocationProgress>(
                     value => SetStatus($"Moving your archive: {value.Moved} of {value.Total} - {value.FileName}"));
-                var result = await ArchiveRelocation.RelocateAsync(relocation, progress, CurrentCancellation);
-
-                await _runtime.StateStore.UpdateAsync(
+                ArchiveRelocationResult result = new(0, 0, [], []);
+                await _runtime.Scanner.RunExclusiveAsync(async () =>
+                {
+                    ArchiveRelocation.EnsurePlanMatchesSettings((await _runtime.StateStore.LoadAsync()).Settings, relocation);
+                    result = await ArchiveRelocation.RelocateAsync(relocation, progress, CurrentCancellation);
+                    var emptied = await Task.Run(() => relocation.Where(step => ArchiveRelocation.IsVerifiedEmpty(step.From)).ToArray());
+                    // Completed moves must be persisted even when Stop was requested.
+                    await _runtime.StateStore.UpdateAsync(
                     state =>
                     {
                         // Only the folders that actually emptied are forgotten. One that kept a
                         // file back is still a place images live.
-                        var emptied = relocation.Where(step => IsEmptyNow(step.From)).ToArray();
 
                         // Rebased from the files that moved, not from the folders it was tried on.
                         // A collision or a failure leaves that record where it was, and pointing it
@@ -1044,18 +976,20 @@ public partial class MainWindow : Window
                         ArchiveRelocation.RebaseIndex(state, result.Moves);
                         ArchiveRelocation.ForgetRelocated(state.Settings, emptied);
                         return true;
-                    });
+                    }, CancellationToken.None);
+                }, CurrentCancellation);
 
                 await RefreshAsync();
                 await RefreshRetainedArchivesAsync();
                 SetStatus(
-                    (result.Stopped, result.LeftBehind) switch
+                    (result.Stopped, result.InventoryComplete, result.LeftBehind) switch
                     {
                         // A stopped run is not a finished one. It reported the same sentence as a
                         // clean finish, so a move interrupted half way looked like a move that had
                         // brought everything across.
-                        (true, _) => $"Stopped after moving {result.Moved} images; the rest are still where they were.",
-                        (false, 0) => $"Moved {result.Moved} images into your archive.",
+                        (true, _, _) => $"Stopped after moving {result.Moved} images; remaining files need checking.",
+                        (_, false, _) => $"Moved {result.Moved} images; archive inventory is incomplete and the remaining count is unknown.",
+                        (false, true, 0) => $"Moved {result.Moved} images into your archive.",
                         _ => $"Moved {result.Moved} images; {result.LeftBehind} were left where they are.",
                     });
                 await ReportScanErrorsAsync(result.Errors);
@@ -1073,6 +1007,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        var request = _retainedArchiveRequests.Begin();
         var settings = (await _runtime.StateStore.LoadAsync()).Settings;
 
         // Planning counts and measures every file in every retained folder, so it is kept off the
@@ -1082,12 +1017,16 @@ public partial class MainWindow : Window
             ? []
             : await Task.Run(() => ArchiveRelocation.Plan(settings, settings.OutputRootPath));
 
+        if (!_retainedArchiveRequests.IsCurrent(request)) return;
+        var saved = (await _runtime.StateStore.LoadAsync()).Settings;
+        if (!_retainedArchiveRequests.IsCurrent(request)
+            || !string.Equals(saved.OutputRootPath, settings.OutputRootPath, StringComparison.OrdinalIgnoreCase)) return;
         _retainedArchives = steps;
         RetainedArchivesList.ItemsSource = steps
             .Select(step => new
             {
                 step.From,
-                Summary = $"{step.FileCount} images, {step.TotalBytes / (double)(1024 * 1024):0.#} MB",
+                Summary = step.InventoryError ?? $"{step.FileCount} images, {step.TotalBytes / (double)(1024 * 1024):0.#} MB",
             })
             .ToArray();
 
@@ -1097,9 +1036,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// What the archive is holding more than once. Read from the index that is already built, so
-    /// this costs no disk work - but only what the index knows about is considered, which for a
-    /// category that has never been scanned is nothing.
+    /// Refreshes archive inventory before reporting duplicate copies and animation variants.
     /// </summary>
     private async Task RefreshArchiveDuplicatesAsync()
     {
@@ -1108,13 +1045,30 @@ public partial class MainWindow : Window
             return;
         }
 
-        var state = await _runtime.StateStore.LoadAsync();
-        var groups = state.ArchiveIndex.Categories
-            .SelectMany(ArchiveDuplicateFinder.Find)
-            .ToArray();
+        var version = ++_archiveDuplicateRefreshVersion;
+        _archiveDuplicates = [];
+        RemoveIdenticalDuplicatesButton.IsEnabled = false;
+        ArchiveDuplicatesList.ItemsSource = null;
+        ArchiveDuplicatesPanel.Visibility = Visibility.Visible;
+        ArchiveDuplicatesSummary.Text = "Checking the archive folders...";
+        ArchiveDuplicateSnapshot snapshot;
+        try
+        {
+            snapshot = await _runtime.Scanner.RefreshArchiveDuplicatesAsync(CurrentCancellation);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+            or InvalidOperationException or ArgumentException or OperationCanceledException)
+        {
+            if (version == _archiveDuplicateRefreshVersion)
+                ArchiveDuplicatesSummary.Text = "Archive check incomplete. " + exception.Message;
+            return;
+        }
+        if (version != _archiveDuplicateRefreshVersion)
+            return;
+        var groups = snapshot.Groups.ToArray();
         _archiveDuplicates = groups;
 
-        var removable = groups.Where(group => IsRemovable(group.Kind)).ToArray();
+        var removable = groups.Where(group => group.IsRemovable).ToArray();
         var sameEmoji = groups.Length - removable.Length;
         var extras = removable.Sum(group => group.Extras.Count);
         var megabytes = removable.Sum(group => group.ReclaimableBytes) / (double)(1024 * 1024);
@@ -1132,14 +1086,13 @@ public partial class MainWindow : Window
             ? $"One extra copy is a picture already here, taking {megabytes:0.#} MB."
             : $"{extras} extra copies are pictures already here, taking {megabytes:0.#} MB.";
         var sameEmojiText = sameEmoji == 1
-            ? "One image is the same emoji as another copy here, at a different size."
-            : $"{sameEmoji} images are the same emoji as another copy here, at a different size.";
+            ? "One group contains versions of the same emoji with different image or animation data."
+            : $"{sameEmoji} groups contain versions of the same emoji with different image or animation data.";
         var judgement = " Which of those is worth keeping is yours to decide, so nothing here will touch them.";
 
-        // Read from the index, so it describes the archive as the app last saw it. Saying so is
-        // the difference between "you have three duplicates" and "three is what I can see".
-        const string provenance = " Counted from the archive index; run a scan first if the folder"
-            + " has changed outside the app.";
+        var provenance = snapshot.IsComplete
+            ? " Checked against the archive folders."
+            : " Archive check incomplete; removal is disabled. " + string.Join(" ", snapshot.Warnings);
         ArchiveDuplicatesSummary.Text = (extras, sameEmoji) switch
         {
             (0, _) => sameEmojiText + judgement + provenance,
@@ -1148,8 +1101,10 @@ public partial class MainWindow : Window
                 + judgement + provenance,
         };
 
-        RemoveIdenticalDuplicatesButton.IsEnabled = extras > 0;
-        ArchiveDuplicatesPanel.Visibility = groups.Length == 0
+        RemoveIdenticalDuplicatesButton.IsEnabled = extras > 0 && snapshot.IsComplete;
+        if (!snapshot.IsComplete)
+            _archiveDuplicates = [];
+        ArchiveDuplicatesPanel.Visibility = groups.Length == 0 && snapshot.IsComplete
             ? Visibility.Collapsed
             : Visibility.Visible;
     }
@@ -1165,7 +1120,7 @@ public partial class MainWindow : Window
         // passing the extras alone is what let a removal go ahead with the keeper already gone -
         // the router had nothing to check, so there was nothing to refuse.
         var removals = _archiveDuplicates
-            .Where(group => IsRemovable(group.Kind))
+            .Where(group => group.IsRemovable)
             .SelectMany(group => group.Extras.Select(extra => (group.Kind, group.Keep, Extra: extra)))
             .ToArray();
         if (removals.Length == 0)
@@ -1173,18 +1128,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var identicalCount = removals.Count(item => item.Kind == ArchiveDuplicateKind.Identical);
-        var animationCount = removals.Length - identicalCount;
-        var what = (identicalCount, animationCount) switch
-        {
-            (0, _) => "Every one is a second copy of an animation already here: the same emoji, "
-                + "playing the same frames at the same rate, encoded twice. The copy that keeps "
-                + "the name stays.",
-            (_, 0) => "Every one is the same picture, byte for byte, as another copy that stays.",
-            _ => $"{identicalCount} are the same picture byte for byte as a copy that stays; the "
-                + $"other {animationCount} are second copies of an animation already here - the "
-                + "same emoji, playing the same frames at the same rate, encoded twice.",
-        };
+        const string what = "Every one has the same decoded pixels and frame timing as another copy that stays.";
 
         var confirmation = MessageBox.Show(
             this,
@@ -1210,20 +1154,8 @@ public partial class MainWindow : Window
                     CurrentCancellation.ThrowIfCancellationRequested();
                     try
                     {
-                        if (removal.Kind == ArchiveDuplicateKind.Identical)
-                        {
-                            await _runtime.Router.RemoveArchivedDuplicateAsync(
-                                removal.Extra,
-                                removal.Keep,
-                                CurrentCancellation);
-                        }
-                        else
-                        {
-                            await _runtime.Router.RemoveSupersededAnimationAsync(
-                                removal.Extra,
-                                removal.Keep,
-                                CurrentCancellation);
-                        }
+                        await _runtime.Router.RemoveArchivedDuplicateAsync(
+                            removal.Extra, removal.Keep, CurrentCancellation);
 
                         removed++;
                     }
@@ -1245,21 +1177,10 @@ public partial class MainWindow : Window
                 SetStatus(
                     failures.Count == 0
                         ? $"Recycled {removed} duplicate copies."
-                        : $"Recycled {removed} duplicate copies; {failures.Count} were left alone.");
+                        : $"Recycled {removed} duplicate copies; {failures.Count} failed operations need checking.");
                 await ReportScanErrorsAsync(failures);
             });
     }
-
-    /// <summary>
-    /// Whether the app can act on a duplicate group, or only report it.
-    /// </summary>
-    /// <remarks>
-    /// Two files it can prove are the same thing - the same decoded picture, or the same animation
-    /// of the same emoji by VRChat's own account - can be tidied on request. Two files that merely
-    /// look alike cannot, and never will be.
-    /// </remarks>
-    private static bool IsRemovable(ArchiveDuplicateKind kind) =>
-        kind is ArchiveDuplicateKind.Identical or ArchiveDuplicateKind.SameAnimation;
 
     private static string DescribeDuplicate(
         ArchiveDuplicateKind kind,
@@ -1267,7 +1188,7 @@ public partial class MainWindow : Window
         IndexedImageRecord keep) => kind switch
         {
             ArchiveDuplicateKind.Identical => "identical",
-            ArchiveDuplicateKind.SameAnimation => "same animation, encoded twice",
+            ArchiveDuplicateKind.SameAnimation => "same emoji and filename parameters; image or timing differs",
             _ => $"{extra.Width}x{extra.Height} beside {keep.Width}x{keep.Height}",
         };
 
@@ -1280,8 +1201,21 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (relocation.Any(step => step.InventoryError is not null))
+        {
+            ShowSettingsNotice("Archive inventory is incomplete. Restore access to the listed folders and refresh before moving.", true);
+            return;
+        }
+
         var images = relocation.Sum(step => step.FileCount);
         var destination = (await _runtime.StateStore.LoadAsync()).Settings.OutputRootPath;
+        if (relocation.Any(step => !string.Equals(PathBoundary.Normalize(step.To),
+                PathBoundary.Normalize(Path.Combine(destination, step.Category.ToString())), StringComparison.OrdinalIgnoreCase)))
+        {
+            await RefreshRetainedArchivesAsync();
+            ShowSettingsNotice("The archive destination changed. Review the refreshed list before moving.", true);
+            return;
+        }
         if (MessageBox.Show(
                 this,
                 $"Move {images} images into {destination}?{Environment.NewLine}{Environment.NewLine}"
@@ -1298,44 +1232,25 @@ public partial class MainWindow : Window
         await MoveArchivesAsync(relocation);
     }
 
-    /// <summary>True when nothing is left in the folder, and false if that cannot be established.</summary>
-    /// <remarks>
-    /// A folder that cannot be read is treated as still holding something. Forgetting an archive
-    /// that turns out to still have images in it would leave those images unindexed and invisible.
-    /// </remarks>
-    private static bool IsEmptyNow(string path)
+    private async Task RefreshSavedDestinationsAsync(long request)
     {
-        try
+        var saved = await _runtime.StateStore.LoadAsync();
+        await Dispatcher.InvokeAsync(() =>
         {
-            return !Directory.Exists(path) || !Directory.EnumerateFileSystemEntries(path).Any();
-        }
-        catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException)
-        {
-            return false;
-        }
+            if (_settingsSaves.IsCurrent(request)) UpdateResolvedDestinations(saved.Settings.OutputRootPath);
+        });
     }
 
-    private static void TryCreateFolder(string path)
-    {
-        try
-        {
-            Directory.CreateDirectory(path);
-        }
-        catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException or NotSupportedException)
-        {
-            // Scanning creates the folder on demand anyway; this only saves a person the surprise
-            // of an output folder that does not exist yet.
-        }
-    }
-
-    private async Task ReportSettingsAutoSaveFailureAsync(Exception exception)
+    private async Task ReportSettingsAutoSaveFailureAsync(Exception exception, long? request = null)
     {
         var logPath = await DiagnosticLog.TryWriteAsync(_runtime.StateDirectory, exception);
         var detail = logPath is null ? string.Empty : $" Details: {logPath}";
-        await Dispatcher.InvokeAsync(
-            () => ShowSettingsNotice($"Settings were not saved. {exception.Message}{detail}", isWarning: true));
+        if (request is { } version) await RefreshSavedDestinationsAsync(version);
+        await Dispatcher.InvokeAsync(() =>
+        {
+            if (request is null || _settingsSaves.IsCurrent(request.Value))
+                ShowSettingsNotice($"Could not finish applying settings. Destinations below show the saved settings. {exception.Message}{detail}", isWarning: true);
+        });
     }
 
     private void ShowSettingsNotice(string? message, bool isWarning)
@@ -1378,8 +1293,15 @@ public partial class MainWindow : Window
             BringReviewForwardCheck.IsChecked == true,
             ParseWatchScanSeconds(WatchScanSeconds.Text),
             (WatchMode?)WatchModeCombo.SelectedItem ?? WatchMode.OnDetection,
-            (OrganizationPolicy?)OrganizationCombo.SelectedItem ?? OrganizationPolicy.CategoryRoot);
+            (OrganizationPolicy?)OrganizationCombo.SelectedItem ?? OrganizationPolicy.CategoryRoot,
+            CustomSimilarityLimits.IsChecked == true
+                ? new SimilarityThresholds(ParseSimilarityPercent(MinimumSimilarity.Text), ParseSimilarityPercent(MaximumSimilarity.Text))
+                : null);
     }
+
+    private static double ParseSimilarityPercent(string text) =>
+        double.TryParse(text, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.CurrentCulture, out var value) ? value : double.NaN;
 
     private static int ParseWatchScanSeconds(string? text) =>
         int.TryParse(
@@ -1559,18 +1481,18 @@ public partial class MainWindow : Window
         if (picker.ShowDialog(this) == true)
         {
             target.Text = picker.FolderName;
-            if (ReferenceEquals(target, OutputRoot))
-            {
-                UpdateResolvedDestinations(target.Text);
-            }
+            BeginAutoSaveSettings();
         }
     }
 
     private void OutputRootChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
-        if (EmojiDestinationText is not null)
+        if (!_loadingSettings && EmojiDestinationText is not null)
         {
-            UpdateResolvedDestinations(OutputRoot.Text.Trim());
+            var request = _settingsSaves.Begin();
+            ShowSettingsNotice("Unsaved output change. Press Enter or leave the field to save; destinations show saved settings.", false);
+            _ = AsyncCommandRunner.RunAsync(() => RefreshSavedDestinationsAsync(request),
+                exception => ReportSettingsAutoSaveFailureAsync(exception, request));
         }
     }
 
@@ -1598,17 +1520,18 @@ public partial class MainWindow : Window
 
         try
         {
-            await action();
+            await _uiMutationGate.WaitAsync(CurrentCancellation);
+            try { await action(); }
+            finally { _uiMutationGate.Release(); }
         }
         catch (OperationCanceledException)
         {
-            // Every file operation is journaled and verified before it runs, so stopping
-            // between images can never leave one half-moved.
-            SetStatus("Stopped. Images already handled are done; nothing was left half-moved.");
+            // Cancellation may follow a file effect but precede its state commit.
+            SetStatus(ActionOutcomeText.Interrupted(cancelled: true));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or InvalidOperationException or NotSupportedException or ArgumentException)
         {
-            SetStatus("Action failed. No image was deleted and no permanent deletion fallback was used.");
+            SetStatus(ActionOutcomeText.Interrupted(cancelled: false));
             var logPath = await DiagnosticLog.TryWriteAsync(_runtime.StateDirectory, exception);
             var details = logPath is null
                 ? "\n\nThe diagnostic log could not be written."
@@ -1965,6 +1888,11 @@ public partial class MainWindow : Window
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             AnimationsSubtitle.Text = $"The archive could not be read: {exception.Message}";
+            SheetList.ItemsSource = null;
+            ExportSheetButton.IsEnabled = false;
+            ExportMissingButton.IsEnabled = false;
+            ExportMissingButton.Content = "Archive check incomplete";
+            ClearAnimationQueueButton.IsEnabled = false;
         }
     }
 
@@ -2313,6 +2241,8 @@ public partial class MainWindow : Window
 
     private async void ExportSelectedAnimation(object sender, RoutedEventArgs e)
     {
+        if (_busy)
+            return;
         if (SheetList.SelectedItem is not ArchivedSheet sheet || CurrentAnimationName() is not { } name)
         {
             return;
@@ -2334,28 +2264,17 @@ public partial class MainWindow : Window
             return;
         }
 
-        ExportSheetButton.IsEnabled = false;
-        AtlasAnimationResult result;
+        AtlasAnimationResult? result = null;
         ExportedAnimationFollowUp? followUp = null;
-        try
+        await RunBusyAsync("Exporting animation...", async () =>
         {
-            result = await AnimationCatalog.ExportAsync(sheet, name);
-
-            // Writing the GIF was only ever the first half. A scan goes on to tell the index about
-            // the new file, file the sheet beside it, and notice when the archive already held that
-            // picture; this button did none of it, so anything exported here stayed invisible to
-            // deduplication until the next full index - which is how the same emoji ended up in the
-            // archive twice.
-            if (result.Exported && result.Path is { } exportedPath)
-            {
-                followUp = await FinishExportAsync(
-                    [new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, exportedPath)]);
-            }
-        }
-        finally
-        {
-            ExportSheetButton.IsEnabled = true;
-        }
+            var batch = await _runtime.Scanner.ExportAnimationsAsync(
+                [new AnimationExportRequest(sheet, name)], CurrentCancellation);
+            result = batch.Results.Single();
+            followUp = batch.FollowUp;
+        });
+        if (result is null)
+            return;
 
         await RefreshAnimationsAsync();
         await RefreshArchiveDuplicatesAsync();
@@ -2453,79 +2372,34 @@ public partial class MainWindow : Window
 
     private async void ExportMissingAnimations(object sender, RoutedEventArgs e)
     {
-        ExportMissingButton.IsEnabled = false;
-        var exported = 0;
-        var failed = 0;
-        ExportedAnimationFollowUp? followUp = null;
-        try
+        if (_busy)
+            return;
+        AnimationExportBatch? batch = null;
+        await RunBusyAsync("Exporting missing animations...", async () =>
         {
-            var sheets = await AnimationCatalog.ListAsync();
-
-            // Collected as they are written and handed over in one go at the end. The follow-up
-            // reads the whole archive once per category, and doing that per file would turn a
-            // fifty-sheet batch into fifty full reads of the archive.
-            var written = new List<ExportedAnimation>();
-            foreach (var sheet in sheets.Where(item => item.NeedsDecision))
-            {
-                ExportMissingButton.Content = $"Exporting {exported + failed + 1}...";
-                var result = await AnimationCatalog.ExportAsync(sheet, sheet.Name);
-                if (result.Exported && result.Path is { } exportedPath)
-                {
-                    exported++;
-                    written.Add(new ExportedAnimation(sheet.Id, sheet.Category, sheet.AtlasPath, exportedPath));
-                }
-                else
-                {
-                    failed++;
-                }
-            }
-
-            followUp = await FinishExportAsync(written);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            AnimationsSubtitle.Text = $"The archive could not be read: {exception.Message}";
-        }
-        finally
-        {
-            ExportMissingButton.IsEnabled = true;
-        }
+            var sheets = await AnimationCatalog.ListAsync(CurrentCancellation);
+            batch = await _runtime.Scanner.ExportAnimationsAsync(sheets.Where(item => item.NeedsDecision)
+                .Select(sheet => new AnimationExportRequest(sheet, sheet.Name, MissingOnly: true)).ToArray(),
+                CurrentCancellation);
+        });
+        if (batch is null)
+            return;
 
         await RefreshAnimationsAsync();
         await RefreshArchiveDuplicatesAsync();
 
         // Written after the refresh for the same reason as the single export above.
+        var exported = batch.Results.Count(result => result.Exported && !result.ReusedExisting);
+        var failed = batch.Results.Count(result => !result.Exported);
+        var reused = batch.Results.Count(result => result.ReusedExisting);
         SheetStatusText.Text = failed == 0
             ? $"Exported {exported} animations."
             : $"Exported {exported} animations, {failed} could not be exported.";
-        SheetStatusText.Text += DescribeFollowUp(followUp);
-    }
-
-    /// <summary>
-    /// Puts freshly exported animations through the rest of what a scan does to one.
-    /// </summary>
-    /// <remarks>
-    /// Never throws. The animations are already on disk and correct by the time this runs, so a
-    /// failure here is something to say out loud, not a reason to report the export as failed.
-    /// </remarks>
-    private async Task<ExportedAnimationFollowUp> FinishExportAsync(IReadOnlyCollection<ExportedAnimation> written)
-    {
-        try
-        {
-            return await _runtime.Scanner.FinishExportedAnimationsAsync(written, CurrentCancellation);
-        }
-        catch (Exception exception) when (
-            exception is IOException
-                or UnauthorizedAccessException
-                or InvalidOperationException
-                or NotSupportedException
-                or InvalidDataException)
-        {
-            return new ExportedAnimationFollowUp(
-                [],
-                [],
-                [$"The archive could not be brought up to date: {exception.Message}. Run a scan."]);
-        }
+        if (reused > 0)
+            SheetStatusText.Text += $" Kept {reused} existing animations.";
+        SheetStatusText.Text += DescribeFollowUp(batch.FollowUp);
+        if (failed > 0)
+            SheetStatusText.Text += " " + string.Join(" ", batch.Results.Where(r => r.Warning is not null).Select(r => r.Warning));
     }
 
     /// <summary>

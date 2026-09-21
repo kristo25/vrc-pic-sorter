@@ -82,7 +82,9 @@ public sealed record PerceptualFrameFingerprint(
     byte[]? DetailAlpha = null,
     byte[]? InsetDetailAlpha = null,
     byte[]? DetailRgb = null,
-    byte[]? InsetDetailRgb = null);
+    byte[]? InsetDetailRgb = null,
+    PerceptualFrameFingerprint? ContentView = null,
+    double AspectRatio = 0);
 
 public sealed record ImageFingerprint(
     string ExactIdentity,
@@ -90,9 +92,11 @@ public sealed record ImageFingerprint(
     int Height,
     IReadOnlyList<int> FrameDelaysMilliseconds,
     IReadOnlyList<PerceptualFrameFingerprint> PerceptualFrames,
-    int FeatureVersion = 1)
+    int FeatureVersion = 1,
+    IReadOnlyList<byte[]>? AnimationFrameSummaries = null)
 {
-    public const int CurrentFeatureVersion = 4;
+    public const int CurrentFeatureVersion = 5;
+    internal const int AnimationSummarySize = 6;
     private const int AnimationSampleCount = 8;
     private const int DifferenceHashWidth = 17;
     private const int DifferenceHashHeight = 16;
@@ -113,7 +117,9 @@ public sealed record ImageFingerprint(
         && FrameDelaysMilliseconds.All(delay => delay >= 0)
         && PerceptualFrames is { Count: > 0 }
         && PerceptualFrames.Count == (FrameDelaysMilliseconds.Count == 1 ? 1 : AnimationSampleCount)
-        && PerceptualFrames.All(IsCurrentFrame);
+        && PerceptualFrames.All(IsCurrentFrame)
+        && (FrameCount == 1 || (AnimationFrameSummaries?.Count == FrameCount
+            && AnimationFrameSummaries.All(frame => frame?.Length == AnimationSummarySize * AnimationSummarySize * 4)));
 
     public static ImageFingerprint Create(DecodedImage image)
     {
@@ -138,7 +144,8 @@ public sealed record ImageFingerprint(
             .Select(index => CreatePerceptualFrame(
                 image.Frames[index].RgbaPixels,
                 image.Width,
-                image.Height))
+                image.Height,
+                normalizeMargins: image.Frames.Count == 1))
             .ToArray();
 
         return new ImageFingerprint(
@@ -147,7 +154,17 @@ public sealed record ImageFingerprint(
             image.Height,
             delays,
             perceptualFrames,
-            CurrentFeatureVersion);
+            CurrentFeatureVersion,
+            image.Frames.Count == 1 ? null : image.Frames.Select(frame =>
+                CreateAnimationSummary(frame.RgbaPixels, image.Width, image.Height)).ToArray());
+    }
+
+    private static byte[] CreateAnimationSummary(ReadOnlySpan<byte> pixels, int width, int height)
+    {
+        var summary = new byte[AnimationSummarySize * AnimationSummarySize * 4];
+        ResizeRgbArea(pixels, width, height, AnimationSummarySize, AnimationSummarySize).CopyTo(summary, 0);
+        ResizeAlpha(pixels, width, height, AnimationSummarySize, AnimationSummarySize).CopyTo(summary, AnimationSummarySize * AnimationSummarySize * 3);
+        return summary;
     }
 
     private static IReadOnlyList<int> SelectPerceptualFrameIndices(
@@ -183,6 +200,7 @@ public sealed record ImageFingerprint(
 
     private static bool IsCurrentFrame(PerceptualFrameFingerprint? frame) =>
         frame is not null
+        && double.IsFinite(frame.AspectRatio) && frame.AspectRatio > 0
         && IsSha256Hex(frame.DifferenceHash)
         && frame.ThumbnailLuminance?.Length == ThumbnailWidth * ThumbnailHeight
         && frame.ThumbnailRgb?.Length == ThumbnailWidth * ThumbnailHeight * 3
@@ -198,7 +216,8 @@ public sealed record ImageFingerprint(
         && frame.DetailAlpha?.Length == DetailThumbnailSize * DetailThumbnailSize
         && frame.InsetDetailAlpha?.Length == DetailThumbnailSize * DetailThumbnailSize
         && frame.DetailRgb?.Length == DetailThumbnailSize * DetailThumbnailSize * 3
-        && frame.InsetDetailRgb?.Length == DetailThumbnailSize * DetailThumbnailSize * 3;
+        && frame.InsetDetailRgb?.Length == DetailThumbnailSize * DetailThumbnailSize * 3
+        && (frame.ContentView is null || (frame.ContentView.ContentView is null && IsCurrentFrame(frame.ContentView)));
 
     private static bool IsSha256Hex(string? value) => value is { Length: 64 }
         && value.All(character => character is >= '0' and <= '9'
@@ -216,8 +235,40 @@ public sealed record ImageFingerprint(
     private static PerceptualFrameFingerprint CreatePerceptualFrame(
         ReadOnlySpan<byte> rgbaPixels,
         int width,
-        int height)
+        int height,
+        bool normalizeMargins)
     {
+        // Preserve the full-canvas features and add a second view without empty margins.
+        // Keeping both avoids regressions when resampling changes the visible bounding box.
+        PerceptualFrameFingerprint? contentView = null;
+        var left = width;
+        var top = height;
+        var right = -1;
+        var bottom = -1;
+        // Per-frame trimming of animations would erase motion, so only stills are normalized.
+        if (normalizeMargins)
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+        {
+            if (rgbaPixels[((y * width) + x) * 4 + 3] == 0) continue;
+            left = Math.Min(left, x);
+            right = Math.Max(right, x);
+            top = Math.Min(top, y);
+            bottom = Math.Max(bottom, y);
+        }
+
+        if (right >= left && bottom >= top
+            && (left > 0 || top > 0 || right < width - 1 || bottom < height - 1))
+        {
+            var contentWidth = right - left + 1;
+            var contentHeight = bottom - top + 1;
+            var content = new byte[checked(contentWidth * contentHeight * 4)];
+            for (var y = 0; y < contentHeight; y++)
+                rgbaPixels.Slice((((top + y) * width) + left) * 4, contentWidth * 4)
+                    .CopyTo(content.AsSpan(y * contentWidth * 4));
+            contentView = CreatePerceptualFrame(content, contentWidth, contentHeight, normalizeMargins: false);
+        }
+
         var differenceSamples = ResizeLuminance(
             rgbaPixels,
             width,
@@ -286,7 +337,9 @@ public sealed record ImageFingerprint(
                 height,
                 DetailThumbnailSize,
                 DetailThumbnailSize,
-                insetFraction: 0.035));
+                insetFraction: 0.035),
+            contentView,
+            width / (double)height);
     }
 
     private static byte[] CreateDifferenceHash(ReadOnlySpan<byte> differenceSamples)

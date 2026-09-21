@@ -8,6 +8,7 @@ public enum JournalPathState
     Missing,
     ExpectedFile,
     DifferentFile,
+    Unavailable,
 }
 
 public enum JournalReconciliationAction
@@ -121,10 +122,16 @@ public sealed class OperationJournal
             return Decision(entry, JournalReconciliationAction.None, "The operation is already complete.");
         }
 
+        if (observation.Source == JournalPathState.Unavailable || observation.Destination == JournalPathState.Unavailable)
+        {
+            return Decision(entry, JournalReconciliationAction.NeedsAttention,
+                "Storage could not be read reliably. The operation remains pending until its paths can be verified.");
+        }
+
         return entry.OperationType switch
         {
             JournalOperationType.Move => ReconcileMove(entry, observation),
-            JournalOperationType.Recycle => ReconcileRecycle(entry, observation),
+            JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming => ReconcileRemoval(entry, observation),
             _ => Decision(entry, JournalReconciliationAction.NeedsAttention, "The operation type is unknown."),
         };
     }
@@ -172,20 +179,20 @@ public sealed class OperationJournal
         return Decision(entry, JournalReconciliationAction.NeedsAttention, "The observed move paths do not prove a safe retry or completion.");
     }
 
-    private static JournalReconciliationDecision ReconcileRecycle(
+    private static JournalReconciliationDecision ReconcileRemoval(
         JournalEntry entry,
         JournalFileObservation observation)
     {
         if (observation.Destination != JournalPathState.NotApplicable)
         {
-            return Decision(entry, JournalReconciliationAction.NeedsAttention, "Recycle operations do not have a destination path.");
+            return Decision(entry, JournalReconciliationAction.NeedsAttention, "Removal operations do not have a destination path.");
         }
 
         if (observation.Source == JournalPathState.ExpectedFile)
         {
             return entry.Phase is JournalPhase.IntentRecorded or JournalPhase.SideEffectStarted or JournalPhase.NeedsAttention
-                ? Decision(entry, JournalReconciliationAction.RetrySideEffect, "The expected source is intact and can be recycled once.")
-                : Decision(entry, JournalReconciliationAction.NeedsAttention, "The journal says recycling was applied, but the source is still present.");
+                ? Decision(entry, JournalReconciliationAction.RetrySideEffect, "The expected source is intact; removal can be retried after verifying the retained copy.")
+                : Decision(entry, JournalReconciliationAction.NeedsAttention, "The journal says removal was applied, but the source is still present.");
         }
 
         if (observation.Source == JournalPathState.Missing)
@@ -195,12 +202,12 @@ public sealed class OperationJournal
                 return Decision(
                     entry,
                     JournalReconciliationAction.NeedsAttention,
-                    "The source changed before the journal recorded that recycling started.");
+                    "The source changed before the journal recorded that removal started.");
             }
 
             return entry.Phase == JournalPhase.StateCommitted
                 ? Decision(entry, JournalReconciliationAction.MarkCompleted, "The source is absent and durable state was committed.")
-                : Decision(entry, JournalReconciliationAction.CommitState, "The source is absent, so the recycle side effect must not be repeated.");
+                : Decision(entry, JournalReconciliationAction.CommitState, "The source is absent, so removal must not be repeated.");
         }
 
         return Decision(entry, JournalReconciliationAction.NeedsAttention, "The source path contains a different file and cannot be reconciled automatically.");
@@ -267,7 +274,14 @@ public sealed class OperationJournal
             throw new ArgumentException("Move journal entries require a destination path.", nameof(entry));
         }
 
-        if (entry.OperationType == JournalOperationType.Recycle
+        if (entry.OperationType == JournalOperationType.DeleteExactIncoming
+            && (entry.Purpose != JournalOperationPurpose.AutoKeepArchived
+                || !string.Equals(entry.ExpectedSource.Fingerprint, entry.SurvivingFingerprint, StringComparison.Ordinal)))
+        {
+            throw new ArgumentException("Permanent deletion requires an exact archived survivor.", nameof(entry));
+        }
+
+        if (entry.OperationType is JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming
             && entry.DestinationPath is not null)
         {
             throw new ArgumentException("Recycle journal entries cannot have a destination path.", nameof(entry));
@@ -286,7 +300,7 @@ public sealed class OperationJournal
     public static bool RequiresSurvivingCopy(JournalEntry entry)
     {
         ArgumentNullException.ThrowIfNull(entry);
-        return entry.OperationType == JournalOperationType.Recycle
+        return entry.OperationType is JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming
             && entry.Purpose is JournalOperationPurpose.AutoKeepArchived
                 or JournalOperationPurpose.AutoKeepHeld
                 or JournalOperationPurpose.RemoveArchiveDuplicate

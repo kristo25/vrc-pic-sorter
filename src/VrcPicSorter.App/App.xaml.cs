@@ -109,7 +109,7 @@ public partial class App : System.Windows.Application
 
             var details = logPath is null ? string.Empty : $"\n\nDetails were written to:\n{logPath}";
             MessageBox.Show(
-                $"An unexpected error occurred. No image was deleted as a result.\n\n{e.Exception.Message}{details}",
+                $"{ActionOutcomeText.Interrupted(cancelled: false)}\n\n{e.Exception.Message}{details}",
                 "VRC Pic Sorter",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);

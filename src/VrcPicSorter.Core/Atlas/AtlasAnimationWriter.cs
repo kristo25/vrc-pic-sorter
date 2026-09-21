@@ -16,7 +16,8 @@ public sealed record AtlasAnimationResult(
     bool Exported,
     string? Path,
     string? Warning,
-    string? Note = null)
+    string? Note = null,
+    bool ReusedExisting = false)
 {
     public static readonly AtlasAnimationResult NotASheet = new(false, null, null);
 }
@@ -197,7 +198,41 @@ public sealed class AtlasAnimationWriter
             return AtlasAnimationResult.NotASheet;
         }
 
-        return await TryWriteAsync(archivedPath, archiveRoot, name, cancellationToken).ConfigureAwait(false);
+        return await TryWriteMissingAsync(archivedPath, archiveRoot, name, cancellationToken).ConfigureAwait(false);
+    }
+
+    public static string? FindExistingAnimation(string archivedPath, string archiveRoot) =>
+        new ExistingAnimations(DestinationRoot(archivedPath, archiveRoot)).Find(archivedPath, archiveRoot);
+
+    /// <summary>Automatic export never replaces a retained animation, even when the index is stale.</summary>
+    public async Task<AtlasAnimationResult> TryWriteMissingAsync(
+        string archivedPath,
+        string archiveRoot,
+        EmojiAtlasName name,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (FindExistingAnimation(archivedPath, archiveRoot) is { } existing)
+            {
+                var decoded = await new Imaging.ImageDecoder().DecodeAsync(existing, cancellationToken).ConfigureAwait(false);
+                if (!decoded.IsSuccess)
+                {
+                    return new AtlasAnimationResult(false, null,
+                        $"The existing animation could not be read: {existing}. It was left unchanged.");
+                }
+                return new AtlasAnimationResult(true, existing, null, "kept the existing animation", true);
+            }
+
+            return await WriteAsync(archivedPath, archiveRoot, name, null, false, cancellationToken, null)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+            or InvalidOperationException or ArgumentException or NotSupportedException)
+        {
+            return new AtlasAnimationResult(false, null, $"could not check existing animations ({exception.Message})");
+        }
     }
 
     /// <summary>
@@ -205,20 +240,27 @@ public sealed class AtlasAnimationWriter
     /// file name. VRChat's name is right on all but a couple of sheets, and this is how those are
     /// corrected by hand.
     /// </summary>
-    public async Task<AtlasAnimationResult> TryWriteAsync(
+    public Task<AtlasAnimationResult> TryWriteAsync(
         string archivedPath,
         string archiveRoot,
         EmojiAtlasName name,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? destinationPath = null,
+        string? expectedDestinationHash = null) =>
+        WriteAsync(archivedPath, archiveRoot, name, destinationPath, true, cancellationToken, expectedDestinationHash);
+
+    private async Task<AtlasAnimationResult> WriteAsync(
+        string archivedPath, string archiveRoot, EmojiAtlasName name,
+        string? destinationPath, bool overwrite, CancellationToken cancellationToken, string? expectedDestinationHash)
     {
         ArgumentNullException.ThrowIfNull(name);
 
         try
         {
-            var destination = BuildDestination(archivedPath, archiveRoot);
+            var destination = destinationPath ?? BuildDestination(archivedPath, archiveRoot);
             var destinationRoot = DestinationRoot(archivedPath, archiveRoot);
             var exported = await _exporter
-                .ExportAsync(archivedPath, destination, name, destinationRoot, cancellationToken)
+                .ExportAsync(archivedPath, destination, name, destinationRoot, cancellationToken, overwrite, expectedDestinationHash)
                 .ConfigureAwait(false);
             return new AtlasAnimationResult(true, exported.Path, null, exported.Note);
         }

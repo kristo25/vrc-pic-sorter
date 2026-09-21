@@ -85,6 +85,7 @@ public enum JournalOperationType
 {
     Move,
     Recycle,
+    DeleteExactIncoming,
 }
 
 public enum JournalOperationPurpose
@@ -165,6 +166,10 @@ public sealed class AppSettings
 
     public bool OutputRootConfirmed { get; set; } = true;
 
+    // Only freshly generated defaults are suggestions. Older state omits this flag and
+    // remains authoritative, including temporarily unavailable archives.
+    public bool OutputRootIsSuggested { get; set; }
+
     public List<LegacyArchiveMapping> LegacyArchiveMappings { get; set; } = [];
 
     public OrganizationPolicy OrganizationPolicy { get; set; } = OrganizationPolicy.CategoryRoot;
@@ -181,6 +186,8 @@ public sealed class AppSettings
 
     public SimilarityProfile SimilarityProfile { get; set; } = SimilarityProfile.Conservative;
 
+    public SimilarityThresholds? CustomSimilarityThresholds { get; set; }
+
     public AutomationSettings Automation { get; set; } = new();
 
     public string HoldingRootPath { get; set; } = string.Empty;
@@ -190,6 +197,10 @@ public sealed class AppSettings
 
 public sealed class CategoryMapping
 {
+    // False for old state. True only when a newly selected category folder was
+    // positively absent beneath a readable parent, not merely unreachable.
+    public bool ArchivePathKnownMissing { get; set; }
+
     public VrcImageCategory Category { get; set; }
 
     public string SourcePath { get; set; } = string.Empty;
@@ -477,6 +488,7 @@ public static class AppStateDefaults
             Settings = new AppSettings
             {
                 OutputRootPath = archiveRoot,
+                OutputRootIsSuggested = true,
                 CategoryMappings = FixedCategories
                     .Select(category => new CategoryMapping
                     {

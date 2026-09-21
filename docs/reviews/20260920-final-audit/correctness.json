@@ -1,0 +1,8 @@
+{
+  "reviewer": "correctness",
+  "findings": [],
+  "residual_risks": [],
+  "testing_gaps": [
+    "The reviewed tests cover the settings sequencer and scanner gate, but do not drive MainWindow autosave, watcher restart, and stale presentation together through a WPF dispatcher. The implementation progress document also records that real slow SMB relocation responsiveness remains unverified; the deterministic blocked-worker test is not that runtime validation."
+  ]
+}

@@ -13,7 +13,8 @@ public sealed record ArchivedSheet(
     bool HasAnimation,
     EmojiAtlasName Name,
     string Fingerprint = "",
-    bool IsSkipped = false)
+    bool IsSkipped = false,
+    string? AnimationFingerprint = null)
 {
     public string FileName => System.IO.Path.GetFileName(AtlasPath);
 
@@ -49,8 +50,8 @@ public sealed record ArchivedSheet(
 /// Lists the animated emoji in the archive and re-exports them on request.
 /// </summary>
 /// <remarks>
-/// Everything here is derived from the file name and the archive index, so the list costs one
-/// file-exists check per archived sheet and nothing is decoded until an export is asked for.
+/// Sheets come from the index; animation candidates are read from disk once per root so an
+/// unindexed or renamed GIF does not turn an already animated sheet back into missing work.
 /// </remarks>
 public sealed class AtlasAnimationCatalog
 {
@@ -66,14 +67,12 @@ public sealed class AtlasAnimationCatalog
     {
         var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
         var skipped = new HashSet<string>(state.SkippedAnimations, StringComparer.OrdinalIgnoreCase);
-        var roots = state.Settings.CategoryMappings
-            .GroupBy(mapping => mapping.Category)
-            .ToDictionary(group => group.Key, group => group.First().ArchivePath);
 
         var sheets = new List<ArchivedSheet>();
+        var animations = new Dictionary<string, ExistingAnimations>(StringComparer.OrdinalIgnoreCase);
+        var fingerprints = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var category in state.ArchiveIndex.Categories)
         {
-            var root = roots.TryGetValue(category.Category, out var mapped) ? mapped : string.Empty;
             foreach (var image in category.Images)
             {
                 if (!EmojiAtlasName.TryParse(image.Path, out var name))
@@ -82,16 +81,33 @@ public sealed class AtlasAnimationCatalog
                 }
 
                 string destination;
+                string root;
                 bool exists;
+                string? animationFingerprint = null;
                 try
                 {
+                    root = ArchiveOwner.Resolve(state.Settings, category.Category, image.Path);
                     destination = AtlasAnimationWriter.BuildDestination(image.Path, root);
-                    exists = File.Exists(destination);
+                    var searchRoot = AtlasAnimationWriter.DestinationRoot(image.Path, root);
+                    if (!animations.TryGetValue(searchRoot, out var existing))
+                    {
+                        existing = new ExistingAnimations(searchRoot);
+                        animations.Add(searchRoot, existing);
+                    }
+                    var retained = existing.Find(image.Path, root);
+                    exists = retained is not null;
+                    destination = retained ?? destination;
+                    if (retained is not null && !fingerprints.TryGetValue(retained, out animationFingerprint))
+                    {
+                        animationFingerprint = await AtlasGifExporter.ReadContentHashAsync(retained, cancellationToken).ConfigureAwait(false);
+                        fingerprints.Add(retained, animationFingerprint);
+                    }
                 }
                 catch (Exception exception) when (
-                    exception is ArgumentException or IOException or UnauthorizedAccessException)
+                    exception is ArgumentException or IOException or UnauthorizedAccessException
+                        or InvalidOperationException or NotSupportedException)
                 {
-                    continue;
+                    throw new IOException($"Could not check the animation for {image.Path}: {exception.Message}", exception);
                 }
 
                 sheets.Add(new ArchivedSheet(
@@ -103,7 +119,8 @@ public sealed class AtlasAnimationCatalog
                     exists,
                     name,
                     image.ExactFingerprint,
-                    skipped.Contains(image.ExactFingerprint)));
+                    skipped.Contains(image.ExactFingerprint),
+                    animationFingerprint));
             }
         }
 
@@ -123,8 +140,25 @@ public sealed class AtlasAnimationCatalog
     {
         ArgumentNullException.ThrowIfNull(sheet);
         ArgumentNullException.ThrowIfNull(name);
-        return _writer.TryWriteAsync(sheet.AtlasPath, sheet.ArchiveRoot, name, cancellationToken);
+        var current = AtlasAnimationWriter.FindExistingAnimation(sheet.AtlasPath, sheet.ArchiveRoot);
+        if (sheet.HasAnimation && !string.Equals(current, sheet.AnimationPath, StringComparison.OrdinalIgnoreCase)
+            || !sheet.HasAnimation && current is not null)
+        {
+            return Task.FromResult(new AtlasAnimationResult(false, null,
+                "The existing animation changed. Refresh the list and confirm the replacement again."));
+        }
+
+        return sheet.HasAnimation
+            ? sheet.AnimationFingerprint is null
+                ? Task.FromResult(new AtlasAnimationResult(false, null, "Refresh the list before replacing an existing animation."))
+                : _writer.TryWriteAsync(sheet.AtlasPath, sheet.ArchiveRoot, name, cancellationToken,
+                    sheet.AnimationPath, sheet.AnimationFingerprint)
+            : _writer.TryWriteMissingAsync(sheet.AtlasPath, sheet.ArchiveRoot, name, cancellationToken);
     }
+
+    public Task<AtlasAnimationResult> ExportMissingAsync(
+        ArchivedSheet sheet, CancellationToken cancellationToken = default) =>
+        _writer.TryWriteMissingAsync(sheet.AtlasPath, sheet.ArchiveRoot, sheet.Name, cancellationToken);
 
     /// <summary>
     /// Marks sheets as skipped, so they stop counting as work still to do. Nothing on disk moves

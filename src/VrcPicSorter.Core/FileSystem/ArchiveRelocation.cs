@@ -8,7 +8,8 @@ public sealed record ArchiveRelocationStep(
     string From,
     string To,
     int FileCount,
-    long TotalBytes);
+    long TotalBytes,
+    string? InventoryError = null);
 
 /// <summary>One file that really did move, and where it landed.</summary>
 /// <remarks>
@@ -32,7 +33,8 @@ public sealed record ArchiveRelocationResult(
     int LeftBehind,
     IReadOnlyList<string> Errors,
     IReadOnlyList<ArchiveRelocationMove> Moves,
-    bool Stopped = false);
+    bool Stopped = false,
+    bool InventoryComplete = true);
 
 public sealed record ArchiveRelocationProgress(int Moved, int Total, string FileName);
 
@@ -52,6 +54,19 @@ public sealed record ArchiveRelocationProgress(int Moved, int Total, string File
 /// </remarks>
 public static class ArchiveRelocation
 {
+    public static void EnsurePlanMatchesSettings(AppSettings settings, IEnumerable<ArchiveRelocationStep> steps)
+    {
+        foreach (var step in steps)
+        {
+            var mapping = settings.CategoryMappings.SingleOrDefault(item => item.Category == step.Category);
+            var sources = settings.LegacyArchiveMappings.Where(item => item.Category == step.Category)
+                .Select(item => item.ArchivePath).Append(mapping?.ArchivePath ?? string.Empty);
+            if (mapping is null || !mapping.IsEnabled || !SameRoot(mapping.ArchivePath, step.To)
+                || !sources.Any(source => !string.IsNullOrWhiteSpace(source) && SameRoot(source, step.From)))
+                throw new InvalidOperationException("Archive settings changed. Refresh the retained archives and confirm the move again.");
+        }
+    }
+
     /// <summary>
     /// Works out which known archive folders hold files that do not sit under
     /// <paramref name="newOutputRoot"/> yet.
@@ -81,13 +96,14 @@ public static class ArchiveRelocation
 
             foreach (var candidate in candidates)
             {
-                if (PathBoundary.Contains(destination, candidate) || !Directory.Exists(candidate))
+                if (string.Equals(PathBoundary.Normalize(destination), PathBoundary.Normalize(candidate), StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
 
-                var files = SafeEnumerate(candidate);
-                if (files.Count == 0)
+                EnsureSeparateRoots(candidate, destination);
+                var inventory = ReadInventory(candidate);
+                if (inventory.Error is null && inventory.Files.Count == 0)
                 {
                     continue;
                 }
@@ -96,8 +112,9 @@ public static class ArchiveRelocation
                     mapping.Category,
                     PathBoundary.Normalize(candidate),
                     destination,
-                    files.Count,
-                    files.Sum(SafeLength)));
+                    inventory.Files.Count,
+                    inventory.Bytes,
+                    inventory.Error));
             }
         }
 
@@ -119,10 +136,21 @@ public static class ArchiveRelocation
     /// sitting at the destination under the same name, with the old fingerprint still attached.
     /// </para>
     /// </remarks>
-    public static async Task<ArchiveRelocationResult> RelocateAsync(
+    public static Task<ArchiveRelocationResult> RelocateAsync(
         IEnumerable<ArchiveRelocationStep> steps,
         IProgress<ArchiveRelocationProgress>? progress = null,
         CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(steps);
+        // Do not cancel scheduling: a pre-cancelled request still returns a truthful stopped
+        // result. Synchronous filesystem work must never run on the WPF calling thread.
+        return Task.Run(() => RelocateCore(steps, progress, cancellationToken));
+    }
+
+    private static ArchiveRelocationResult RelocateCore(
+        IEnumerable<ArchiveRelocationStep> steps,
+        IProgress<ArchiveRelocationProgress>? progress,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(steps);
         var planned = steps.ToArray();
@@ -131,6 +159,20 @@ public static class ArchiveRelocation
         var leftBehind = 0;
         var errors = new List<string>();
         var moves = new List<ArchiveRelocationMove>();
+        var inventoryComplete = true;
+        // Validate every pair before the first move, including cross-step nesting.
+        try
+        {
+            foreach (var step in planned)
+            {
+                if (SameRoot(step.From, step.To)) continue;
+                foreach (var other in planned) EnsureSeparateRoots(other.From, step.To);
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
+        {
+            return new ArchiveRelocationResult(0, 0, [exception.Message], [], InventoryComplete: false);
+        }
 
         foreach (var step in planned)
         {
@@ -139,7 +181,15 @@ public static class ArchiveRelocation
                 return Stop(moved, leftBehind, errors, moves);
             }
 
-            foreach (var file in SafeEnumerate(step.From))
+            if (SameRoot(step.From, step.To)) continue;
+            var inventory = ReadInventory(step.From);
+            if (inventory.Error is { } inventoryError)
+            {
+                inventoryComplete = false;
+                errors.Add(inventoryError);
+                continue;
+            }
+            foreach (var file in inventory.Files)
             {
                 if (cancellationToken.IsCancellationRequested)
                 {
@@ -158,18 +208,10 @@ public static class ArchiveRelocation
                     }
 
                     PathBoundary.EnsureSafeDestination(step.To, destination, "Relocated archive file");
+                    PathBoundary.EnsureContained(step.From, file, "Relocation source");
+                    PathBoundary.EnsureNoReparsePoints(file, "Relocation source");
                     Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
                     File.Move(file, destination);
-                    if (!File.Exists(destination))
-                    {
-                        leftBehind++;
-                        errors.Add($"{file}: the move reported success but nothing arrived.");
-                        continue;
-                    }
-
-                    moved++;
-                    moves.Add(new ArchiveRelocationMove(step.Category, file, destination));
-                    progress?.Report(new ArchiveRelocationProgress(moved, total, Path.GetFileName(file)));
                 }
                 catch (Exception exception) when (
                     exception is IOException
@@ -179,13 +221,28 @@ public static class ArchiveRelocation
                 {
                     leftBehind++;
                     errors.Add($"{file}: {exception.Message}");
+                    continue;
                 }
 
-                await Task.Yield();
+                // A successful move is a completed effect even if the destination goes offline
+                // immediately afterwards. Preserve its receipt before reporting progress.
+                moved++;
+                moves.Add(new ArchiveRelocationMove(step.Category, file, destination));
+                try
+                {
+                    progress?.Report(new ArchiveRelocationProgress(moved, total, Path.GetFileName(file)));
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                    or NotSupportedException or InvalidOperationException or OperationCanceledException)
+                {
+                    errors.Add($"Progress reporting failed after moving {file}: {exception.Message}");
+                    return Stop(moved, leftBehind, errors, moves);
+                }
+
             }
         }
 
-        return new ArchiveRelocationResult(moved, leftBehind, errors, moves);
+        return new ArchiveRelocationResult(moved, leftBehind, errors, moves, InventoryComplete: inventoryComplete);
     }
 
     /// <summary>What a cancelled relocation hands back.</summary>
@@ -202,7 +259,7 @@ public static class ArchiveRelocation
         List<ArchiveRelocationMove> moves)
     {
         errors.Add("Moving your archive was stopped. The files that had already moved are recorded.");
-        return new ArchiveRelocationResult(moved, leftBehind, errors, moves, Stopped: true);
+        return new ArchiveRelocationResult(moved, leftBehind, errors, moves, Stopped: true, InventoryComplete: false);
     }
 
     /// <summary>
@@ -357,28 +414,41 @@ public static class ArchiveRelocation
                 && moved.Contains(PathBoundary.Normalize(legacy.ArchivePath)));
     }
 
-    private static IReadOnlyList<string> SafeEnumerate(string root)
+    public static bool IsVerifiedEmpty(string root)
     {
         try
         {
-            return PathBoundary.EnumerateFilesWithoutReparsePoints(root);
+            PathBoundary.EnsureNoReparsePoints(root, "Archive folder");
+            return !Directory.EnumerateFileSystemEntries(root).Any();
         }
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
-            return [];
+            return false;
         }
     }
 
-    private static long SafeLength(string path)
+    private static bool SameRoot(string first, string second) =>
+        string.Equals(PathBoundary.Normalize(first), PathBoundary.Normalize(second), StringComparison.OrdinalIgnoreCase);
+
+    private static void EnsureSeparateRoots(string source, string destination)
+    {
+        if (PathBoundary.Overlaps(source, destination))
+            throw new InvalidOperationException($"Archive relocation folders cannot overlap: {source} and {destination}");
+        PathBoundary.EnsureNoReparsePoints(source, "Relocation source");
+        PathBoundary.EnsureNoReparsePoints(destination, "Relocation destination");
+    }
+
+    private static (IReadOnlyList<string> Files, long Bytes, string? Error) ReadInventory(string root)
     {
         try
         {
-            return new FileInfo(path).Length;
+            var files = PathBoundary.EnumerateFilesWithoutReparsePoints(root);
+            return (files, files.Sum(path => new FileInfo(path).Length), null);
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
-            return 0;
+            return ([], 0, $"Archive inventory is unavailable or incomplete: {root}. {exception.Message}");
         }
     }
 }

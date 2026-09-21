@@ -58,22 +58,20 @@ public static class ImageMatcher
     /// </summary>
     /// <remarks>
     /// A presentation threshold and nothing more. It decides what a person is shown next to a
-    /// match; it does not decide anything about their files, and no code path may treat a number
-    /// on the screen as permission to discard one.
+    /// match; it does not decide anything about their files. Opt-in custom limits use the raw
+    /// score, never this rounded display threshold, and allow recycling only for non-exact matches.
     /// </remarks>
     public const double DisplayedAsIdenticalThreshold = 0.995;
 
     /// <summary>
-    /// True when a ranked match can be resolved without asking anyone: the two images decode to
+    /// True when a ranked match qualifies for exact-duplicate removal: the two images decode to
     /// the very same pixels, at the same size, in the same frame order, with the same timing.
     /// </summary>
     /// <remarks>
-    /// Perceptual similarity ranks matches for review. It never authorises a deletion, because it
-    /// cannot prove identity: an animation is compared on eight sampled frames, so a pair that
-    /// differs on half of its frames still scores a rounded 100%. The audit built exactly that
-    /// pair - two 16-frame GIFs, eight frames red against eight frames blue - and watched the
-    /// incoming image go to the Recycle Bin without anyone seeing it. Identity is the whole
-    /// decoded content or it is not identity.
+    /// Perceptual similarity alone never authorises permanent deletion, because it
+    /// cannot prove identity. High-detail samples and compact summaries of every frame improve
+    /// similarity estimates, but neither compares every pixel. Only the exact fingerprint
+    /// establishes identity of the complete decoded content, dimensions, order, and timing.
     /// </remarks>
     public static bool IsSamePicture(
         ImageMatchResult match,
@@ -113,10 +111,13 @@ public static class ImageMatcher
     public static IReadOnlyList<ImageMatchResult> RankCandidates(
         ImageFingerprint incoming,
         IEnumerable<ImageCandidate> candidates,
-        SimilarityProfile profile)
+        SimilarityProfile profile,
+        double? minimumScore = null)
     {
         ArgumentNullException.ThrowIfNull(incoming);
         ArgumentNullException.ThrowIfNull(candidates);
+        if (minimumScore is { } limit && (!double.IsFinite(limit) || limit < 0 || limit > 1))
+            throw new ArgumentOutOfRangeException(nameof(minimumScore));
 
         var matches = new List<ImageMatchResult>();
         foreach (var candidate in candidates)
@@ -135,7 +136,8 @@ public static class ImageMatcher
             }
 
             var comparison = Compare(incoming, candidate.Fingerprint);
-            if (MeetsProfileEvidence(incoming, candidate.Fingerprint, comparison, profile))
+            if (minimumScore is { } minimum ? comparison.Score >= minimum
+                : MeetsProfileEvidence(incoming, candidate.Fingerprint, comparison, profile))
             {
                 matches.Add(new ImageMatchResult(
                     candidate.CandidateKey,
@@ -197,10 +199,13 @@ public static class ImageMatcher
 
     private static PerceptualComparison Compare(ImageFingerprint first, ImageFingerprint second)
     {
-        var frameComparison = AlignedFrameComparison(first.PerceptualFrames, second.PerceptualFrames);
+        var allowContentAlignment = first.FrameCount == 1 && second.FrameCount == 1
+            && (first.Width != second.Width || first.Height != second.Height);
+        var frameComparison = AlignedFrameComparison(first.PerceptualFrames, second.PerceptualFrames, allowContentAlignment);
         var aspectScore = Math.Min(first.AspectRatio, second.AspectRatio)
             / Math.Max(first.AspectRatio, second.AspectRatio);
-        var animationScore = AnimationSimilarity(first, second);
+        var allFramesScore = AllFramesSimilarity(first, second);
+        var animationScore = Math.Min(AnimationSimilarity(first, second), allFramesScore);
         var score = (frameComparison.HashScore * 0.07)
             + (frameComparison.ThumbnailScore * 0.05)
             + (frameComparison.ColorThumbnailScore * 0.18)
@@ -210,7 +215,7 @@ public static class ImageMatcher
             + (aspectScore * 0.05)
             + (animationScore * 0.10);
         return new PerceptualComparison(
-            Math.Clamp(score, 0, 1),
+            Math.Clamp(Math.Min(score, allFramesScore), 0, 1),
             frameComparison.HashScore,
             frameComparison.ThumbnailScore,
             frameComparison.ColorThumbnailScore,
@@ -222,15 +227,58 @@ public static class ImageMatcher
             frameComparison.InsetAlignmentScore);
     }
 
+    private static double AllFramesSimilarity(ImageFingerprint first, ImageFingerprint second)
+    {
+        // High-detail sampling ranks animation appearance; it cannot establish agreement of
+        // frames it never inspected. These compact summaries cover every decoded frame.
+        if (first.FrameCount <= 1 || second.FrameCount <= 1
+            || first.AnimationFrameSummaries is not { Count: > 0 } a
+            || second.AnimationFrameSummaries is not { Count: > 0 } b)
+            return 1;
+
+        // Canonicalize unequal lengths so swapping incoming/archive cannot change the score.
+        if (a.Count > b.Count) (a, b) = (b, a);
+        var count = Math.Max(a.Count, b.Count);
+        const int pixels = ImageFingerprint.AnimationSummarySize * ImageFingerprint.AnimationSummarySize;
+        var best = 0D;
+        for (var offset = 0; offset < b.Count; offset++)
+        {
+            var worst = 1D;
+            for (var frame = 0; frame < count; frame++)
+            {
+                var left = a[(int)((long)frame * a.Count / count)];
+                var right = b[((int)((long)frame * b.Count / count) + offset) % b.Count];
+                double colorError = 0, alphaError = 0;
+                for (var pixel = 0; pixel < pixels * 3; pixel++)
+                {
+                    var difference = left[pixel] - right[pixel];
+                    colorError += difference * difference;
+                }
+                for (var pixel = pixels * 3; pixel < pixels * 4; pixel++)
+                {
+                    var difference = left[pixel] - right[pixel];
+                    alphaError += difference * difference;
+                }
+                var similarity = 1 - Math.Max(Math.Sqrt(colorError / (pixels * 3)), Math.Sqrt(alphaError / pixels)) / 255;
+                worst = Math.Min(worst, similarity);
+                if (worst <= best) break;
+            }
+            best = Math.Max(best, worst);
+            if (best >= 1) break;
+        }
+        return best;
+    }
+
     private static FrameComparison AlignedFrameComparison(
         IReadOnlyList<PerceptualFrameFingerprint> first,
-        IReadOnlyList<PerceptualFrameFingerprint> second)
+        IReadOnlyList<PerceptualFrameFingerprint> second,
+        bool allowContentAlignment)
     {
         if (first.Count == 1 || second.Count == 1)
         {
             var staticFrame = first.Count == 1 ? first[0] : second[0];
             var animatedFrames = SampleFrames(first.Count == 1 ? second : first, 8);
-            return Average(animatedFrames.Select(frame => CompareFrame(staticFrame, frame)));
+            return Average(animatedFrames.Select(frame => CompareFrame(staticFrame, frame, allowContentAlignment)));
         }
 
         var sampleCount = Math.Min(8, Math.Max(first.Count, second.Count));
@@ -256,7 +304,8 @@ public static class ImageMatcher
 
     private static FrameComparison CompareFrame(
         PerceptualFrameFingerprint first,
-        PerceptualFrameFingerprint second)
+        PerceptualFrameFingerprint second,
+        bool allowContentAlignment = false)
     {
         var comparisons = new[]
         {
@@ -267,7 +316,22 @@ public static class ImageMatcher
         };
         var best = comparisons.MaxBy(FrameScore)!;
         var colorScore = ColorSimilarity(first.ColorStatistics, second.ColorStatistics);
-        return best with { ColorScore = colorScore };
+        best = best with { ColorScore = colorScore };
+        if (allowContentAlignment && (first.ContentView is not null || second.ContentView is not null))
+        {
+            var firstContent = first.ContentView ?? first;
+            var secondContent = second.ContentView ?? second;
+            var aspectAgreement = Math.Min(firstContent.AspectRatio, secondContent.AspectRatio)
+                / Math.Max(firstContent.AspectRatio, secondContent.AspectRatio);
+            // Normalizing must not turn a thin horizontal mark into the same image as a
+            // vertical mark. Small rounding changes from resized alpha edges are allowed.
+            if (aspectAgreement >= 0.95)
+            {
+                var content = CompareFrame(firstContent, secondContent);
+                if (FrameScore(content) > FrameScore(best)) best = content;
+            }
+        }
+        return best;
     }
 
     private static FrameComparison CompareViews(
