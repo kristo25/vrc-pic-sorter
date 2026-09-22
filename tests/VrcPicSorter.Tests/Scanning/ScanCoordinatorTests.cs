@@ -77,8 +77,10 @@ public sealed class ScanCoordinatorTests
             foreach (var path in new[] { requested, unrelated })
                 state.ReviewQueue.Add(new ReviewItem
                 {
-                    Id = Guid.NewGuid(), Category = VrcImageCategory.Emoji,
-                    IncomingOriginalPath = path, HeldFilePath = path,
+                    Id = Guid.NewGuid(),
+                    Category = VrcImageCategory.Emoji,
+                    IncomingOriginalPath = path,
+                    HeldFilePath = path,
                     IncomingFingerprint = fingerprint.ExactIdentity,
                     IncomingImageFingerprint = fingerprint,
                     Candidates = [new ReviewCandidate

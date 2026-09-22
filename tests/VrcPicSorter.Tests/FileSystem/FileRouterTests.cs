@@ -32,7 +32,8 @@ public sealed class FileRouterTests
             OperationType = permanent ? JournalOperationType.DeleteExactIncoming : JournalOperationType.Recycle,
             Purpose = JournalOperationPurpose.AutoKeepArchived,
             SourcePath = Path.Combine(sourceRoot, "unavailable", "copy.png"),
-            SurvivingPath = keeper, SurvivingFingerprint = fingerprint.ExactIdentity,
+            SurvivingPath = keeper,
+            SurvivingFingerprint = fingerprint.ExactIdentity,
             ExpectedSource = new ExpectedFileIdentity { Fingerprint = fingerprint.ExactIdentity },
         });
         await journal.AdvanceAsync(entry.Id, JournalPhase.SideEffectStarted);

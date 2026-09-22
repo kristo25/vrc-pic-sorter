@@ -2,6 +2,18 @@
 
 VRC Pic Sorter is a local Windows tool for reviewing duplicate and similar images collected by VRCX. It scans the fixed `Emoji`, `Prints`, and `Stickers` categories, keeps unique images organized, and places possible matches in a persistent visual review queue. It also turns animated emoji sheets into GIFs, using the frame count, rate, and loop direction VRChat writes into the file name. See *Animated emoji* below.
 
+**[Download the latest Windows app](https://github.com/kristo25/vrc-pic-sorter/releases/latest)** · Portable, no installation required · Windows x64
+
+### New in 1.4.0
+
+- Turn animated emoji sheets into GIFs and reuse existing animations across retained archives.
+- Set minimum and maximum similarity limits to control automatic filing, review, and recycling.
+- Detect padded emoji more reliably and check every GIF frame with compact visual summaries.
+- Keep the archived copy of verified exact duplicates automatically, with a permanent-delete fallback only when recycling is unavailable.
+- Safer archive relocation, recovery, settings updates, and duplicate handling.
+
+In a fixed held-out test, padded-image detection improved from **0/96 to 77/96**, and changed GIFs incorrectly scoring at least 99% fell from **8/8 to 0/8**. These controlled tests are not a universal accuracy estimate. See the [release changelog](CHANGELOG.md).
+
 ## Safety model
 
 - Filenames and metadata do not determine image identity.
@@ -137,7 +149,7 @@ PNG, animated GIF, JPG/JPEG, WebP, and BMP are supported. MP4, `.temp`, and unsu
 5. Settings save automatically as you change them. Select **Scan now** when you are ready; the output folder is created if it does not exist yet.
 6. Use **Scan another folder** for a one-time recursive scan outside the configured VRCX folders.
 7. Use **Start watching** when you want the app to monitor configured folders during the current session. Choose **OnDetection** to analyze each image as it arrives, or **OnInterval** to ignore individual arrivals and sweep the folders on a timer instead (default 60 seconds, range 15–3600). Temporarily unavailable folders are attached automatically when they return.
-8. Review matches with **Keep incoming**, **Keep match**, or **Move as Unique**. A review holding several matches asks for confirmation once, not once per match.
+8. Review matches with **Keep incoming**, **Keep match**, or **Move as Unique**. **Keep incoming** applies without an extra confirmation popup; file validation and recycling safeguards still apply.
 9. Open **Animations** to turn emoji sheets into GIFs. See *Animated emoji* above.
 10. **Stop** interrupts a running scan. It stops between images, never during one, so nothing is left half-moved.
 

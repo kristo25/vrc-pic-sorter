@@ -57,7 +57,8 @@ public sealed class ArchiveRelocationTests
                     new CallbackProgress(_ => { reached.TrySetResult(); release.Wait(TimeSpan.FromSeconds(10)); }), cancellation.Token));
             }
             catch (Exception exception) { returned.TrySetException(exception); }
-        }) { IsBackground = true };
+        })
+        { IsBackground = true };
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
         bool callerResponsive;

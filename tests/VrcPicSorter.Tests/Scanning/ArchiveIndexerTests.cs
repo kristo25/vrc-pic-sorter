@@ -25,8 +25,11 @@ public sealed class ArchiveIndexerTests
         var original = Path.Combine(currentUnavailable ? current : retained, "keeper.png");
         await image.SaveAsPngAsync(original);
         using var store = FileRouterTests.CreateStore(directory, source, current);
-        await store.UpdateAsync(state => { state.Settings.LegacyArchiveMappings.Add(
-            new LegacyArchiveMapping { Category = VrcImageCategory.Emoji, ArchivePath = retained }); return true; });
+        await store.UpdateAsync(state =>
+        {
+            state.Settings.LegacyArchiveMappings.Add(
+            new LegacyArchiveMapping { Category = VrcImageCategory.Emoji, ArchivePath = retained }); return true;
+        });
         var indexer = new ArchiveIndexer(store, new ImageDecoder());
         Assert.Equal(IndexStatus.Current, (await indexer.RefreshAsync(VrcImageCategory.Emoji)).Status);
         var unavailable = currentUnavailable ? current : retained;

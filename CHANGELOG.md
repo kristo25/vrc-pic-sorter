@@ -3,9 +3,11 @@
 All notable changes to VRC Pic Sorter are recorded here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4.0] - 2026-09-14
+## [1.4.0] - 2026-09-21
 
 ### Added
+
+- **Custom similarity limits.** Set a minimum and maximum in Settings: below minimum archives as unique, between limits queues for review, and at or above maximum keeps the archive copy and recycles incoming. Non-exact matches never use permanent deletion; existing review items stay manual.
 
 - **Animated emoji.** VRChat writes an emoji sheet's frame count, rate and loop direction into its
   file name, and that is now what the animation follows: the sheet is exported as a GIF to the
@@ -44,10 +46,9 @@ All notable changes to VRC Pic Sorter are recorded here. This project follows
   that category's folder. The layout is selectable in Settings. An existing installation keeps
   whatever it is already set to - only a new installation, or state carried across the settings
   migration, takes the new default.
-- **Keep incoming** asks for confirmation once per review instead of once per match, so settling a
-  review that holds several matches no longer means dismissing the same dialog repeatedly. A match
-  on a drive without a Recycle Bin still asks, because moving it to the Replaced folder is a
-  different thing to agree to.
+- **Keep incoming** no longer displays a confirmation popup. Existing validation and safe file handling remain in place.
+- **More accurate visual matching.** Additional transparent-border alignment improves still-image matching while preserving same-canvas layout differences. Compact summaries now check every GIF frame alongside detailed samples. Older cached visual fingerprints are refreshed automatically.
+- **Verified exact duplicates** keep the archive copy automatically. When recycling is unavailable, only a revalidated exact incoming duplicate may be permanently deleted; History identifies this outcome. A displayed 100% similarity alone is insufficient.
 - Scanning no longer reads and rewrites every archived fingerprint for each incoming image. The
   view of the index is built once and reused until the index itself changes.
 - A sheet whose pixels disagree with its name is recorded in the activity history as information.
@@ -55,6 +56,12 @@ All notable changes to VRC Pic Sorter are recorded here. This project follows
   asked announce *Scan completed with warnings*.
 
 ### Fixed
+
+- Repeated GIF exports reuse existing animations, including retained archives, and preserve ownership when folders move.
+- Archive relocation rejects unsafe overlaps, reports inaccessible files truthfully, and supports cancellation between files.
+- Unavailable archives pause changes for the affected category rather than silently treating incoming files as unique.
+- Settings use the latest saved choice; background watching and duplicate refreshes no longer race stale operations.
+- Scan scope limits pending exact resolution, and operation recovery preserves ambiguous or offline files for attention.
 
 - Combo boxes and lists drew themselves from the Windows theme rather than the application's own
   colours. On a light Windows theme that left the *Loop* dropdown white with unreadable text and
@@ -73,9 +80,8 @@ All notable changes to VRC Pic Sorter are recorded here. This project follows
   already did. Without a Recycle Bin nothing is deleted and both copies still get asked about.
 - **A drive with the Recycle Bin switched off was still recycled to.** Windows lets a drive be set
   to "remove files immediately when deleted", and then deletes permanently while still reporting a
-  successful recycle - so the automatic duplicate handling, which asks nobody, could destroy the
-  only copy of a picture. Such a drive is now treated as having no Recycle Bin at all, which every
-  caller already answers by asking instead of deleting.
+  successful recycle. Such a drive is now treated as having no Recycle Bin. Non-exact matches remain
+  for review; only separately revalidated exact incoming duplicates qualify for permanent deletion.
 - A whole drive chosen as the main output folder matched nothing inside itself, because a volume
   root keeps its trailing separator. That quietly switched off the guards that stop the app
   scanning its own archive, and made every archive destination look like an escape from the folder
@@ -83,8 +89,7 @@ All notable changes to VRC Pic Sorter are recorded here. This project follows
 - An animation the scan writes for a sheet already in the archive is now indexed by that same scan.
   It was written after the index was built, so for the rest of that scan it did not exist, and an
   incoming copy of it was archived all over again as though the app had never made it.
-- An archive file deleted or locked between the moment a scan lists it and the moment it is read no
-  longer disables the whole category. It is skipped and reported like any other unreadable file.
+- Unreadable supported archive files are reported and pause changes for the affected category until archive coverage is complete.
 - Startup recovery no longer stops at the first pending operation whose drive cannot recycle. That
   one is marked as needing attention and the rest are still reconciled.
 - Fingerprints held in memory during a scan survive the sidecar file disappearing underneath them.
@@ -101,6 +106,13 @@ All notable changes to VRC Pic Sorter are recorded here. This project follows
   froze the Settings page on every field.
 - A preview whose decode finished after its card had left the screen left an animation timer
   running for the life of the window, holding every decoded frame with it.
+
+### Validation
+
+- 433 Release regression tests pass.
+- A frozen comparison of 672 image pairs lost no previously detected duplicates. On the untouched holdout, padded-image detection increased from 0/96 to 77/96; false scores of at least 99% on deliberately changed GIF frames fell from 8/8 to 0/8. Resized and reencoded controls retained their detections.
+- The dataset used 96 PNG sources and 16 GIF assets, with controlled transformations and visually inspected real pairs. Results demonstrate these cases, not universal accuracy; compact summaries may miss small edits and some loop-phase changes remain undetected.
+- All 471 original archive files remained unchanged. Portable startup was checked with isolated application state.
 
 ### Known limitations
 

@@ -247,15 +247,15 @@ public sealed record ImageFingerprint(
         var bottom = -1;
         // Per-frame trimming of animations would erase motion, so only stills are normalized.
         if (normalizeMargins)
-        for (var y = 0; y < height; y++)
-        for (var x = 0; x < width; x++)
-        {
-            if (rgbaPixels[((y * width) + x) * 4 + 3] == 0) continue;
-            left = Math.Min(left, x);
-            right = Math.Max(right, x);
-            top = Math.Min(top, y);
-            bottom = Math.Max(bottom, y);
-        }
+            for (var y = 0; y < height; y++)
+                for (var x = 0; x < width; x++)
+                {
+                    if (rgbaPixels[((y * width) + x) * 4 + 3] == 0) continue;
+                    left = Math.Min(left, x);
+                    right = Math.Max(right, x);
+                    top = Math.Min(top, y);
+                    bottom = Math.Max(bottom, y);
+                }
 
         if (right >= left && bottom >= top
             && (left > 0 || top > 0 || right < width - 1 || bottom < height - 1))
