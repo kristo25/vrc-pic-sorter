@@ -189,7 +189,7 @@ public sealed class ArchiveRelocationTests
     }
 
     [Fact]
-    public async Task AFileAlreadyAtTheDestinationIsLeftWhereItIs()
+    public async Task DifferentContentAtTheDestinationKeepsBothFiles()
     {
         // Two archives can hold different images under one name. The copy already filed is the
         // one the index describes, so the incoming one stays put and is reported rather than
@@ -205,11 +205,31 @@ public sealed class ArchiveRelocationTests
 
         var result = await ArchiveRelocation.RelocateAsync([step]);
 
-        Assert.Equal(0, result.Moved);
-        Assert.Equal(1, result.LeftBehind);
+        Assert.Equal(1, result.Moved);
+        Assert.Equal(0, result.LeftBehind);
         Assert.Equal("already filed", File.ReadAllText(Path.Combine(to, "same.png")));
-        Assert.Equal("incoming", File.ReadAllText(Path.Combine(from, "same.png")));
-        Assert.Single(result.Errors);
+        Assert.False(File.Exists(Path.Combine(from, "same.png")));
+        Assert.Equal("incoming", File.ReadAllText(Assert.Single(result.Moves).To));
+        Assert.Empty(result.Errors);
+    }
+
+    [Fact]
+    public async Task IdenticalDestinationCompletesInterruptedCopyWithoutAnotherFile()
+    {
+        using var directory = new TestDirectory();
+        var from = directory.GetPath("old", "Emoji");
+        var to = directory.GetPath("new", "Emoji");
+        Directory.CreateDirectory(from);
+        Directory.CreateDirectory(to);
+        File.WriteAllText(Path.Combine(from, "same.png"), "verified bytes");
+        File.WriteAllText(Path.Combine(to, "same.png"), "verified bytes");
+        var result = await ArchiveRelocation.RelocateAsync([
+            new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 1, 14)]);
+        Assert.Equal(1, result.Moved);
+        Assert.Empty(result.Errors);
+        Assert.Empty(Directory.GetFiles(from));
+        Assert.Single(Directory.GetFiles(to));
+        Assert.Equal("verified bytes", File.ReadAllText(Path.Combine(to, "same.png")));
     }
 
     [Fact]
@@ -302,6 +322,9 @@ public sealed class ArchiveRelocationTests
         });
         state.ReviewQueue.Add(review);
 
+        // A real transfer failure must leave references untouched. Name collisions now move
+        // safely under a different name, so hold this source open instead.
+        using var locked = new FileStream(collidingFile, FileMode.Open, FileAccess.Read, FileShare.None);
         var result = await ArchiveRelocation.RelocateAsync(
             [new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 2, 9)]);
 
@@ -315,6 +338,7 @@ public sealed class ArchiveRelocationTests
 
         Assert.Equal(Path.Combine(to, "moved.png"), index.Images.Single(item => item.Id == movedId).Path);
         Assert.Equal(collidingFile, index.Images.Single(item => item.Id == stayedId).Path);
+        locked.Dispose();
         Assert.Equal("mine", File.ReadAllText(collidingFile));
         Assert.Equal("someone else's", File.ReadAllText(Path.Combine(to, "same.png")));
         Assert.Equal(
@@ -378,6 +402,115 @@ public sealed class ArchiveRelocationTests
 
         Assert.Equal(1, removed);
         Assert.Equal(@"C:\old\Prints", Assert.Single(settings.LegacyArchiveMappings).ArchivePath);
+    }
+
+    [Fact]
+    public async Task FailedSourceRemovalCanRetryWithoutDuplicatingVerifiedDestination()
+    {
+        using var directory = new TestDirectory();
+        var from = directory.GetPath("old");
+        var to = directory.GetPath("new");
+        Directory.CreateDirectory(from);
+        var source = Path.Combine(from, "a.png");
+        File.WriteAllText(source, "preserve these bytes");
+        var modified = new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(source, modified);
+        File.SetAttributes(source, FileAttributes.ReadOnly);
+        var step = new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 1, 20);
+        try
+        {
+            var failed = await ArchiveRelocation.RelocateAsync([step]);
+            Assert.Equal(0, failed.Moved);
+            Assert.Single(failed.Errors);
+            Assert.Equal("preserve these bytes", File.ReadAllText(source));
+            Assert.Equal("preserve these bytes", File.ReadAllText(Path.Combine(to, "a.png")));
+        }
+        finally { File.SetAttributes(source, FileAttributes.Normal); }
+        var retried = await ArchiveRelocation.RelocateAsync([step]);
+        Assert.Equal(1, retried.Moved);
+        Assert.Empty(retried.Errors);
+        Assert.Single(Directory.GetFiles(to));
+        Assert.Equal(modified, File.GetLastWriteTimeUtc(Path.Combine(to, "a.png")));
+        Assert.False(File.Exists(source));
+    }
+
+    [Fact]
+    public async Task LockedDestinationLeavesSourceIntactAndRetryCompletes()
+    {
+        using var directory = new TestDirectory();
+        var from = directory.GetPath("old");
+        var to = directory.GetPath("new");
+        Directory.CreateDirectory(from);
+        Directory.CreateDirectory(to);
+        var source = Path.Combine(from, "a.png");
+        var destination = Path.Combine(to, "a.png");
+        File.WriteAllText(source, "same");
+        File.WriteAllText(destination, "same");
+        var step = new ArchiveRelocationStep(VrcImageCategory.Emoji, from, to, 1, 4);
+        using (var locked = new FileStream(destination, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            var failed = await ArchiveRelocation.RelocateAsync([step]);
+            Assert.Equal(0, failed.Moved);
+            Assert.Single(failed.Errors);
+            Assert.Equal("same", File.ReadAllText(source));
+        }
+        Assert.Equal(1, (await ArchiveRelocation.RelocateAsync([step])).Moved);
+        Assert.Single(Directory.GetFiles(to));
+    }
+
+    [Fact]
+    public void EmptyNestedFoldersAreVerifiedEmptyButMissingFoldersAreNot()
+    {
+        using var directory = new TestDirectory();
+        var root = directory.GetPath("old");
+        var nested = Path.Combine(root, "Animated", "Gif Ref");
+        Directory.CreateDirectory(nested);
+        Assert.True(ArchiveRelocation.IsVerifiedEmpty(root));
+        File.WriteAllText(Path.Combine(nested, "remaining.png"), "remaining");
+        Assert.False(ArchiveRelocation.IsVerifiedEmpty(root));
+        Assert.False(ArchiveRelocation.IsVerifiedEmpty(directory.GetPath("missing")));
+    }
+
+    [Fact]
+    public void ForgetUnavailableRemovesOnlyOldMetadataAndPreservesPendingReview()
+    {
+        using var directory = new TestDirectory();
+        var old = directory.GetPath("missing");
+        var current = directory.GetPath("current");
+        Directory.CreateDirectory(current);
+        var state = new AppStateDocument { Settings = Settings(current, old) };
+        var oldImage = Path.Combine(old, "a.png");
+        var kept = Path.Combine(current, "b.png");
+        File.WriteAllText(kept, "keep");
+        var index = new CategoryIndexState { Category = VrcImageCategory.Emoji };
+        index.Images.Add(new IndexedImageRecord { Path = oldImage });
+        index.Images.Add(new IndexedImageRecord { Path = kept });
+        state.ArchiveIndex.Categories.Add(index);
+        var review = new ReviewItem { HeldFilePath = directory.GetPath("incoming.png") };
+        review.Candidates.Add(new ReviewCandidate { ArchivePath = oldImage });
+        state.ReviewQueue.Add(review);
+        Assert.Equal(1, ArchiveRelocation.ForgetUnavailable(state, old));
+        Assert.Empty(state.Settings.LegacyArchiveMappings);
+        Assert.Equal(kept, Assert.Single(index.Images).Path);
+        Assert.Equal(IndexStatus.Stale, index.Status);
+        Assert.Equal(ReviewStatus.NeedsReconciliation, review.Status);
+        Assert.Empty(review.Candidates);
+        Assert.Single(state.ReviewQueue);
+        Assert.Equal("keep", File.ReadAllText(kept));
+    }
+
+    [Fact]
+    public void ForgetUnavailableRefusesExistingFolderAndPendingOperations()
+    {
+        using var directory = new TestDirectory();
+        var old = directory.GetPath("old");
+        Directory.CreateDirectory(old);
+        var state = new AppStateDocument { Settings = Settings(directory.GetPath("new"), old) };
+        Assert.Throws<InvalidOperationException>(() => ArchiveRelocation.ForgetUnavailable(state, old));
+        Directory.Delete(old);
+        state.OperationJournal.Add(new JournalEntry { SourcePath = Path.Combine(old, "a.png") });
+        Assert.Throws<InvalidOperationException>(() => ArchiveRelocation.ForgetUnavailable(state, old));
+        Assert.Single(state.Settings.LegacyArchiveMappings);
     }
 
     private static AppSettings Settings(string currentArchive, string? retainedArchive = null)

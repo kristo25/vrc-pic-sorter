@@ -464,10 +464,18 @@ public sealed class WatchService : IDisposable
             }
             else
             {
-                // Archive-only change: keep the fingerprint index current without
-                // re-analyzing anything in the input folders.
-                var index = await _indexer.RefreshAsync(category, cancellationToken).ConfigureAwait(false);
-                result = new CategoryScanResult(category, 0, 0, 0, 0, index.Errors);
+                // Archive-only change: refresh and clean the archive without re-analyzing
+                // anything in the input folders.
+                var cleanup = await _scanner.RefreshAndCleanArchiveCategoryAsync(category, cancellationToken)
+                    .ConfigureAwait(false);
+                result = new CategoryScanResult(
+                    category,
+                    0,
+                    0,
+                    0,
+                    0,
+                    cleanup.Warnings,
+                    ArchiveDuplicatesRemoved: cleanup.Removed);
             }
 
             ScanCompleted?.Invoke(this, result);

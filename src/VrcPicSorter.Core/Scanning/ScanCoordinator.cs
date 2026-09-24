@@ -14,7 +14,8 @@ public sealed record CategoryScanResult(
     int Skipped,
     IReadOnlyList<string> Errors,
     int AutoKeptArchived = 0,
-    int Animated = 0);
+    int Animated = 0,
+    int ArchiveDuplicatesRemoved = 0);
 
 /// <summary><see cref="Activity"/> and <see cref="FileName"/> describe what the scan is doing
 /// right now, so the UI can say more than a bare count.</summary>
@@ -46,13 +47,14 @@ public sealed record ExportedAnimation(
 /// <param name="Filed">Sheets that were filed beside their animation, by the path they moved to.</param>
 /// <param name="Duplicates">
 /// Each export that turned out to be a picture the archive already held, and the copies it joins.
-/// Reported, never acted on: two files both already archived is a decision, not a scan result.
+/// Exact extra copies are recycled after verification; distinct animation variants remain reported.
 /// </param>
 /// <param name="Warnings">Anything that could not be finished, in the words of the failure.</param>
 public sealed record ExportedAnimationFollowUp(
     IReadOnlyList<string> Filed,
     IReadOnlyList<ArchivedAnimationDuplicate> Duplicates,
-    IReadOnlyList<string> Warnings);
+    IReadOnlyList<string> Warnings,
+    int ArchiveDuplicatesRemoved = 0);
 
 /// <param name="AnimationPath">The animation just exported.</param>
 /// <param name="ExistingCopies">Archived files that decode to the very same picture.</param>
@@ -464,10 +466,14 @@ public sealed partial class ScanCoordinator
             return new CategoryScanResult(category, 0, 0, 0, 0, indexResult.Errors);
         }
 
+        var duplicateCleanup = await CleanIndexedArchiveDuplicatesCoreAsync([category], cancellationToken)
+            .ConfigureAwait(false);
+
         // Individual unreadable archive files are surfaced as scan warnings, not as a
         // reason to abort the category.
         var errors = new List<string>(
             indexResult.SkippedFiles.Select(skipped => $"Archive file skipped - {skipped}"));
+        errors.AddRange(duplicateCleanup.Warnings);
 
         // A sheet whose pixels disagree with its name is worth saying out loud, but it is not a
         // failure: the export did exactly what it was asked to. Kept apart from the errors so it
@@ -519,6 +525,20 @@ public sealed partial class ScanCoordinator
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var refreshed = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
         var archivedImages = refreshed.ArchiveIndex.Categories.Single(item => item.Category == category).Images;
+        // Archive relocation/retirement can invalidate every match. Let files included in this
+        // scan go through fresh matching instead of being skipped forever as already queued.
+        // Never release a partially applied decision, a legacy held file, or an unrelated path.
+        foreach (var waiting in refreshed.ReviewQueue.Where(item =>
+                     item.Category == category && item.Status != ReviewStatus.Resolved
+                     && item.Candidates.Count == 0 && item.IsIncomingInPlace
+                     && string.IsNullOrWhiteSpace(item.KeptIncomingArchivedPath)
+                     && requestedPaths.Contains(PathBoundary.Normalize(item.IncomingOriginalPath))
+                     && !refreshed.OperationJournal.Any(entry => entry.Phase != JournalPhase.Completed
+                         && (entry.ReviewItemId == item.Id
+                             || string.Equals(entry.SourcePath, item.HeldFilePath, StringComparison.OrdinalIgnoreCase)))))
+        {
+            await _router.DismissReviewAsync(waiting.Id, cancellationToken).ConfigureAwait(false);
+        }
         foreach (var waiting in refreshed.ReviewQueue.Where(item =>
                      item.Category == category && item.Status == ReviewStatus.Pending
                      && (reconcileAllPending || requestedPaths.Contains(PathBoundary.Normalize(item.IncomingOriginalPath)))
@@ -997,7 +1017,16 @@ public sealed partial class ScanCoordinator
                 },
                 cancellationToken).ConfigureAwait(false);
 
-        return new CategoryScanResult(category, examined, moved, held, skipped, errors, autoKept, animated);
+        return new CategoryScanResult(
+            category,
+            examined,
+            moved,
+            held,
+            skipped,
+            errors,
+            autoKept,
+            animated,
+            duplicateCleanup.Removed);
     }
 
     /// <summary>
@@ -1184,9 +1213,8 @@ public sealed partial class ScanCoordinator
     /// full index - which is how the archive came to hold the same emoji twice. The same steps run
     /// here, from the same code, so the two paths cannot drift apart again.
     /// <para>
-    /// Nothing is deleted. A duplicate found here is reported and left alone: both copies are
-    /// already archived, and which one to keep is a decision, not a side effect of a button that
-    /// was pressed to make an animation.
+    /// Exact extra copies are verified and sent to the Recycle Bin automatically. Distinct
+    /// animations of the same emoji are reported and left for review.
     /// </para>
     /// </remarks>
     public async Task<ExportedAnimationFollowUp> FinishExportedAnimationsAsync(
@@ -1279,7 +1307,12 @@ public sealed partial class ScanCoordinator
             state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        return new ExportedAnimationFollowUp(filed, duplicates, warnings);
+        var duplicateCleanup = await CleanIndexedArchiveDuplicatesCoreAsync(
+                exported.Select(item => item.Category).Distinct().ToArray(),
+                cancellationToken)
+            .ConfigureAwait(false);
+        warnings.AddRange(duplicateCleanup.Warnings);
+        return new ExportedAnimationFollowUp(filed, duplicates, warnings, duplicateCleanup.Removed);
     }
 
     /// <summary>

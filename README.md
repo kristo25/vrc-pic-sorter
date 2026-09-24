@@ -172,8 +172,10 @@ Changing this decides where new files go. Existing archived files are not moved.
 Use **Settings > Retained archives > Move them into my archive** to relocate old archives explicitly.
 Overlapping relocation folders are refused, and inaccessible folders remain listed with an error.
 Moving runs in the background; Stop finishes the current file and prevents the next move. Completed
-changes remain after a partial failure or cancellation. Existing GIFs in retained dated folders are
+changes remain after a partial failure or cancellation. Transfers copy, flush, and verify bytes before removing the old copy. Byte-identical destination files are reused; different files with the same name receive a separate name. Failed transfers keep their source where possible and can be retried with the same button. Existing GIFs in retained dated folders are
 reused in their original archive until it is explicitly relocated.
+
+If an old archive folder has already been moved outside the app and no longer exists, **Forget unavailable** removes its saved references without touching files. Confirm only after checking that its files are moved or backed up elsewhere. For a temporarily disconnected drive, reconnect it instead. Pending file operations must be resolved before the folder can be forgotten; affected reviews require reconciliation. Completed moves also retire old folders that contain only empty subfolders.
 
 **Start with Windows** launches the app in background watching mode. Ordinary launches begin with watching stopped.
 

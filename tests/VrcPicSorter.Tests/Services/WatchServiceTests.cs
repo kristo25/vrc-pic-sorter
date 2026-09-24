@@ -84,6 +84,54 @@ public sealed class WatchServiceTests
     }
 
     [Fact]
+    public async Task ArchiveOnlyChangeRefreshesAndCleansExactDuplicates()
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("source");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(archive);
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        var state = await store.LoadAsync();
+        var decoder = new ImageDecoder();
+        var indexer = new ArchiveIndexer(store, decoder);
+        var recycleBin = new FileRouterTests.FakeRecycleBinService();
+        var scanner = new ScanCoordinator(
+            store,
+            indexer,
+            decoder,
+            new FileRouter(store, decoder, recycleBin));
+        using var watcher = new WatchService(
+            scanner,
+            indexer,
+            debounce: TimeSpan.FromMilliseconds(25),
+            retryInterval: TimeSpan.FromMilliseconds(25));
+        var first = Path.Combine(archive, "one.gif");
+        var copy = Path.Combine(archive, "two (2).gif");
+        using (var image = ImageFixtureFactory.CreatePattern(191))
+        {
+            await image.SaveAsGifAsync(first);
+        }
+        await indexer.RefreshAsync(VrcImageCategory.Emoji);
+        var completed = new TaskCompletionSource<CategoryScanResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        watcher.ScanCompleted += (_, result) =>
+        {
+            if (result.ArchiveDuplicatesRemoved > 0)
+                completed.TrySetResult(result);
+        };
+        watcher.Start(state.Settings.CategoryMappings, state.Settings.LegacyArchiveMappings);
+
+        File.Copy(first, copy);
+
+        var result = await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, result.ArchiveDuplicatesRemoved);
+        Assert.Equal(copy, Assert.Single(recycleBin.RecycledPaths));
+        Assert.True(File.Exists(first));
+        Assert.False(File.Exists(copy));
+    }
+
+    [Fact]
     public async Task StopAsyncCancelsAnActiveWatcherScanBeforeItMovesFiles()
     {
         using var directory = new TestDirectory();

@@ -125,9 +125,9 @@ public static class ArchiveRelocation
     /// Moves every file of each step into its destination, keeping the folders it sat in.
     /// </summary>
     /// <remarks>
-    /// A file whose name is already taken at the destination is left exactly where it is rather
-    /// than overwritten. Two archives can hold different images under one name, and the copy
-    /// already filed is the one the index is describing.
+    /// Byte-identical destination files are reused. Different content receives a separate name.
+    /// Copies are flushed and verified before the locked source is removed; failed copies can
+    /// be retried without overwriting an existing file.
     /// <para>
     /// Every file that moves is recorded. A batch is nearly always mixed - some files move, some
     /// meet a name already taken, some fail outright - and the index may only be rewritten from
@@ -200,18 +200,10 @@ public static class ArchiveRelocation
                 var destination = Path.Combine(step.To, relative);
                 try
                 {
-                    if (File.Exists(destination))
-                    {
-                        leftBehind++;
-                        errors.Add($"{file}: a file of that name is already in the new archive.");
-                        continue;
-                    }
-
                     PathBoundary.EnsureSafeDestination(step.To, destination, "Relocated archive file");
                     PathBoundary.EnsureContained(step.From, file, "Relocation source");
                     PathBoundary.EnsureNoReparsePoints(file, "Relocation source");
-                    Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-                    File.Move(file, destination);
+                    destination = VerifiedArchiveTransfer.Move(file, step.To, destination);
                 }
                 catch (Exception exception) when (
                     exception is IOException
@@ -317,6 +309,10 @@ public static class ArchiveRelocation
                 // A generation that did not move would let a scan already in flight route against
                 // the paths this just rewrote.
                 index.Generation++;
+                index.Status = IndexStatus.Stale;
+                index.LastError = "Archive files relocated; refresh required.";
+                index.Images = index.Images.GroupBy(image => NormalizeOrRaw(image.Path), StringComparer.OrdinalIgnoreCase)
+                    .Select(group => group.First()).ToList();
                 rebased += changed;
             }
         }
@@ -339,6 +335,9 @@ public static class ArchiveRelocation
                 {
                     candidate.ArchivePath = candidatePath;
                 }
+                var indexed = state.ArchiveIndex.Categories.SelectMany(index => index.Images)
+                    .FirstOrDefault(image => string.Equals(image.Path, candidate.ArchivePath, StringComparison.OrdinalIgnoreCase));
+                if (indexed is not null) candidate.IndexedImageId = indexed.Id;
             }
         }
 
@@ -414,12 +413,58 @@ public static class ArchiveRelocation
                 && moved.Contains(PathBoundary.Normalize(legacy.ArchivePath)));
     }
 
+    /// <summary>Explicit user acknowledgement only: forget metadata, never move or delete files.</summary>
+    public static int ForgetUnavailable(AppStateDocument state, string root)
+    {
+        root = PathBoundary.Normalize(root);
+        if (!state.Settings.LegacyArchiveMappings.Any(item => SameRoot(item.ArchivePath, root)))
+            throw new InvalidOperationException("That folder is no longer a retained archive. Refresh the list.");
+        if (state.Settings.CategoryMappings.Any(item => PathBoundary.Overlaps(item.ArchivePath, root)))
+            throw new InvalidOperationException("A current archive cannot be forgotten.");
+        if (Directory.Exists(root) || File.Exists(root))
+            throw new InvalidOperationException("That folder is available. Move its contents instead of forgetting it.");
+        bool UnderRoot(string? path) => !string.IsNullOrWhiteSpace(path) && PathBoundary.Contains(root, path);
+        if (state.OperationJournal.Any(entry => entry.Phase != JournalPhase.Completed
+            && (UnderRoot(entry.SourcePath) || UnderRoot(entry.DestinationPath) || UnderRoot(entry.SurvivingPath))))
+            throw new InvalidOperationException("Resolve pending file operations for this folder before forgetting it.");
+
+        foreach (var index in state.ArchiveIndex.Categories)
+        {
+            if (!state.Settings.LegacyArchiveMappings.Any(item => item.Category == index.Category && SameRoot(item.ArchivePath, root))) continue;
+            index.Images.RemoveAll(image => UnderRoot(image.Path));
+            index.Status = IndexStatus.Stale;
+            index.LastError = "Unavailable archive forgotten by user; refresh required.";
+            index.Generation++;
+        }
+        foreach (var review in state.ReviewQueue.Where(item => item.Status != ReviewStatus.Resolved))
+        {
+            if (UnderRoot(review.HeldFilePath) || UnderRoot(review.KeptIncomingArchivedPath)
+                || review.Candidates.Any(candidate => UnderRoot(candidate.ArchivePath)))
+                review.Status = ReviewStatus.NeedsReconciliation;
+            review.Candidates.RemoveAll(candidate => UnderRoot(candidate.ArchivePath));
+        }
+        return state.Settings.LegacyArchiveMappings.RemoveAll(item => SameRoot(item.ArchivePath, root));
+    }
+
     public static bool IsVerifiedEmpty(string root)
     {
         try
         {
             PathBoundary.EnsureNoReparsePoints(root, "Archive folder");
-            return !Directory.EnumerateFileSystemEntries(root).Any();
+            // Empty subdirectories are harmless, but never follow or forget a redirecting link.
+            var pending = new Stack<string>();
+            pending.Push(root);
+            while (pending.TryPop(out var folder))
+            {
+                foreach (var path in Directory.EnumerateFileSystemEntries(folder))
+                {
+                    var attributes = File.GetAttributes(path);
+                    if ((attributes & FileAttributes.ReparsePoint) != 0) return false;
+                    if ((attributes & FileAttributes.Directory) == 0) return false;
+                    pending.Push(path);
+                }
+            }
+            return true;
         }
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or InvalidOperationException)

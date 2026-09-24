@@ -28,8 +28,6 @@ public partial class MainWindow : Window
     private readonly SemaphoreSlim _automationSettingsGate = new(1, 1);
     private IReadOnlyList<ArchiveRelocationStep> _retainedArchives = [];
 
-    private IReadOnlyList<ArchiveDuplicateGroup> _archiveDuplicates = [];
-    private long _archiveDuplicateRefreshVersion;
     private bool _busy;
     private bool _loadingSettings;
     private CancellationTokenSource? _operationCancellation;
@@ -50,6 +48,7 @@ public partial class MainWindow : Window
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
+        var duplicateCleanup = await _runtime.Scanner.CleanArchiveDuplicatesAsync();
         await RefreshAsync(selectFirst: false, refreshSettings: true);
         var state = await _runtime.StateStore.LoadAsync();
         ShowPage(ReviewPage);
@@ -74,6 +73,12 @@ public partial class MainWindow : Window
         {
             SetStatus("Review is ready. Configure folders in Settings before scanning.");
         }
+        else if (duplicateCleanup.Removed > 0)
+        {
+            SetStatus($"Recycled {duplicateCleanup.Removed} duplicate archive copies automatically.");
+        }
+
+        await ReportScanErrorsAsync(duplicateCleanup.Warnings);
     }
 
     private async Task RefreshAsync(
@@ -225,7 +230,9 @@ public partial class MainWindow : Window
         var incomingTiming = review.IncomingImageFingerprint is { FrameCount: > 1 } incoming
             ? $" | {incoming.FrameCount} frames, {incoming.FrameDelaysMilliseconds.Sum()} ms"
             : string.Empty;
-        ReviewSubtitle.Text = $"{review.Category} | {review.Candidates.Count} possible match(es) | {review.Status}{incomingTiming}";
+        ReviewSubtitle.Text = review.Candidates.Count == 0
+            ? $"{review.Category} | Matches need rechecking{incomingTiming}"
+            : $"{review.Category} | {review.Candidates.Count} possible match(es) | {review.Status}{incomingTiming}";
         IncomingResolutionText.Text = review.IncomingImageFingerprint is { } incomingFingerprint
             ? $"{incomingFingerprint.Width} x {incomingFingerprint.Height}"
             : "Resolution unavailable";
@@ -284,7 +291,7 @@ public partial class MainWindow : Window
                 candidate.ArchivePath);
         }).ToArray();
         CandidateHint.Text = review.Candidates.Count == 0
-            ? "No remaining matches."
+            ? "Previous matches were cleared. Scan this file's folder again to compare it with the current archive."
             : $"{review.Candidates.Count} ranked candidate(s)";
         UpdateActionAvailability(review);
     }
@@ -374,12 +381,14 @@ public partial class MainWindow : Window
                 var moved = results.Sum(result => result.MovedUnique);
                 var held = results.Sum(result => result.HeldForReview);
                 var autoKept = results.Sum(result => result.AutoKeptArchived);
+                var archiveDuplicatesRemoved = results.Sum(result => result.ArchiveDuplicatesRemoved);
                 var examined = results.Sum(result => result.Examined);
                 var skipped = results.Sum(result => result.Skipped);
                 var errors = results.Sum(result => result.Errors.Count);
                 SetStatus(
                     $"Scan complete: {examined} examined, {moved} archived, {autoKept} archive copies kept automatically, "
-                    + $"{held} queued for review, {skipped} skipped, {errors} failed.");
+                    + $"{held} queued for review, {archiveDuplicatesRemoved} archive duplicates recycled, "
+                    + $"{skipped} skipped, {errors} failed.");
                 await ReportScanErrorsAsync(results.SelectMany(result => result.Errors));
                 await RefreshAsync();
                 ShowPage(ReviewPage);
@@ -420,7 +429,8 @@ public partial class MainWindow : Window
                 SetStatus(
                     $"Folder scan complete: {result.Examined} examined, {result.MovedUnique} archived, "
                     + $"{result.AutoKeptArchived} archive copies kept automatically, {result.HeldForReview} queued for review, "
-                    + $"{result.Skipped} skipped, {result.Errors.Count} failed.");
+                    + $"{result.ArchiveDuplicatesRemoved} archive duplicates recycled, {result.Skipped} skipped, "
+                    + $"{result.Errors.Count} failed.");
                 await ReportScanErrorsAsync(result.Errors);
                 await RefreshAsync();
                 ShowPage(ReviewPage);
@@ -1027,6 +1037,7 @@ public partial class MainWindow : Window
             {
                 step.From,
                 Summary = step.InventoryError ?? $"{step.FileCount} images, {step.TotalBytes / (double)(1024 * 1024):0.#} MB",
+                ForgetVisibility = step.InventoryError is null ? Visibility.Collapsed : Visibility.Visible,
             })
             .ToArray();
 
@@ -1034,163 +1045,6 @@ public partial class MainWindow : Window
             ? Visibility.Collapsed
             : Visibility.Visible;
     }
-
-    /// <summary>
-    /// Refreshes archive inventory before reporting duplicate copies and animation variants.
-    /// </summary>
-    private async Task RefreshArchiveDuplicatesAsync()
-    {
-        if (ArchiveDuplicatesPanel is null)
-        {
-            return;
-        }
-
-        var version = ++_archiveDuplicateRefreshVersion;
-        _archiveDuplicates = [];
-        RemoveIdenticalDuplicatesButton.IsEnabled = false;
-        ArchiveDuplicatesList.ItemsSource = null;
-        ArchiveDuplicatesPanel.Visibility = Visibility.Visible;
-        ArchiveDuplicatesSummary.Text = "Checking the archive folders...";
-        ArchiveDuplicateSnapshot snapshot;
-        try
-        {
-            snapshot = await _runtime.Scanner.RefreshArchiveDuplicatesAsync(CurrentCancellation);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
-            or InvalidOperationException or ArgumentException or OperationCanceledException)
-        {
-            if (version == _archiveDuplicateRefreshVersion)
-                ArchiveDuplicatesSummary.Text = "Archive check incomplete. " + exception.Message;
-            return;
-        }
-        if (version != _archiveDuplicateRefreshVersion)
-            return;
-        var groups = snapshot.Groups.ToArray();
-        _archiveDuplicates = groups;
-
-        var removable = groups.Where(group => group.IsRemovable).ToArray();
-        var sameEmoji = groups.Length - removable.Length;
-        var extras = removable.Sum(group => group.Extras.Count);
-        var megabytes = removable.Sum(group => group.ReclaimableBytes) / (double)(1024 * 1024);
-
-        ArchiveDuplicatesList.ItemsSource = groups
-            .SelectMany(group => group.Extras.Select(extra => new
-            {
-                Extra = Path.GetFileName(extra.Path),
-                Detail = $"{extra.Path}{Environment.NewLine}kept instead: {group.Keep.Path}",
-                Summary = DescribeDuplicate(group.Kind, extra, group.Keep),
-            }))
-            .ToArray();
-
-        var identicalText = extras == 1
-            ? $"One extra copy is a picture already here, taking {megabytes:0.#} MB."
-            : $"{extras} extra copies are pictures already here, taking {megabytes:0.#} MB.";
-        var sameEmojiText = sameEmoji == 1
-            ? "One group contains versions of the same emoji with different image or animation data."
-            : $"{sameEmoji} groups contain versions of the same emoji with different image or animation data.";
-        var judgement = " Which of those is worth keeping is yours to decide, so nothing here will touch them.";
-
-        var provenance = snapshot.IsComplete
-            ? " Checked against the archive folders."
-            : " Archive check incomplete; removal is disabled. " + string.Join(" ", snapshot.Warnings);
-        ArchiveDuplicatesSummary.Text = (extras, sameEmoji) switch
-        {
-            (0, _) => sameEmojiText + judgement + provenance,
-            (_, 0) => identicalText + provenance,
-            _ => identicalText + " Another " + sameEmojiText[..1].ToLowerInvariant() + sameEmojiText[1..]
-                + judgement + provenance,
-        };
-
-        RemoveIdenticalDuplicatesButton.IsEnabled = extras > 0 && snapshot.IsComplete;
-        if (!snapshot.IsComplete)
-            _archiveDuplicates = [];
-        ArchiveDuplicatesPanel.Visibility = groups.Length == 0 && snapshot.IsComplete
-            ? Visibility.Collapsed
-            : Visibility.Visible;
-    }
-
-    private async void RemoveIdenticalDuplicates(object sender, RoutedEventArgs e)
-    {
-        if (_busy)
-        {
-            return;
-        }
-
-        // The copy each extra is being removed in favour of travels with it. Dropping it here and
-        // passing the extras alone is what let a removal go ahead with the keeper already gone -
-        // the router had nothing to check, so there was nothing to refuse.
-        var removals = _archiveDuplicates
-            .Where(group => group.IsRemovable)
-            .SelectMany(group => group.Extras.Select(extra => (group.Kind, group.Keep, Extra: extra)))
-            .ToArray();
-        if (removals.Length == 0)
-        {
-            return;
-        }
-
-        const string what = "Every one has the same decoded pixels and frame timing as another copy that stays.";
-
-        var confirmation = MessageBox.Show(
-            this,
-            $"Send {removals.Length} extra copies to the Recycle Bin? {what} Nothing is deleted "
-                + "permanently, and both files are checked before either is touched: the copy "
-                + "going, and the copy it is going in favour of.",
-            "Recycle the extra copies",
-            MessageBoxButton.OKCancel,
-            MessageBoxImage.Question);
-        if (confirmation != MessageBoxResult.OK)
-        {
-            return;
-        }
-
-        await RunBusyAsync(
-            $"Recycling {removals.Length} duplicate copies...",
-            async () =>
-            {
-                var removed = 0;
-                var failures = new List<string>();
-                foreach (var removal in removals)
-                {
-                    CurrentCancellation.ThrowIfCancellationRequested();
-                    try
-                    {
-                        await _runtime.Router.RemoveArchivedDuplicateAsync(
-                            removal.Extra, removal.Keep, CurrentCancellation);
-
-                        removed++;
-                    }
-                    catch (Exception exception) when (
-                        exception is NotSupportedException
-                            or InvalidOperationException
-                            or IOException
-                            or UnauthorizedAccessException)
-                    {
-                        // One copy that changed, a keeper that is no longer there, or a drive that
-                        // cannot recycle, must not stop the rest. Nothing is ever deleted outright
-                        // to get past it.
-                        failures.Add($"{removal.Extra.Path}: {exception.Message}");
-                    }
-                }
-
-                await RefreshArchiveDuplicatesAsync();
-                await RefreshAsync();
-                SetStatus(
-                    failures.Count == 0
-                        ? $"Recycled {removed} duplicate copies."
-                        : $"Recycled {removed} duplicate copies; {failures.Count} failed operations need checking.");
-                await ReportScanErrorsAsync(failures);
-            });
-    }
-
-    private static string DescribeDuplicate(
-        ArchiveDuplicateKind kind,
-        IndexedImageRecord extra,
-        IndexedImageRecord keep) => kind switch
-        {
-            ArchiveDuplicateKind.Identical => "identical",
-            ArchiveDuplicateKind.SameAnimation => "same emoji and filename parameters; image or timing differs",
-            _ => $"{extra.Width}x{extra.Height} beside {keep.Width}x{keep.Height}",
-        };
 
     private async void MoveRetainedArchives(object sender, RoutedEventArgs e)
     {
@@ -1219,8 +1073,8 @@ public partial class MainWindow : Window
         if (MessageBox.Show(
                 this,
                 $"Move {images} images into {destination}?{Environment.NewLine}{Environment.NewLine}"
-                    + "Nothing is deleted. A file whose name is already taken in your archive stays "
-                    + "where it is and is reported.",
+                    + "Files are copied and verified before their old copies are removed. Identical files "
+                    + "reuse the destination copy; different files with the same name are renamed. Failed transfers can be retried.",
                 "Move retained archives",
                 MessageBoxButton.OKCancel,
                 MessageBoxImage.Question) != MessageBoxResult.OK)
@@ -1230,6 +1084,27 @@ public partial class MainWindow : Window
         }
 
         await MoveArchivesAsync(relocation);
+    }
+
+    private async void ForgetUnavailableArchive(object sender, RoutedEventArgs e)
+    {
+        if (_busy || sender is not System.Windows.Controls.Button { Tag: string root }) return;
+        if (MessageBox.Show(this,
+            $"Stop checking this unavailable archive?\n\n{root}\n\n"
+            + "Only do this if you have already moved or backed up its files elsewhere. "
+            + "This removes its saved index and old match references; it does not move or delete files. "
+            + "For a temporarily disconnected drive, reconnect it instead.",
+            "Forget unavailable archive", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        await RunBusyAsync("Updating retained archives...", async () =>
+        {
+            await _runtime.Scanner.RunExclusiveAsync(async () =>
+            {
+                await _runtime.StateStore.UpdateAsync(state => ArchiveRelocation.ForgetUnavailable(state, root));
+            }, CurrentCancellation);
+            await RefreshAsync();
+            await RefreshRetainedArchivesAsync();
+            SetStatus("Old archive reference removed. Scan now to refresh matches in the current archive.");
+        });
     }
 
     private async Task RefreshSavedDestinationsAsync(long request)
@@ -1314,23 +1189,6 @@ public partial class MainWindow : Window
                 AutomationSettings.MinimumWatchScanSeconds,
                 AutomationSettings.MaximumWatchScanSeconds)
             : AutomationSettings.DefaultWatchScanSeconds;
-
-    private async void RebuildIndexes(object sender, RoutedEventArgs e)
-    {
-        await RunBusyAsync(
-            "Rebuilding enabled archive indexes...",
-            async () =>
-            {
-                var state = await _runtime.StateStore.LoadAsync();
-                foreach (var mapping in state.Settings.CategoryMappings.Where(item => item.IsEnabled))
-                {
-                    await _runtime.Indexer.RebuildAsync(mapping.Category, CurrentCancellation);
-                }
-
-                StatusText.Text = "Archive indexes rebuilt.";
-                await RefreshAsync();
-            });
-    }
 
     private async void ClearLocalData(object sender, RoutedEventArgs e)
     {
@@ -1602,7 +1460,6 @@ public partial class MainWindow : Window
             async () =>
             {
                 await RefreshRetainedArchivesAsync();
-                await RefreshArchiveDuplicatesAsync();
             },
             exception => Dispatcher.InvokeAsync(
                     () => ShowSettingsNotice(
@@ -1674,7 +1531,16 @@ public partial class MainWindow : Window
         var refreshTask = await Dispatcher.InvokeAsync(() => RefreshAsync());
         await refreshTask;
         var queued = results.Sum(result => result.HeldForReview);
-        await Dispatcher.InvokeAsync(() => SetStatus($"Background scan complete: {queued} queued for review."));
+        var archiveDuplicatesRemoved = results.Sum(result => result.ArchiveDuplicatesRemoved);
+        var warnings = results.SelectMany(result => result.Errors).ToArray();
+        await Dispatcher.InvokeAsync(() => SetStatus(
+            $"Background scan complete: {queued} queued for review, "
+                + $"{archiveDuplicatesRemoved} archive duplicates recycled, {warnings.Length} warning(s)."));
+        if (warnings.Length > 0)
+        {
+            var reportTask = await Dispatcher.InvokeAsync(() => ReportScanErrorsAsync(warnings));
+            await reportTask;
+        }
     }
 
     public void ReportWatcherFailure(VrcImageCategory category, string message, string? logPath)
@@ -2277,8 +2143,6 @@ public partial class MainWindow : Window
             return;
 
         await RefreshAnimationsAsync();
-        await RefreshArchiveDuplicatesAsync();
-
         // The answer is written after the refresh, not before it. A successful export takes the
         // sheet off the list of ones still needing a decision, so the refresh clears the selection
         // and with it everything written here - which looked exactly like a button that did
@@ -2289,6 +2153,8 @@ public partial class MainWindow : Window
                 : $"Exported to {result.Path} - {result.Note}"
             : $"Not exported: {result.Warning ?? "this file is not a sheet."}";
         SheetStatusText.Text += DescribeFollowUp(followUp);
+        if (followUp?.ArchiveDuplicatesRemoved > 0)
+            SheetStatusText.Text += $" Recycled {followUp.ArchiveDuplicatesRemoved} duplicate archive copies.";
 
         if (result.Exported && SheetList.SelectedItem is null)
         {
@@ -2386,8 +2252,6 @@ public partial class MainWindow : Window
             return;
 
         await RefreshAnimationsAsync();
-        await RefreshArchiveDuplicatesAsync();
-
         // Written after the refresh for the same reason as the single export above.
         var exported = batch.Results.Count(result => result.Exported && !result.ReusedExisting);
         var failed = batch.Results.Count(result => !result.Exported);
@@ -2398,6 +2262,8 @@ public partial class MainWindow : Window
         if (reused > 0)
             SheetStatusText.Text += $" Kept {reused} existing animations.";
         SheetStatusText.Text += DescribeFollowUp(batch.FollowUp);
+        if (batch.FollowUp.ArchiveDuplicatesRemoved > 0)
+            SheetStatusText.Text += $" Recycled {batch.FollowUp.ArchiveDuplicatesRemoved} duplicate archive copies.";
         if (failed > 0)
             SheetStatusText.Text += " " + string.Join(" ", batch.Results.Where(r => r.Warning is not null).Select(r => r.Warning));
     }
@@ -2423,21 +2289,19 @@ public partial class MainWindow : Window
             sentences.Add($"{followUp.Filed.Count} sheets were filed beside their animations.");
         }
 
-        // Said, not acted on. Both copies are already in the archive, so which one to keep is a
-        // decision - and the place to make it is the archive duplicates list in Settings, where
-        // the copy being kept is checked on disk before anything is removed.
+        // Export follow-up records the copies it found before automatic cleanup ran. The cleanup
+        // path independently verifies both the extra and its survivor before recycling anything.
         if (followUp.Duplicates.Count == 1)
         {
             var copies = string.Join(", ", followUp.Duplicates[0].ExistingCopies);
             sentences.Add(
-                $"The archive already held this picture at {copies}. Nothing was removed - "
-                    + "Settings lists archive duplicates when you want to decide.");
+                $"The archive already held this picture at {copies}. Automatic duplicate cleanup checked the extra copy.");
         }
         else if (followUp.Duplicates.Count > 1)
         {
             sentences.Add(
                 $"{followUp.Duplicates.Count} of them are pictures the archive already held. "
-                    + "Nothing was removed - Settings lists archive duplicates when you want to decide.");
+                    + "Automatic duplicate cleanup checked the extra copies.");
         }
 
         sentences.AddRange(followUp.Warnings);

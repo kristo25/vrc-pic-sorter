@@ -17,6 +17,56 @@ public sealed class ScanCoordinatorTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public async Task ScanRechecksReviewWhoseArchiveMatchesWereCleared(bool exactMatch)
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(archive);
+        using var image = ImageFixtureFactory.CreatePattern(21);
+        var incoming = Path.Combine(source, "incoming.png");
+        await image.SaveAsPngAsync(incoming);
+        if (exactMatch) await image.SaveAsPngAsync(Path.Combine(archive, "keeper.png"));
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        var fingerprint = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
+        var outside = directory.GetPath("other", "outside.png");
+        var outsideId = Guid.NewGuid();
+        await store.UpdateAsync(state =>
+        {
+            state.ReviewQueue.Add(new ReviewItem
+            {
+                Id = Guid.NewGuid(),
+                Category = VrcImageCategory.Emoji,
+                IncomingOriginalPath = incoming,
+                HeldFilePath = incoming,
+                IncomingFingerprint = fingerprint.ExactIdentity,
+                IncomingImageFingerprint = fingerprint,
+                Status = ReviewStatus.NeedsReconciliation,
+            });
+            state.ReviewQueue.Add(new ReviewItem
+            {
+                Id = outsideId,
+                Category = VrcImageCategory.Emoji,
+                IncomingOriginalPath = outside,
+                HeldFilePath = outside,
+            });
+            return true;
+        });
+        var decoder = new ImageDecoder();
+        var coordinator = new ScanCoordinator(store, new ArchiveIndexer(store, decoder), decoder,
+            new FileRouter(store, decoder, new FileRouterTests.FakeRecycleBinService()), TimeSpan.Zero);
+        var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Empty(result.Errors);
+        Assert.False(File.Exists(incoming));
+        Assert.Single(Directory.GetFiles(archive, "*.png"));
+        var state = await store.LoadAsync();
+        Assert.Equal(outsideId, Assert.Single(state.ReviewQueue, item => item.Status != ReviewStatus.Resolved).Id);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public async Task RetainedDatedSheetBackfillStaysInItsOwningArchive(bool existing)
     {
         using var directory = new TestDirectory();
@@ -1305,7 +1355,7 @@ public sealed class ScanCoordinatorTests
     /// proceed is a second copy of every animation in the folder.
     /// </summary>
     [Fact]
-    public async Task AScanThatWouldDoubleTheAnimationFolderRefusesAndSaysSo()
+    public async Task DuplicateAnimationsAreCleanedBeforeBackfillCanMultiplyThem()
     {
         using var directory = new TestDirectory();
         var sourceRoot = directory.GetPath("incoming");
@@ -1333,11 +1383,9 @@ public sealed class ScanCoordinatorTests
 
         var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
 
-        Assert.Equal(0, result.Animated);
-        Assert.Equal(26, Directory.GetFiles(animationFolder, "*.gif").Length);
-        Assert.Contains(
-            result.Errors,
-            error => error.Contains("Stopped before writing 26 animations", StringComparison.Ordinal));
+        Assert.Equal(50, result.ArchiveDuplicatesRemoved);
+        Assert.InRange(result.Animated, 0, 1);
+        Assert.InRange(Directory.GetFiles(animationFolder, "*.gif").Length, 1, 2);
     }
 
     private static string[] Snapshot(string root) =>
@@ -1881,11 +1929,11 @@ public sealed class ScanCoordinatorTests
     }
 
     /// <summary>
-    /// And when the export turns out to be a picture the archive already held, it is reported
-    /// rather than acted on - both copies are archived, so which to keep is a decision.
+    /// And when the export turns out to be a picture the archive already held, the follow-up
+    /// reports what it found and automatic cleanup recycles the numbered extra copy.
     /// </summary>
     [Fact]
-    public async Task AHandMadeExportThatDuplicatesAnArchivedCopyIsReportedNotRemoved()
+    public async Task AHandMadeExportThatDuplicatesAnArchivedCopyIsReportedAndCleaned()
     {
         using var directory = new TestDirectory();
         var sourceRoot = directory.GetPath("incoming");
@@ -1917,9 +1965,9 @@ public sealed class ScanCoordinatorTests
         Assert.Equal(animationPath, duplicate.AnimationPath);
         Assert.Equal(twin, Assert.Single(duplicate.ExistingCopies));
 
-        // Reported, and both files still there.
+        Assert.Equal(1, followUp.ArchiveDuplicatesRemoved);
         Assert.True(File.Exists(animationPath));
-        Assert.True(File.Exists(twin));
+        Assert.False(File.Exists(twin));
     }
 
     private static void WriteSheet(string path)
