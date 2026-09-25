@@ -35,6 +35,23 @@ public sealed record ImageDecodeResult(DecodedImage? Image, ImageDecodeFailure? 
 
 public sealed class ImageDecoder
 {
+    internal async Task<ImageFingerprint> FingerprintAsync(string path, DecodeMemoryBudget budget, CancellationToken token)
+    {
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        if (stream.Length > ImageResourceLimits.MaximumEncodedBytes)
+            throw new InvalidDataException("The image exceeds the configured encoded-file resource limit.");
+        var info = await Image.IdentifyAsync(stream, token).ConfigureAwait(false)
+            ?? throw new InvalidDataException("The image header could not be read.");
+        var estimate = DecodeMemoryBudget.EstimateBytes(info.Width, info.Height, Math.Max(1, info.FrameMetadataCollection.Count));
+        using var lease = await budget.AcquireAsync(estimate, token).ConfigureAwait(false);
+        stream.Position = 0;
+        var decoded = await DecodeCoreAsync(stream, path, info, token).ConfigureAwait(false);
+        if (!decoded.IsSuccess) throw new InvalidDataException(decoded.Failure!.Message);
+        token.ThrowIfCancellationRequested();
+        return ImageFingerprint.Create(decoded.Image!);
+    }
+
     private static readonly HashSet<string> SupportedFormats =
         new(StringComparer.OrdinalIgnoreCase) { "PNG", "GIF", "JPEG", "WEBP", "BMP" };
 
@@ -78,10 +95,14 @@ public sealed class ImageDecoder
         }
     }
 
-    public async Task<ImageDecodeResult> DecodeAsync(
+    public Task<ImageDecodeResult> DecodeAsync(
         Stream stream,
         string? sourceName = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        DecodeCoreAsync(stream, sourceName, null, cancellationToken);
+
+    private async Task<ImageDecodeResult> DecodeCoreAsync(
+        Stream stream, string? sourceName, ImageInfo? identifiedInfo, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
 
@@ -104,7 +125,7 @@ public sealed class ImageDecoder
             }
 
             var startPosition = stream.Position;
-            var info = await Image.IdentifyAsync(stream, cancellationToken).ConfigureAwait(false);
+            var info = identifiedInfo ?? await Image.IdentifyAsync(stream, cancellationToken).ConfigureAwait(false);
             if (info is null)
             {
                 return ImageDecodeResult.Failed(

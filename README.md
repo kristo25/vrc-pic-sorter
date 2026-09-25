@@ -38,8 +38,14 @@ In a fixed held-out test, padded-image detection improved from **0/96 to 77/96**
 By default, an incoming image is resolved without asking only when it is the *same picture* as one already
 in the archive. That requires an exact decoded fingerprint, including every frame and its timing;
 a rounded similarity score of 100% is not enough. In that case the archived copy is kept and the
-incoming copy is moved to the Windows Recycle Bin. When recycling is unavailable (for example,
-on a network share), the exact incoming duplicate is permanently deleted after both copies are
+incoming copy is moved to the Windows Recycle Bin. Network files are first copied to local storage
+and verified byte-for-byte; only after the local copy is recycled is the network original removed.
+Windows **Restore** returns these copies to `%LOCALAPPDATA%\VrcPicSorter-RecycleStaging`, where
+an accompanying `.origin.txt` file records their original network location. This requires local disk space.
+A failed copy or recycle leaves the network original intact. Retries reuse a verified local staging
+copy; incomplete transfers are rebuilt. Network transfer reads observe scan cancellation.
+Both mapped drives and direct UNC network paths use local recycling. When recycling is unavailable,
+the exact incoming duplicate is permanently deleted after both copies are
 rechecked. History explicitly records permanent deletion. **Scan now** also retries pending exact
 matches in enabled categories, including those from a previously scanned extra folder. Watcher
 events and **Scan another folder** only resolve incoming files within that scan's captured scope.
@@ -54,6 +60,23 @@ Three deliberate limits on this:
 
 Recycled copies can be restored from the Recycle Bin. Permanently removed incoming copies cannot;
 the verified archive copy is kept. **History** distinguishes these outcomes.
+
+## Scan workers
+
+**Settings > Scan workers** controls parallel archive indexing and incoming image analysis.
+Choose **Auto** or **1–8** manual workers. Auto tests throughput up to your PC's logical processor
+count on the first scan after changing Main output folder (including switching back). Calibration
+has a 15-second scheduling budget; outstanding reads finish safely. Small temporary probes are
+removed afterward. Auto chooses the fastest measured setting, preferring fewer workers within 5%,
+then adjusts during longer scans for throughput, memory pressure and UI responsiveness. Saved
+measurements are reused; phases with too few images learn when images become available.
+The current count appears in Settings and scan status. Changes apply to the next scan.
+Decisions and file operations stay ordered:
+each result is checked against the archive updated by earlier results, including copies found by
+other workers. A shared 256 MiB decode estimate budget uses image dimensions and frame count,
+including highly compressed images. A single image over that estimate runs alone; this is not
+a hard limit on total application memory, and existing per-image limits still apply.
+Stopping a scan drains its readers before another scan starts. File moves remain serial.
 
 ## Custom similarity limits
 

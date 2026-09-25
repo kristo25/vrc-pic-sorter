@@ -15,11 +15,28 @@ public interface IRecycleBinService
 /// and what made it possible to destroy a file while reporting a recycle.
 /// </param>
 public sealed class WindowsRecycleBinService(
-    Func<string, bool>? recycleBinDisabledForVolume = null) : IRecycleBinService
+    Func<string, bool>? recycleBinDisabledForVolume = null,
+    Func<string, DriveType>? driveType = null,
+    Action<string>? recycleFile = null,
+    string? stagingRoot = null) : IRecycleBinService
 {
+    private readonly string _stagingRoot = stagingRoot ?? Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VrcPicSorter-RecycleStaging");
+
+    private DriveType TypeOf(string root)
+    {
+        if (driveType is not null) return driveType(root);
+        if (root.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)
+            || (root.StartsWith(@"\\", StringComparison.Ordinal)
+                && !root.StartsWith(@"\\?\", StringComparison.Ordinal)
+                && !root.StartsWith(@"\\.\", StringComparison.Ordinal)))
+            return DriveType.Network;
+        return new DriveInfo(root.StartsWith(@"\\?\", StringComparison.Ordinal) ? root[4..] : root).DriveType;
+    }
+
     public bool CanRecycle(string path)
     {
-        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path) || path.StartsWith("\\\\"))
+        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path))
         {
             return false;
         }
@@ -27,7 +44,15 @@ public sealed class WindowsRecycleBinService(
         try
         {
             var root = Path.GetPathRoot(path);
-            if (root is null || new DriveInfo(root).DriveType != DriveType.Fixed)
+            if (root is null) return false;
+            if (TypeOf(root) == DriveType.Network)
+            {
+                var localRoot = Path.GetPathRoot(_stagingRoot);
+                return Path.IsPathFullyQualified(_stagingRoot) && localRoot is not null
+                    && TypeOf(localRoot) == DriveType.Fixed
+                    && recycleBinDisabledForVolume?.Invoke(localRoot) != true;
+            }
+            if (TypeOf(root) != DriveType.Fixed)
             {
                 return false;
             }
@@ -56,11 +81,24 @@ public sealed class WindowsRecycleBinService(
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+        if (TypeOf(Path.GetPathRoot(path)!) == DriveType.Network)
+            return Task.Run(() => VerifiedArchiveTransfer.RecycleThroughLocalCopyAsync(path, _stagingRoot,
+                localCopy =>
+                {
+                    if (!CanRecycle(localCopy)) throw new NotSupportedException("The local Recycle Bin is unavailable; the network original was kept.");
+                    RecycleLocal(localCopy);
+                }, cancellationToken), cancellationToken);
+        RecycleLocal(path);
+        return Task.CompletedTask;
+    }
+
+    private void RecycleLocal(string path)
+    {
+        if (recycleFile is not null) { recycleFile(path); return; }
         Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(
             path,
             UIOption.OnlyErrorDialogs,
             RecycleOption.SendToRecycleBin,
             UICancelOption.ThrowException);
-        return Task.CompletedTask;
     }
 }

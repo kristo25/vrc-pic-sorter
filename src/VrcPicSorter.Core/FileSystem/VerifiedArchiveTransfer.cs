@@ -8,6 +8,74 @@ namespace VrcPicSorter.Core.FileSystem;
 /// <summary>Copy, flush and verify before removing the locked source file.</summary>
 internal static class VerifiedArchiveTransfer
 {
+    public static async Task RecycleThroughLocalCopyAsync(string source, string stagingRoot, Action<string> recycle,
+        CancellationToken cancellationToken)
+    {
+        PathBoundary.EnsureNoReparsePoints(source, "Recycling source");
+        PathBoundary.EnsureNoReparsePoints(stagingRoot, "Local recycling folder");
+        cancellationToken.ThrowIfCancellationRequested();
+        using var handle = CreateFile(source, 0x80000000 | 0x00010000, 1, IntPtr.Zero, 3, 0x48000000, IntPtr.Zero);
+        if (handle.IsInvalid) throw Error("Cannot lock recycling source");
+        await using var input = new FileStream(handle, FileAccess.Read, 65536, isAsync: true);
+        cancellationToken.ThrowIfCancellationRequested();
+        var hash = await SHA256.HashDataAsync(input, cancellationToken).ConfigureAwait(false);
+        // Stable staging identity permits safe retry without accumulating full local copies.
+        var identity = System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(source).ToUpperInvariant()
+            + "\n" + Convert.ToHexString(hash));
+        var folder = Path.Combine(stagingRoot, Convert.ToHexString(SHA256.HashData(identity)));
+        var localCopy = Path.Combine(folder, Path.GetFileName(source));
+        PathBoundary.EnsureSafeDestination(stagingRoot, localCopy, "Local recycling copy");
+        Directory.CreateDirectory(folder);
+        // Keep origin information alongside staging: Restore in Windows returns the copy here,
+        // not to a network share which may no longer be connected.
+        await File.WriteAllTextAsync(localCopy + ".origin.txt", source, cancellationToken).ConfigureAwait(false);
+        if (!File.Exists(localCopy))
+        {
+            var partial = localCopy + ".partial";
+            PathBoundary.EnsureNoReparsePoints(partial, "Local recycling temporary file");
+            try
+            {
+                // A prior interrupted attempt's partial file is disposable; the source is locked.
+                await using (var copy = new FileStream(partial, FileMode.Create, FileAccess.ReadWrite,
+                    FileShare.None, 65536, FileOptions.Asynchronous))
+                {
+                    await CopyAndVerifyAsync(input, copy, hash, cancellationToken).ConfigureAwait(false);
+                    copy.Flush(flushToDisk: true);
+                }
+                File.Move(partial, localCopy, overwrite: false);
+            }
+            finally
+            {
+                // Keep the verified final copy for retry, but never accumulate incomplete copies.
+                try { File.Delete(partial); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
+        PathBoundary.EnsureNoReparsePoints(localCopy, "Local recycling copy");
+        await using (var verified = new FileStream(localCopy, FileMode.Open, FileAccess.Read,
+            FileShare.Read, 65536, FileOptions.Asynchronous))
+            if (verified.Length != input.Length || !(await SHA256.HashDataAsync(verified, cancellationToken)
+                .ConfigureAwait(false)).AsSpan().SequenceEqual(hash))
+                throw new IOException("Local recycling copy verification failed; the original was kept.");
+        File.SetLastWriteTimeUtc(localCopy, File.GetLastWriteTimeUtc(source));
+        cancellationToken.ThrowIfCancellationRequested();
+        recycle(localCopy); // Failure leaves the locked original intact.
+        if (File.Exists(localCopy)) throw new IOException("Local copy was not recycled; the original was kept.");
+        DeleteLockedSource(handle);
+    }
+
+    internal static async Task CopyAndVerifyAsync(Stream input, Stream copy, byte[] hash, CancellationToken token)
+    {
+        input.Position = 0;
+        await input.CopyToAsync(copy, 65536, token).ConfigureAwait(false);
+        await copy.FlushAsync(token).ConfigureAwait(false);
+        copy.Position = 0;
+        if (copy.Length != input.Length || !(await SHA256.HashDataAsync(copy, token).ConfigureAwait(false))
+            .AsSpan().SequenceEqual(hash))
+            throw new IOException("Local recycling copy verification failed; the original was kept.");
+    }
+
     public static string Move(string source, string destinationRoot, string requestedDestination)
     {
         // DELETE access lets us remove this exact open file, not whatever later occupies its path.

@@ -160,6 +160,22 @@ public sealed class AppStateDocument
 
 public sealed class AppSettings
 {
+    public const int MaximumScanWorkers = 8;
+    public long OutputFolderRevision { get; set; }
+    public AutoScanProfile? AutoScanProfile { get; set; }
+    private int _scanWorkers;
+
+    /// <summary>Zero selects Auto; positive values limit parallel incoming image analysis.</summary>
+    public int ScanWorkers
+    {
+        get => _scanWorkers;
+        set => _scanWorkers = Math.Clamp(value, 0, MaximumScanWorkers);
+    }
+
+    public int ResolveScanWorkers() => ScanWorkers == 0
+        ? Math.Clamp(Environment.ProcessorCount, 1, 2)
+        : ScanWorkers;
+
     public List<CategoryMapping> CategoryMappings { get; set; } = [];
 
     public string OutputRootPath { get; set; } = string.Empty;
@@ -194,6 +210,22 @@ public sealed class AppSettings
 
     public bool BringReviewForwardWhenHeld { get; set; } = true;
 }
+
+public sealed class AutoScanProfile
+{
+    public string OutputRoot { get; set; } = string.Empty;
+    public long OutputRevision { get; set; }
+    public int ProcessorCount { get; set; }
+    public int AlgorithmVersion { get; set; }
+    public int ArchiveWorkers { get; set; } = 2;
+    public int IncomingWorkers { get; set; } = 2;
+    public bool Learning { get; set; }
+    public DateTimeOffset MeasuredUtc { get; set; }
+    public double StorageMilliseconds { get; set; }
+    public List<WorkerMeasurement> Measurements { get; set; } = [];
+}
+
+public sealed record WorkerMeasurement(string Phase, int Workers, double ImagesPerSecond);
 
 public sealed class CategoryMapping
 {

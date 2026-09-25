@@ -18,8 +18,26 @@ public sealed record SettingsDraft(
     int WatchScanSeconds = AutomationSettings.DefaultWatchScanSeconds,
     WatchMode WatchMode = WatchMode.OnDetection,
     OrganizationPolicy OrganizationPolicy = OrganizationPolicy.CategoryRoot,
-    SimilarityThresholds? CustomSimilarityThresholds = null)
+    SimilarityThresholds? CustomSimilarityThresholds = null,
+    int ScanWorkers = 0)
 {
+    public bool ChangesOnlyScanWorkers(AppSettings settings) =>
+        ScanWorkers != settings.ScanWorkers
+        && settings.OutputRootConfirmed
+        && string.Equals(OutputRootPath, settings.OutputRootPath, StringComparison.OrdinalIgnoreCase)
+        && SimilarityProfile == settings.SimilarityProfile
+        && Equals(CustomSimilarityThresholds, settings.CustomSimilarityThresholds)
+        && OrganizationPolicy == settings.OrganizationPolicy
+        && StartWithWindows == settings.Automation.StartWithWindows
+        && BringReviewForwardWhenHeld == settings.BringReviewForwardWhenHeld
+        && WatchScanSeconds == settings.Automation.WatchScanSeconds
+        && WatchMode == settings.Automation.WatchMode
+        && !settings.Automation.WatchWhileOpen
+        && Categories.Count == settings.CategoryMappings.Count
+        && Categories.All(draft => settings.CategoryMappings.Any(mapping =>
+            mapping.Category == draft.Category && mapping.IsEnabled == draft.IsEnabled
+            && string.Equals(mapping.SourcePath, draft.SourcePath, StringComparison.OrdinalIgnoreCase)));
+
     /// <summary>
     /// Returns the first invariant this draft would break, or <see langword="null"/> when it is
     /// safe to persist. Only overlap problems block a save, because they are the ones that could
@@ -107,6 +125,8 @@ public sealed record SettingsDraft(
 
         if (rootChanged)
         {
+            state.Settings.OutputFolderRevision++;
+            state.Settings.AutoScanProfile = null;
             foreach (var mapping in state.Settings.CategoryMappings)
             {
                 var previousIndex = state.ArchiveIndex.Categories.Single(item => item.Category == mapping.Category);
@@ -169,6 +189,7 @@ public sealed record SettingsDraft(
         if (rootChanged) state.Settings.OutputRootIsSuggested = false;
         state.Settings.OutputRootConfirmed = true;
         state.Settings.SimilarityProfile = SimilarityProfile;
+        state.Settings.ScanWorkers = ScanWorkers;
         state.Settings.CustomSimilarityThresholds = CustomSimilarityThresholds;
         state.Settings.OrganizationPolicy = OrganizationPolicy;
         state.Settings.Automation.WatchWhileOpen = false;

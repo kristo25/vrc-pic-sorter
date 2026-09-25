@@ -40,9 +40,32 @@ public partial class MainWindow : Window
         _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
         InitializeComponent();
         SimilarityCombo.ItemsSource = Enum.GetValues<SimilarityProfile>();
+        ScanWorkersCombo.ItemsSource = new[] { $"Auto (up to {Environment.ProcessorCount} workers)" }
+            .Concat(Enumerable.Range(1, AppSettings.MaximumScanWorkers).Select(count => count.ToString()));
         OrganizationCombo.ItemsSource = Enum.GetValues<OrganizationPolicy>();
         WatchModeCombo.ItemsSource = Enum.GetValues<WatchMode>();
+        _runtime.Scanner.Concurrency.StatusChanged += WorkerStatusChanged;
+        _runtime.Scanner.Concurrency.UiDelayMilliseconds = () => Math.Max(
+            System.Threading.Volatile.Read(ref _uiDelayMilliseconds),
+            System.Diagnostics.Stopwatch.GetElapsedTime(System.Threading.Interlocked.Read(ref _lastUiBeat)).TotalMilliseconds - 100);
+        _uiHeartbeat.Tick += (_, _) =>
+        {
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            var previous = System.Threading.Interlocked.Exchange(ref _lastUiBeat, now);
+            System.Threading.Volatile.Write(ref _uiDelayMilliseconds,
+                Math.Max(0, System.Diagnostics.Stopwatch.GetElapsedTime(previous, now).TotalMilliseconds - 100));
+        };
+        _uiHeartbeat.Start();
     }
+
+    private readonly DispatcherTimer _uiHeartbeat = new(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(100) };
+    private long _lastUiBeat = System.Diagnostics.Stopwatch.GetTimestamp();
+    private double _uiDelayMilliseconds;
+    private void WorkerStatusChanged(string message) => Dispatcher.BeginInvoke(() =>
+    {
+        WorkerStatusText.Text = message;
+        if (_busy || message.StartsWith("Testing archive", StringComparison.Ordinal)) StatusText.Text = message;
+    });
 
     private ReviewItem? SelectedReview => QueueList.SelectedItem as ReviewItem;
 
@@ -152,6 +175,12 @@ public partial class MainWindow : Window
             OutputRoot.Text = settings.OutputRootPath;
             UpdateResolvedDestinations(settings.OutputRootPath);
             SimilarityCombo.SelectedItem = settings.SimilarityProfile;
+            ScanWorkersCombo.SelectedIndex = settings.ScanWorkers;
+            WorkerStatusText.Text = settings.ScanWorkers == 0
+                ? settings.AutoScanProfile is { } profile
+                    ? $"Auto: archive {profile.ArchiveWorkers}, incoming {profile.IncomingWorkers} of {Environment.ProcessorCount} workers{(profile.Learning ? " (learning)" : "")}."
+                    : "Auto will test the output folder on the next scan."
+                : $"Manual: {settings.ScanWorkers} workers.";
             CustomSimilarityLimits.IsChecked = settings.CustomSimilarityThresholds is not null;
             MinimumSimilarity.Text = (settings.CustomSimilarityThresholds?.MinimumPercent ?? 82).ToString(System.Globalization.CultureInfo.CurrentCulture);
             MaximumSimilarity.Text = (settings.CustomSimilarityThresholds?.MaximumPercent ?? 99).ToString(System.Globalization.CultureInfo.CurrentCulture);
@@ -909,6 +938,7 @@ public partial class MainWindow : Window
         }
 
         var stateApplied = false;
+        var workersOnly = false;
         var applied = await _settingsSaves.SaveAsync(request, () => Task.FromResult(draft),
             async action =>
             {
@@ -922,11 +952,20 @@ public partial class MainWindow : Window
                     if (!_settingsSaves.IsCurrent(request)) return false;
                     if (captured.DescribeBlockingProblem(state.Settings) is { } blocking)
                         throw new InvalidOperationException(blocking);
-                    captured.ApplyTo(state);
+                    workersOnly = captured.ChangesOnlyScanWorkers(state.Settings);
+                    if (workersOnly) state.Settings.ScanWorkers = captured.ScanWorkers;
+                    else captured.ApplyTo(state);
                     return true;
                 });
             });
         if (!applied && !stateApplied) return;
+
+        if (workersOnly)
+        {
+            if (_settingsSaves.IsCurrent(request))
+                ShowSettingsNotice("Scan workers saved. Applies to the next scan.", isWarning: false);
+            return;
+        }
 
         // A running watcher holds the folders, mode and interval it was started with, so it has
         // to be restarted for any settings change to take effect.
@@ -1171,7 +1210,8 @@ public partial class MainWindow : Window
             (OrganizationPolicy?)OrganizationCombo.SelectedItem ?? OrganizationPolicy.CategoryRoot,
             CustomSimilarityLimits.IsChecked == true
                 ? new SimilarityThresholds(ParseSimilarityPercent(MinimumSimilarity.Text), ParseSimilarityPercent(MaximumSimilarity.Text))
-                : null);
+                : null,
+            ScanWorkers: Math.Max(0, ScanWorkersCombo.SelectedIndex));
     }
 
     private static double ParseSimilarityPercent(string text) =>
@@ -1685,6 +1725,9 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        _uiHeartbeat.Stop();
+        _runtime.Scanner.Concurrency.StatusChanged -= WorkerStatusChanged;
+        _runtime.Scanner.Concurrency.UiDelayMilliseconds = null;
         _previewService.Dispose();
         base.OnClosed(e);
     }

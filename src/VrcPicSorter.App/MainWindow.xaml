@@ -386,6 +386,15 @@
                     </Grid>
 
                     <StackPanel Margin="0,0,0,20">
+                        <TextBlock FontWeight="SemiBold" Text="Scan workers" />
+                        <ComboBox x:Name="ScanWorkersCombo" Width="300" HorizontalAlignment="Left" Margin="0,8,0,8"
+                                  SelectionChanged="SettingsSelectionChanged" automation:AutomationProperties.Name="Parallel scan workers" />
+                        <TextBlock TextWrapping="Wrap" Foreground="{StaticResource MutedTextBrush}" FontSize="12"
+                                   Text="Auto measures archive and incoming analysis speed, using up to your available processors. The first scan after changing the main output folder spends up to 15 seconds testing it, then continues learning. Memory and responsiveness limits still apply. Manual choices apply to the next scan. Duplicate decisions remain coordinated." />
+                        <TextBlock x:Name="WorkerStatusText" Margin="0,6,0,0" TextWrapping="Wrap" Foreground="{StaticResource MutedTextBrush}" />
+                    </StackPanel>
+
+                    <StackPanel Margin="0,0,0,20">
                         <CheckBox x:Name="CustomSimilarityLimits" Content="Use custom similarity limits (overrides preset)"
                                   Checked="SettingsToggled" Unchecked="SettingsToggled" />
                         <StackPanel Orientation="Horizontal" Margin="0,10,0,8" IsEnabled="{Binding IsChecked, ElementName=CustomSimilarityLimits}">

@@ -3,6 +3,26 @@
 All notable changes to VRC Pic Sorter are recorded here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-09-25
+
+### Added
+
+- Scan workers setting: Auto measures archive and incoming-image throughput up to the PC's logical processor count; manual settings allow 1–8 workers.
+- Auto recalibrates after changing Main output folder, saves measurements, and adjusts during longer scans for throughput, memory pressure and UI responsiveness.
+- Shared decoded-image memory budget and ordered duplicate decisions prevent parallel workers from allowing identical incoming images through.
+
+### Fixed
+
+- Network-drive recycling stages and verifies files locally before recycling, with cancellation and recovery of interrupted transfers.
+- Automatic archive maintenance and retained-archive handling preserve incomplete-inventory safeguards after output-folder changes.
+- Changing only the worker count avoids unnecessary watcher restarts and archive recounts.
+- Calibration samples across folders, learns previously empty phases, and reduces concurrency after sustained slowdowns.
+
+### Validation
+
+- 487 automated tests passed locally, plus isolated portable startup and disposable C:/K: transfer checks.
+- Three-round GIF benchmarks against fixed two workers measured 68–71% faster index rebuilds and 4–6% faster full duplicate scans with identical fingerprints and decisions. Initial calibration added about 6.5 seconds; performance varies by workload and hardware.
+
 ## [1.4.0] - 2026-09-21
 
 ### Added

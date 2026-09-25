@@ -737,8 +737,11 @@ public sealed class ScanCoordinatorTests
         Assert.Empty((await store.LoadAsync()).ReviewQueue);
     }
 
-    [Fact]
-    public async Task LaterImageMatchesUniqueMovedEarlierInSameScan()
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(8)]
+    public async Task LaterImageMatchesUniqueMovedEarlierInSameScan(int workers)
     {
         using var directory = new TestDirectory();
         var sourceRoot = directory.GetPath("incoming");
@@ -751,6 +754,7 @@ public sealed class ScanCoordinatorTests
         await image.SaveAsPngAsync(first);
         await image.SaveAsPngAsync(second);
         using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
+        await store.UpdateAsync(state => state.Settings.ScanWorkers = workers);
         var decoder = new ImageDecoder();
         var coordinator = new ScanCoordinator(
             store,
@@ -767,6 +771,57 @@ public sealed class ScanCoordinatorTests
         Assert.True(File.Exists(Path.Combine(archiveRoot, "01-first.png")));
         Assert.False(File.Exists(second));
         Assert.Empty((await store.LoadAsync()).ReviewQueue);
+    }
+
+    [Fact]
+    public async Task StoppedParallelScanCanRestartWithoutLosingDuplicates()
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(archive);
+        using var image = ImageFixtureFactory.CreatePattern(98);
+        for (var i = 0; i < 12; i++)
+            await image.SaveAsPngAsync(Path.Combine(source, $"{i:00}.png"));
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        await store.UpdateAsync(state => state.Settings.ScanWorkers = 8);
+        var decoder = new ImageDecoder();
+        var coordinator = new ScanCoordinator(store, new ArchiveIndexer(store, decoder), decoder,
+            new FileRouter(store, decoder, new FileRouterTests.FakeRecycleBinService()));
+        using var cancellation = new CancellationTokenSource();
+        var progress = new CallbackProgress<ScanProgress>(value =>
+        {
+            if (value.ScannedImages == 1) cancellation.Cancel();
+        });
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => coordinator.ScanAllAsync(
+            progress, cancellation.Token));
+        await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Single(Directory.GetFiles(archive, "*.png", SearchOption.AllDirectories));
+        Assert.Empty(Directory.GetFiles(source, "*.png"));
+        Assert.Empty((await store.LoadAsync()).ReviewQueue);
+    }
+
+    [Fact]
+    public async Task InvalidHeaderDoesNotAbortOtherWorkers()
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(archive);
+        File.WriteAllText(Path.Combine(source, "01-corrupt.png"), "not an image");
+        using var image = ImageFixtureFactory.CreatePattern(98);
+        await image.SaveAsPngAsync(Path.Combine(source, "02-valid.png"));
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        await store.UpdateAsync(state => state.Settings.ScanWorkers = 8);
+        var decoder = new ImageDecoder();
+        var coordinator = new ScanCoordinator(store, new ArchiveIndexer(store, decoder), decoder,
+            new FileRouter(store, decoder, new FileRouterTests.FakeRecycleBinService()));
+        var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Equal(1, result.MovedUnique);
+        Assert.Single(result.Errors);
+        Assert.True(File.Exists(Path.Combine(source, "01-corrupt.png")));
     }
 
     [Fact]

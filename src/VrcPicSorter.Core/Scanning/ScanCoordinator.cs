@@ -69,14 +69,7 @@ public sealed partial class ScanCoordinator
     /// state and no file is moved - so it is the only part of a scan that can safely run ahead.
     /// Every decision still happens one image at a time, in path order.
     /// </summary>
-    public const int MaximumConcurrentReads = 5;
-
-    /// <summary>
-    /// An encoded size above which an image is read on its own. A decoded image is allowed to
-    /// reach <see cref="ImageResourceLimits.MaximumDecodedBytes"/>, so reading several large ones
-    /// together could multiply that; large files are rare enough that serialising them is free.
-    /// </summary>
-    private const long LargeEncodedBytes = 16L * 1024 * 1024;
+    public const int MaximumConcurrentReads = AppSettings.MaximumScanWorkers;
 
     /// <summary>
     /// How many animations one scan will add to an archive that already has some before it treats
@@ -94,6 +87,7 @@ public sealed partial class ScanCoordinator
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _settleDelay;
     private readonly SemaphoreSlim _scanGate = new(1, 1);
+    public ScanConcurrencyController Concurrency => _indexer.Concurrency;
 
     /// <summary>Runs a settings application or relocation between scanner operations.
     /// The callback must not call another scanner entry point or stop the watcher.</summary>
@@ -455,6 +449,7 @@ public sealed partial class ScanCoordinator
                 [$"The {category} output folder could not be created: {exception.Message}"]);
         }
 
+        await Concurrency.PrepareAsync(initial.Settings, null, sourceSnapshot.Paths, cancellationToken).ConfigureAwait(false);
         var indexResult = await _indexer.RefreshAsync(category, cancellationToken).ConfigureAwait(false);
         if (indexResult.Status != IndexStatus.Current)
         {
@@ -613,15 +608,14 @@ public sealed partial class ScanCoordinator
         // Reading runs ahead of routing by up to MaximumConcurrentReads images. Reads produce a
         // fingerprint and nothing else, so running them early cannot change what any decision
         // sees; the loop below still consumes them strictly in path order.
-        var readAhead = Math.Clamp(Environment.ProcessorCount, 1, MaximumConcurrentReads);
-        using var readSlots = new SemaphoreSlim(readAhead, readAhead);
-        using var largeReadSlot = new SemaphoreSlim(1, 1);
+        var workerSession = await Concurrency.StartAsync("Incoming", cancellationToken).ConfigureAwait(false);
+        using var readCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var inFlight = new Dictionary<string, Task<PreparedImage>>(StringComparer.OrdinalIgnoreCase);
         var nextToRead = 0;
 
         void StartReadsAhead()
         {
-            while (inFlight.Count < readAhead && nextToRead < paths.Count)
+            while (inFlight.Count < workerSession.Workers && nextToRead < paths.Count)
             {
                 var upcoming = paths[nextToRead++];
                 if (queuedPaths.Contains(upcoming) || !settledPaths.Contains(upcoming))
@@ -629,201 +623,74 @@ public sealed partial class ScanCoordinator
                     continue;
                 }
 
-                inFlight[upcoming] = PrepareImageAsync(upcoming, readSlots, largeReadSlot, cancellationToken);
+                inFlight[upcoming] = Task.Run(() => PrepareImageAsync(upcoming, readCancellation.Token));
             }
         }
 
-        foreach (var path in paths)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            examined++;
-            var fileName = Path.GetFileName(path);
-            var readingReported = false;
-            var outcome = "Skipped";
-            try
+            foreach (var path in paths)
             {
-                if (queuedPaths.Contains(path))
-                {
-                    skipped++;
-                    outcome = "Already in the review queue";
-                    continue;
-                }
-
-                if (!settledPaths.Contains(path))
-                {
-                    errors.Add($"{path}: file is still being written or locked.");
-                    outcome = "Still being written";
-                    continue;
-                }
-
-                StartReadsAhead();
-                if (!inFlight.Remove(path, out var read))
-                {
-                    read = PrepareImageAsync(path, readSlots, largeReadSlot, cancellationToken);
-                }
-
-                var prepared = await read.ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
-                onImageScanned?.Invoke("Reading", fileName);
-                readingReported = true;
-                if (prepared.Fingerprint is null)
+                examined++;
+                var fileName = Path.GetFileName(path);
+                var readingReported = false;
+                var outcome = "Skipped";
+                try
                 {
-                    errors.Add($"{path}: {prepared.Error}");
-                    outcome = "Could not be read";
-                    continue;
-                }
-
-                var fingerprint = prepared.Fingerprint;
-
-                // The same picture saved twice under different names matches the archive the same
-                // way twice, and one review card per copy is one decision too many. The copy
-                // already held keeps the decision; this one decodes to the very same pixels, so
-                // whatever is decided there decides this too, and the Recycle Bin is what that
-                // means for a copy nobody is going to keep.
-                if (heldByIdentity.TryGetValue(fingerprint.ExactIdentity, out var twin))
-                {
-                    try
+                    if (queuedPaths.Contains(path))
                     {
-                        await _router.AutoKeepHeldAsync(
-                                path,
-                                category,
-                                fingerprint,
-                                twin.Path,
-                                twin.Fingerprint.ExactIdentity,
-                                cancellationToken)
-                            .ConfigureAwait(false);
-                        autoKept++;
-                        outcome = "Same picture already in review; recycled";
+                        skipped++;
+                        outcome = "Already in the review queue";
                         continue;
                     }
-                    catch (Exception exception) when (
-                        exception is NotSupportedException
-                            or InvalidOperationException
-                            or IOException
-                            or UnauthorizedAccessException)
+
+                    if (!settledPaths.Contains(path))
                     {
-                        // The Recycle Bin was unavailable, or the held copy changed since it was
-                        // scanned. Never delete and never drop the image: fall through and let
-                        // this copy get a review of its own.
-                        errors.Add($"{path}: could not resolve automatically ({exception.Message}).");
-                    }
-                }
-
-                var relativeDirectory = Path.GetRelativePath(
-                    sourceRoot,
-                    Path.GetDirectoryName(path) ?? sourceRoot);
-                var routingContext = new ScanRoutingContext
-                {
-                    SourceRootPath = sourceRoot,
-                    RelativeDirectory = relativeDirectory == "." ? string.Empty : relativeDirectory,
-                    OutputRootPath = initial.Settings.OutputRootPath,
-                };
-                var current = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
-                var index = current.ArchiveIndex.Categories.Single(item => item.Category == category);
-                if (index.Status != IndexStatus.Current)
-                {
-                    errors.Add($"{path}: archive index became stale; rescan required.");
-                    outcome = "Archive index went stale";
-                    continue;
-                }
-
-                // Rebuilt only when the index has actually moved on. Reading every archived
-                // fingerprint back for every incoming image is what made a large archive crawl.
-                if (candidateGeneration != index.Generation)
-                {
-                    indexedCandidates = index.Images
-                        .Where(item => item.Fingerprint is not null)
-                        .Select(item => new ImageCandidate(item.Id.ToString("N"), item.Fingerprint!))
-                        .ToArray();
-                    indexedByKey = index.Images.ToDictionary(
-                        item => item.Id.ToString("N"),
-                        item => item,
-                        StringComparer.Ordinal);
-                    candidateGeneration = index.Generation;
-                }
-
-                // Everything this incoming image may be compared against. Normally that is the
-                // index alone, and the cached view above is used exactly as it stands. A ready-made
-                // GIF is also compared against the animation the archive's own sheet produces -
-                // generated now if it has never been made - and that companion belongs to this one
-                // file, so it goes into a copy rather than into the cache every other image reads.
-                var comparable = indexedByKey;
-                var candidates = indexedCandidates;
-                if (AtlasAnimationWriter.IsAnimation(path))
-                {
-                    var companion = await BuildCompanionAnimationAsync(
-                            index,
-                            path,
-                            mapping.ArchivePath,
-                            errors,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    if (companion is not null)
-                    {
-                        var companionKey = companion.Id.ToString("N");
-                        comparable = new Dictionary<string, IndexedImageRecord>(
-                            indexedByKey,
-                            StringComparer.Ordinal)
-                        {
-                            [companionKey] = companion,
-                        };
-                        if (companion.Fingerprint is not null)
-                        {
-                            candidates =
-                                [.. indexedCandidates, new ImageCandidate(companionKey, companion.Fingerprint)];
-                        }
-                    }
-                }
-
-                var thresholds = current.Settings.CustomSimilarityThresholds;
-                thresholds?.Validate();
-                var matches = ImageMatcher.RankCandidates(
-                    fingerprint,
-                    candidates,
-                    current.Settings.SimilarityProfile,
-                    thresholds?.MinimumPercent / 100);
-
-                // VRChat hands over its own ready-made GIF for an emoji this app has already
-                // animated. The two are the same animation encoded twice, so they are not the same
-                // bytes and their score can land under any threshold - and the copy was then filed
-                // as a brand new image, which is where a folder full of "x" beside "x (2)" came
-                // from. Being the same emoji, with the same frame count, rate and loop direction in
-                // its name, is not a resemblance to be scored: it is VRChat's own metadata about
-                // its own inventory item. So it always earns a review card, however the score came
-                // out. It never resolves one: discarding a file still needs the decoded content to
-                // match exactly, and these do not.
-                matches = WithSameEmojiAnimations(matches, comparable, path, fingerprint);
-
-                if (matches.Count > 0)
-                {
-                    // Exact identity permits the existing permanent-removal fallback. Custom
-                    // score-based decisions below use recycling only, never that fallback.
-                    IndexedImageRecord? duplicate = null;
-                    foreach (var match in matches)
-                    {
-                        var indexed = comparable[match.CandidateKey];
-                        if (indexed.Fingerprint is not null
-                            && ImageMatcher.IsSamePicture(match, fingerprint, indexed.Fingerprint))
-                        {
-                            duplicate = indexed;
-                            break;
-                        }
+                        errors.Add($"{path}: file is still being written or locked.");
+                        outcome = "Still being written";
+                        continue;
                     }
 
-                    if (duplicate is not null)
+                    StartReadsAhead();
+                    if (!inFlight.Remove(path, out var read))
+                    {
+                        read = PrepareImageAsync(path, cancellationToken);
+                    }
+
+                    var prepared = await read.ConfigureAwait(false);
+                    workerSession.Completed(prepared.Fingerprint is not null, nextToRead < paths.Count);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    onImageScanned?.Invoke("Reading", fileName);
+                    readingReported = true;
+                    if (prepared.Fingerprint is null)
+                    {
+                        errors.Add($"{path}: {prepared.Error}");
+                        outcome = "Could not be read";
+                        continue;
+                    }
+
+                    var fingerprint = prepared.Fingerprint;
+
+                    // The same picture saved twice under different names matches the archive the same
+                    // way twice, and one review card per copy is one decision too many. The copy
+                    // already held keeps the decision; this one decodes to the very same pixels, so
+                    // whatever is decided there decides this too, and the Recycle Bin is what that
+                    // means for a copy nobody is going to keep.
+                    if (heldByIdentity.TryGetValue(fingerprint.ExactIdentity, out var twin))
                     {
                         try
                         {
-                            await _router.AutoKeepArchivedAsync(
+                            await _router.AutoKeepHeldAsync(
                                     path,
                                     category,
                                     fingerprint,
-                                    duplicate.Path,
-                                    duplicate.ExactFingerprint,
+                                    twin.Path,
+                                    twin.Fingerprint.ExactIdentity,
                                     cancellationToken)
                                 .ConfigureAwait(false);
                             autoKept++;
-                            outcome = "Exact duplicate resolved; archived copy kept";
+                            outcome = "Same picture already in review; recycled";
                             continue;
                         }
                         catch (Exception exception) when (
@@ -832,159 +699,300 @@ public sealed partial class ScanCoordinator
                                 or IOException
                                 or UnauthorizedAccessException)
                         {
-                            // A copy changed or removal failed. Keep the incoming file in review.
+                            // The Recycle Bin was unavailable, or the held copy changed since it was
+                            // scanned. Never delete and never drop the image: fall through and let
+                            // this copy get a review of its own.
                             errors.Add($"{path}: could not resolve automatically ({exception.Message}).");
                         }
                     }
 
-                    var review = new ReviewItem
+                    var relativeDirectory = Path.GetRelativePath(
+                        sourceRoot,
+                        Path.GetDirectoryName(path) ?? sourceRoot);
+                    var routingContext = new ScanRoutingContext
                     {
-                        Id = Guid.NewGuid(),
-                        Category = category,
-                        Status = ReviewStatus.Pending,
-                        IncomingOriginalPath = path,
-                        HeldFilePath = path,
-                        IncomingFingerprint = fingerprint.ExactIdentity,
-                        IncomingImageFingerprint = fingerprint,
-                        IndexGeneration = index.Generation,
-                        CreatedUtc = _timeProvider.GetUtcNow(),
-                        RoutingContext = routingContext,
-                        Candidates = matches.Select(
-                                match =>
-                                {
-                                    var indexed = comparable[match.CandidateKey];
-                                    return new ReviewCandidate
-                                    {
-                                        Id = Guid.NewGuid(),
-                                        IndexedImageId = indexed.Id,
-                                        ArchivePath = indexed.Path,
-                                        ExpectedFingerprint = indexed.ExactFingerprint,
-                                        MatchKind = match.MatchKind,
-                                        SimilarityScore = match.SimilarityScore,
-                                        MatchReasons = match.MatchReasons.ToList(),
-                                    };
-                                })
-                            .ToList(),
+                        SourceRootPath = sourceRoot,
+                        RelativeDirectory = relativeDirectory == "." ? string.Empty : relativeDirectory,
+                        OutputRootPath = initial.Settings.OutputRootPath,
                     };
-                    await _router.QueueForReviewAsync(review, cancellationToken).ConfigureAwait(false);
-                    var best = review.Candidates.OrderByDescending(candidate => candidate.SimilarityScore).First();
-                    if (duplicate is null && thresholds is not null
-                        && best.SimilarityScore >= thresholds.MaximumPercent / 100)
+                    var current = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+                    var index = current.ArchiveIndex.Categories.Single(item => item.Category == category);
+                    if (index.Status != IndexStatus.Current)
                     {
-                        try
+                        errors.Add($"{path}: archive index became stale; rescan required.");
+                        outcome = "Archive index went stale";
+                        continue;
+                    }
+
+                    // Rebuilt only when the index has actually moved on. Reading every archived
+                    // fingerprint back for every incoming image is what made a large archive crawl.
+                    if (candidateGeneration != index.Generation)
+                    {
+                        indexedCandidates = index.Images
+                            .Where(item => item.Fingerprint is not null)
+                            .Select(item => new ImageCandidate(item.Id.ToString("N"), item.Fingerprint!))
+                            .ToArray();
+                        indexedByKey = index.Images.ToDictionary(
+                            item => item.Id.ToString("N"),
+                            item => item,
+                            StringComparer.Ordinal);
+                        candidateGeneration = index.Generation;
+                    }
+
+                    // Everything this incoming image may be compared against. Normally that is the
+                    // index alone, and the cached view above is used exactly as it stands. A ready-made
+                    // GIF is also compared against the animation the archive's own sheet produces -
+                    // generated now if it has never been made - and that companion belongs to this one
+                    // file, so it goes into a copy rather than into the cache every other image reads.
+                    var comparable = indexedByKey;
+                    var candidates = indexedCandidates;
+                    if (AtlasAnimationWriter.IsAnimation(path))
+                    {
+                        var companion = await BuildCompanionAnimationAsync(
+                                index,
+                                path,
+                                mapping.ArchivePath,
+                                errors,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        if (companion is not null)
                         {
-                            // Reuse verified, journaled review routing. Non-identical copies
-                            // must remain recoverable even when their score rounds to 100%.
-                            await _router.KeepMatchAsync(review, best, cancellationToken).ConfigureAwait(false);
-                            autoKept++;
-                            outcome = "Similarity limit reached; incoming recycled and archived copy kept";
-                            continue;
-                        }
-                        catch (Exception exception) when (exception is NotSupportedException
-                            or InvalidOperationException or IOException or UnauthorizedAccessException)
-                        {
-                            errors.Add($"{path}: automatic recycling unavailable or failed; check review/recovery ({exception.Message}).");
+                            var companionKey = companion.Id.ToString("N");
+                            comparable = new Dictionary<string, IndexedImageRecord>(
+                                indexedByKey,
+                                StringComparer.Ordinal)
+                            {
+                                [companionKey] = companion,
+                            };
+                            if (companion.Fingerprint is not null)
+                            {
+                                candidates =
+                                    [.. indexedCandidates, new ImageCandidate(companionKey, companion.Fingerprint)];
+                            }
                         }
                     }
-                    queuedPaths.Add(path);
-                    heldByIdentity.TryAdd(fingerprint.ExactIdentity, new HeldImage(path, fingerprint));
-                    held++;
-                    outcome = "Queued for review";
-                    continue;
-                }
 
-                var beforeMove = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
-                var freshIndex = beforeMove.ArchiveIndex.Categories.Single(item => item.Category == category);
-                if (freshIndex.Status != IndexStatus.Current || freshIndex.Generation != index.Generation)
-                {
-                    errors.Add($"{path}: index generation changed before routing; retry required.");
-                    outcome = "Index changed; retry needed";
-                    continue;
-                }
-
-                var route = await _router.MoveUniqueAsync(
-                        path,
-                        category,
+                    var thresholds = current.Settings.CustomSimilarityThresholds;
+                    thresholds?.Validate();
+                    var matches = ImageMatcher.RankCandidates(
                         fingerprint,
-                        routingContext,
-                        cancellationToken: cancellationToken)
-                    .ConfigureAwait(false);
-                moved++;
-                outcome = "Archived as unique";
+                        candidates,
+                        current.Settings.SimilarityProfile,
+                        thresholds?.MinimumPercent / 100);
 
-                // VRChat writes the frame count, rate and loop direction into the name of an
-                // animated emoji, so a sheet identifies itself and needs no detection. The image
-                // is already archived safely by this point, so a failure to animate it is a
-                // warning on the scan rather than a failure of the image.
-                if (route.DestinationPath is { } archivedPath)
-                {
-                    // An animation may already be sitting there - VRCX hands over ready-made GIFs
-                    // for some emoji, and one that arrived earlier is archived under exactly the
-                    // name this sheet's export would take. Writing over it would destroy an
-                    // archived file and leave the index describing pixels that no longer exist, so
-                    // the existing animation is adopted instead. Re-exporting from the Animations
-                    // tab still overwrites, because there a person has asked for it.
-                    var animation = await AnimateOrAdoptAsync(
-                            archivedPath,
-                            mapping.ArchivePath,
-                            cancellationToken)
+                    // VRChat hands over its own ready-made GIF for an emoji this app has already
+                    // animated. The two are the same animation encoded twice, so they are not the same
+                    // bytes and their score can land under any threshold - and the copy was then filed
+                    // as a brand new image, which is where a folder full of "x" beside "x (2)" came
+                    // from. Being the same emoji, with the same frame count, rate and loop direction in
+                    // its name, is not a resemblance to be scored: it is VRChat's own metadata about
+                    // its own inventory item. So it always earns a review card, however the score came
+                    // out. It never resolves one: discarding a file still needs the decoded content to
+                    // match exactly, and these do not.
+                    matches = WithSameEmojiAnimations(matches, comparable, path, fingerprint);
+
+                    if (matches.Count > 0)
+                    {
+                        // Exact identity permits the existing permanent-removal fallback. Custom
+                        // score-based decisions below use recycling only, never that fallback.
+                        IndexedImageRecord? duplicate = null;
+                        foreach (var match in matches)
+                        {
+                            var indexed = comparable[match.CandidateKey];
+                            if (indexed.Fingerprint is not null
+                                && ImageMatcher.IsSamePicture(match, fingerprint, indexed.Fingerprint))
+                            {
+                                duplicate = indexed;
+                                break;
+                            }
+                        }
+
+                        if (duplicate is not null)
+                        {
+                            try
+                            {
+                                await _router.AutoKeepArchivedAsync(
+                                        path,
+                                        category,
+                                        fingerprint,
+                                        duplicate.Path,
+                                        duplicate.ExactFingerprint,
+                                        cancellationToken)
+                                    .ConfigureAwait(false);
+                                autoKept++;
+                                outcome = "Exact duplicate resolved; archived copy kept";
+                                continue;
+                            }
+                            catch (Exception exception) when (
+                                exception is NotSupportedException
+                                    or InvalidOperationException
+                                    or IOException
+                                    or UnauthorizedAccessException)
+                            {
+                                // A copy changed or removal failed. Keep the incoming file in review.
+                                errors.Add($"{path}: could not resolve automatically ({exception.Message}).");
+                            }
+                        }
+
+                        var review = new ReviewItem
+                        {
+                            Id = Guid.NewGuid(),
+                            Category = category,
+                            Status = ReviewStatus.Pending,
+                            IncomingOriginalPath = path,
+                            HeldFilePath = path,
+                            IncomingFingerprint = fingerprint.ExactIdentity,
+                            IncomingImageFingerprint = fingerprint,
+                            IndexGeneration = index.Generation,
+                            CreatedUtc = _timeProvider.GetUtcNow(),
+                            RoutingContext = routingContext,
+                            Candidates = matches.Select(
+                                    match =>
+                                    {
+                                        var indexed = comparable[match.CandidateKey];
+                                        return new ReviewCandidate
+                                        {
+                                            Id = Guid.NewGuid(),
+                                            IndexedImageId = indexed.Id,
+                                            ArchivePath = indexed.Path,
+                                            ExpectedFingerprint = indexed.ExactFingerprint,
+                                            MatchKind = match.MatchKind,
+                                            SimilarityScore = match.SimilarityScore,
+                                            MatchReasons = match.MatchReasons.ToList(),
+                                        };
+                                    })
+                                .ToList(),
+                        };
+                        await _router.QueueForReviewAsync(review, cancellationToken).ConfigureAwait(false);
+                        var best = review.Candidates.OrderByDescending(candidate => candidate.SimilarityScore).First();
+                        if (duplicate is null && thresholds is not null
+                            && best.SimilarityScore >= thresholds.MaximumPercent / 100)
+                        {
+                            try
+                            {
+                                // Reuse verified, journaled review routing. Non-identical copies
+                                // must remain recoverable even when their score rounds to 100%.
+                                await _router.KeepMatchAsync(review, best, cancellationToken).ConfigureAwait(false);
+                                autoKept++;
+                                outcome = "Similarity limit reached; incoming recycled and archived copy kept";
+                                continue;
+                            }
+                            catch (Exception exception) when (exception is NotSupportedException
+                                or InvalidOperationException or IOException or UnauthorizedAccessException)
+                            {
+                                errors.Add($"{path}: automatic recycling unavailable or failed; check review/recovery ({exception.Message}).");
+                            }
+                        }
+                        queuedPaths.Add(path);
+                        heldByIdentity.TryAdd(fingerprint.ExactIdentity, new HeldImage(path, fingerprint));
+                        held++;
+                        outcome = "Queued for review";
+                        continue;
+                    }
+
+                    var beforeMove = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+                    var freshIndex = beforeMove.ArchiveIndex.Categories.Single(item => item.Category == category);
+                    if (freshIndex.Status != IndexStatus.Current || freshIndex.Generation != index.Generation)
+                    {
+                        errors.Add($"{path}: index generation changed before routing; retry required.");
+                        outcome = "Index changed; retry needed";
+                        continue;
+                    }
+
+                    var route = await _router.MoveUniqueAsync(
+                            path,
+                            category,
+                            fingerprint,
+                            routingContext,
+                            cancellationToken: cancellationToken)
                         .ConfigureAwait(false);
-                    if (animation.Exported)
-                    {
-                        animated++;
-                        outcome = "Archived as unique, animated";
+                    moved++;
+                    outcome = "Archived as unique";
 
-                        // Said out loud rather than swallowed. The sheet was animated to its name
-                        // and then filed away as finished, so the history is the only place a
-                        // person would ever hear what the export made of it.
-                        if (animation.Note is { } exportNote)
-                        {
-                            notes.Add($"{archivedPath}: {exportNote}");
-                        }
-
-                        // The sheet has served its purpose as a still, so it is filed with the
-                        // animation rather than left among the images a person browses. Only a
-                        // sheet that actually produced a GIF moves: one still waiting on review is
-                        // unfinished work and stays where it can be seen.
-                        if (route.IndexedImageId is { } indexedSheetId)
-                        {
-                            _ = await FileAnimatedSheetAsync(
-                                    indexedSheetId,
-                                    archivedPath,
-                                    category,
-                                    fingerprint,
-                                    mapping.ArchivePath,
-                                    errors,
-                                    cancellationToken)
-                                .ConfigureAwait(false);
-                        }
-                    }
-                    else if (animation.Warning is { } warning)
+                    // VRChat writes the frame count, rate and loop direction into the name of an
+                    // animated emoji, so a sheet identifies itself and needs no detection. The image
+                    // is already archived safely by this point, so a failure to animate it is a
+                    // warning on the scan rather than a failure of the image.
+                    if (route.DestinationPath is { } archivedPath)
                     {
-                        errors.Add($"{archivedPath}: {warning}");
+                        // An animation may already be sitting there - VRCX hands over ready-made GIFs
+                        // for some emoji, and one that arrived earlier is archived under exactly the
+                        // name this sheet's export would take. Writing over it would destroy an
+                        // archived file and leave the index describing pixels that no longer exist, so
+                        // the existing animation is adopted instead. Re-exporting from the Animations
+                        // tab still overwrites, because there a person has asked for it.
+                        var animation = await AnimateOrAdoptAsync(
+                                archivedPath,
+                                mapping.ArchivePath,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        if (animation.Exported)
+                        {
+                            animated++;
+                            outcome = "Archived as unique, animated";
+
+                            // Said out loud rather than swallowed. The sheet was animated to its name
+                            // and then filed away as finished, so the history is the only place a
+                            // person would ever hear what the export made of it.
+                            if (animation.Note is { } exportNote)
+                            {
+                                notes.Add($"{archivedPath}: {exportNote}");
+                            }
+
+                            // The sheet has served its purpose as a still, so it is filed with the
+                            // animation rather than left among the images a person browses. Only a
+                            // sheet that actually produced a GIF moves: one still waiting on review is
+                            // unfinished work and stays where it can be seen.
+                            if (route.IndexedImageId is { } indexedSheetId)
+                            {
+                                _ = await FileAnimatedSheetAsync(
+                                        indexedSheetId,
+                                        archivedPath,
+                                        category,
+                                        fingerprint,
+                                        mapping.ArchivePath,
+                                        errors,
+                                        cancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+                        }
+                        else if (animation.Warning is { } warning)
+                        {
+                            errors.Add($"{archivedPath}: {warning}");
+                        }
                     }
                 }
-            }
-            catch (Exception exception) when (
-                exception is IOException
-                    or UnauthorizedAccessException
-                    or InvalidDataException
-                    or InvalidOperationException
-                    or NotSupportedException)
-            {
-                errors.Add($"{path}: {exception.Message}");
-                outcome = "Failed";
-            }
-            finally
-            {
-                if (!readingReported)
+                catch (Exception exception) when (
+                    exception is IOException
+                        or UnauthorizedAccessException
+                        or InvalidDataException
+                        or InvalidOperationException
+                        or NotSupportedException)
                 {
-                    onImageScanned?.Invoke("Reading", fileName);
+                    errors.Add($"{path}: {exception.Message}");
+                    outcome = "Failed";
                 }
+                finally
+                {
+                    if (!readingReported)
+                    {
+                        onImageScanned?.Invoke("Reading", fileName);
+                    }
 
-                onImageProcessed?.Invoke(outcome, fileName);
+                    onImageProcessed?.Invoke(outcome, fileName);
+                }
             }
+
         }
+        finally
+        {
+            // Drain readers before releasing the scan gate or disposing their semaphores.
+            // A stopped scan must not leave workers overlapping the next scan.
+            readCancellation.Cancel();
+            await Task.WhenAll(inFlight.Values).ConfigureAwait(false);
+        }
+
+        await workerSession.FinishAsync(cancellationToken).ConfigureAwait(false);
 
         await _stateStore.UpdateAsync(
                 state =>
@@ -1830,49 +1838,11 @@ public sealed partial class ScanCoordinator
     /// </summary>
     private async Task<PreparedImage> PrepareImageAsync(
         string path,
-        SemaphoreSlim readSlots,
-        SemaphoreSlim largeReadSlot,
         CancellationToken cancellationToken)
     {
-        var isLarge = false;
         try
         {
-            isLarge = new FileInfo(path).Length > LargeEncodedBytes;
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            // The read below reports the failure properly.
-        }
-
-        try
-        {
-            if (isLarge)
-            {
-                await largeReadSlot.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            try
-            {
-                await readSlots.WaitAsync(cancellationToken).ConfigureAwait(false);
-                try
-                {
-                    var decoded = await _decoder.DecodeAsync(path, cancellationToken).ConfigureAwait(false);
-                    return decoded.IsSuccess
-                        ? new PreparedImage(ImageFingerprint.Create(decoded.Image!), null)
-                        : new PreparedImage(null, decoded.Failure!.Message);
-                }
-                finally
-                {
-                    readSlots.Release();
-                }
-            }
-            finally
-            {
-                if (isLarge)
-                {
-                    largeReadSlot.Release();
-                }
-            }
+            return new PreparedImage(await Concurrency.ReadAsync(path, cancellationToken).ConfigureAwait(false), null);
         }
         catch (OperationCanceledException)
         {
@@ -1883,7 +1853,9 @@ public sealed partial class ScanCoordinator
                 or UnauthorizedAccessException
                 or InvalidDataException
                 or NotSupportedException
-                or InvalidOperationException)
+                or InvalidOperationException
+                or SixLabors.ImageSharp.UnknownImageFormatException
+                or SixLabors.ImageSharp.ImageFormatException)
         {
             return new PreparedImage(null, exception.Message);
         }

@@ -30,6 +30,7 @@ public sealed class ArchiveIndexer
     private readonly JsonStateStore _stateStore;
     private readonly ImageDecoder _decoder;
     private readonly TimeProvider _timeProvider;
+    public ScanConcurrencyController Concurrency { get; }
 
     public ArchiveIndexer(
         JsonStateStore stateStore,
@@ -39,6 +40,7 @@ public sealed class ArchiveIndexer
         _stateStore = stateStore ?? throw new ArgumentNullException(nameof(stateStore));
         _decoder = decoder ?? throw new ArgumentNullException(nameof(decoder));
         _timeProvider = timeProvider ?? TimeProvider.System;
+        Concurrency = new ScanConcurrencyController(stateStore, decoder);
     }
 
     public Task<ArchiveIndexResult> RefreshAsync(
@@ -118,60 +120,65 @@ public sealed class ArchiveIndexer
                 []);
         }
 
-        foreach (var path in paths)
+        await Concurrency.PrepareAsync(state.Settings, paths, null, cancellationToken).ConfigureAwait(false);
+        var session = await Concurrency.StartAsync("Archive", cancellationToken).ConfigureAwait(false);
+        using var readers = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var pending = new Queue<Task<(IndexedImageRecord? Record, string? Error)>>();
+        using var iterator = paths.GetEnumerator();
+        var exhausted = false;
+        async Task<(IndexedImageRecord? Record, string? Error)> PrepareRecord(string path)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            // The list of paths was taken before any of this decoding started, and on a large
-            // archive that is minutes ago. A file deleted or locked in between - by the user, or by
-            // OneDrive moving it - used to throw straight out of here and disable the whole
-            // category. It is skipped like any other unreadable file instead.
-            FileInfo info;
             try
             {
-                info = new FileInfo(path);
-                _ = info.Length;
+                readers.Token.ThrowIfCancellationRequested();
+                var info = new FileInfo(path);
+                var length = info.Length; var written = info.LastWriteTimeUtc;
+                if (reuseUnchanged && previousRecords.TryGetValue(path, out var previous)
+                    && previous.Fingerprint!.HasCurrentFeatures && previous.FileSize == length && previous.LastWriteUtc == written)
+                    return (previous, null);
+                var fingerprint = await Concurrency.ReadAsync(path, readers.Token).ConfigureAwait(false);
+                var after = new FileInfo(path);
+                if (length != after.Length || written != after.LastWriteTimeUtc)
+                    throw new IOException("Image changed during indexing; retry required.");
+                previousRecords.TryGetValue(path, out var priorRecord);
+                return (new IndexedImageRecord
+                {
+                    Id = priorRecord?.Id ?? Guid.NewGuid(),
+                    Category = category,
+                    Path = path,
+                    FileSize = length,
+                    LastWriteUtc = written,
+                    Width = fingerprint.Width,
+                    Height = fingerprint.Height,
+                    ExactFingerprint = fingerprint.ExactIdentity,
+                    PerceptualFingerprint = fingerprint.PerceptualFrames[0].DifferenceHash,
+                    Fingerprint = fingerprint,
+                }, null);
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            catch (Exception error) when (ScanConcurrencyController.IsReadFailure(error))
             {
-                skipped.Add($"{path}: {exception.Message}");
-                continue;
+                return (null, $"{path}: {error.Message}");
             }
-
-            if (reuseUnchanged
-                && previousRecords.TryGetValue(path, out var previous)
-                && previous.Fingerprint!.HasCurrentFeatures
-                && previous.FileSize == info.Length
-                && previous.LastWriteUtc == info.LastWriteTimeUtc)
-            {
-                indexed.Add(previous);
-                continue;
-            }
-
-            var decoded = await _decoder.DecodeAsync(path, cancellationToken).ConfigureAwait(false);
-            if (!decoded.IsSuccess)
-            {
-                // Incomplete duplicate coverage cannot establish that incoming media is unique.
-                skipped.Add($"{path}: {decoded.Failure!.Message}");
-                continue;
-            }
-
-            var fingerprint = ImageFingerprint.Create(decoded.Image!);
-            previousRecords.TryGetValue(path, out var priorRecord);
-            indexed.Add(new IndexedImageRecord
-            {
-                Id = priorRecord?.Id ?? Guid.NewGuid(),
-                Category = category,
-                Path = path,
-                FileSize = info.Length,
-                LastWriteUtc = info.LastWriteTimeUtc,
-                Width = fingerprint.Width,
-                Height = fingerprint.Height,
-                ExactFingerprint = fingerprint.ExactIdentity,
-                PerceptualFingerprint = fingerprint.PerceptualFrames[0].DifferenceHash,
-                Fingerprint = fingerprint,
-            });
         }
+        try
+        {
+            while (!exhausted || pending.Count > 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                while (!exhausted && pending.Count < session.Workers)
+                {
+                    exhausted = !iterator.MoveNext();
+                    if (!exhausted) { var path = iterator.Current; pending.Enqueue(Task.Run(() => PrepareRecord(path))); }
+                }
+                if (pending.Count == 0) break;
+                var prepared = await pending.Dequeue().ConfigureAwait(false);
+                session.Completed(prepared.Error is null, !exhausted);
+                if (prepared.Record is not null) indexed.Add(prepared.Record);
+                else skipped.Add(prepared.Error!);
+            }
+        }
+        finally { readers.Cancel(); await Task.WhenAll(pending).ConfigureAwait(false); }
+        await session.FinishAsync(cancellationToken).ConfigureAwait(false);
 
         if (skipped.Count > 0)
         {
