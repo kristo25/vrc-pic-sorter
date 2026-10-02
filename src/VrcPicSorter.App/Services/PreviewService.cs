@@ -20,6 +20,7 @@ public sealed class PreviewService : IDisposable
     private static readonly DecoderOptions BoundedOptions = new() { MaxFrames = ImageResourceLimits.MaximumFrames };
 
     private readonly Dictionary<System.Windows.Controls.Image, PreviewAnimation> _animations = [];
+    private readonly SemaphoreSlim _thumbnailGate = new(1, 1);
 
     /// <summary>
     /// Which load each control is waiting for, so a load that finishes after the control moved on
@@ -40,7 +41,7 @@ public sealed class PreviewService : IDisposable
             ImageResourceLimits.EnsureEncodedSizeSafe(path);
             var info = SixLabors.ImageSharp.Image.Identify(path);
             ImageResourceLimits.EnsureSafe(info.Width, info.Height, Math.Max(1, info.FrameMetadataCollection.Count));
-            using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(BoundedOptions, path);
+            using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(new DecoderOptions { MaxFrames = 1 }, path);
             image.Mutate(context => context.AutoOrient());
             if (image.Width > decodeWidth)
             {
@@ -65,7 +66,8 @@ public sealed class PreviewService : IDisposable
     public async Task ShowAsync(
         System.Windows.Controls.Image target,
         string? path,
-        int decodeWidth = 960)
+        int decodeWidth = 960,
+        bool animate = true)
     {
         ArgumentNullException.ThrowIfNull(target);
         Stop(target);
@@ -80,9 +82,16 @@ public sealed class PreviewService : IDisposable
         // swap red and blue. On the UI thread a single 4K screenshot stopped the window repainting
         // for the whole of that, twice per queue selection. The BitmapSource it returns is frozen,
         // so it is free to cross back.
-        if (!Path.GetExtension(path).Equals(".gif", StringComparison.OrdinalIgnoreCase))
+        if (!animate || !Path.GetExtension(path).Equals(".gif", StringComparison.OrdinalIgnoreCase))
         {
-            var still = await Task.Run(() => Load(path, decodeWidth));
+            BitmapSource? still;
+            await _thumbnailGate.WaitAsync();
+            try
+            {
+                if (CurrentVersion(target) != version) return;
+                still = await Task.Run(() => Load(path, decodeWidth));
+            }
+            finally { _thumbnailGate.Release(); }
             if (CurrentVersion(target) != version)
             {
                 return;

@@ -97,6 +97,11 @@ public sealed partial class ScanCoordinator
         foreach (var category in categories.Distinct())
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (state.ReviewDecisions.Any(g => g.Category == category))
+            {
+                warnings.Add($"{category}: finish the pending group decision before automatic cleanup.");
+                continue;
+            }
             var mapping = state.Settings.CategoryMappings.Single(item => item.Category == category);
             var roots = state.Settings.LegacyArchiveMappings
                 .Where(item => item.Category == category)
@@ -131,12 +136,14 @@ public sealed partial class ScanCoordinator
         var removed = 0;
         foreach (var group in groups)
         {
-            foreach (var extra in group.Extras)
+            var members = group.Extras.Prepend(group.Keep).ToArray();
+            var survivor = members.FirstOrDefault(image => ManualKeepRules.IsProtected(state, image)) ?? group.Keep;
+            foreach (var extra in members.Where(image => image != survivor && !ManualKeepRules.IsProtected(state, image)))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
-                    await _router.RemoveArchivedDuplicateAsync(extra, group.Keep, cancellationToken)
+                    await _router.RemoveArchivedDuplicateAsync(extra, survivor, cancellationToken)
                         .ConfigureAwait(false);
                     removed++;
                 }

@@ -19,6 +19,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="VrcPicSorter.Tests" />
     <ProjectReference Include="..\VrcPicSorter.Core\VrcPicSorter.Core.csproj" />
   </ItemGroup>
 

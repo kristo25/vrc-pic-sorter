@@ -17,7 +17,7 @@ public sealed record ReviewRestoreResult(
     int Restored,
     IReadOnlyList<string> Failures);
 
-public sealed class FileRouter
+public sealed partial class FileRouter
 {
     private readonly JsonStateStore _stateStore;
     private readonly OperationJournal _journal;
@@ -500,10 +500,18 @@ public sealed class FileRouter
         ReviewItem reviewItem,
         CancellationToken cancellationToken = default)
     {
+        await _groupGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { return await RestoreReviewCoreAsync(reviewItem, cancellationToken).ConfigureAwait(false); }
+        finally { _groupGate.Release(); }
+    }
+
+    private async Task<FileRouteResult> RestoreReviewCoreAsync(ReviewItem reviewItem, CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(reviewItem);
+        EnsureReviewCanBeDismissed(await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false), reviewItem.Id);
         if (reviewItem.IsIncomingInPlace)
         {
-            await DismissReviewAsync(reviewItem.Id, cancellationToken).ConfigureAwait(false);
+            await DismissReviewCoreAsync(reviewItem.Id, cancellationToken).ConfigureAwait(false);
             return new FileRouteResult(Guid.Empty, reviewItem.IncomingOriginalPath);
         }
 
@@ -533,8 +541,18 @@ public sealed class FileRouter
         IProgress<ReviewRestoreProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        await _groupGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { return await RestoreReviewsCoreAsync(reviews, progress, cancellationToken).ConfigureAwait(false); }
+        finally { _groupGate.Release(); }
+    }
+
+    private async Task<ReviewRestoreResult> RestoreReviewsCoreAsync(IReadOnlyCollection<ReviewItem> reviews,
+        IProgress<ReviewRestoreProgress>? progress, CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(reviews);
         var pending = reviews.ToArray();
+        var stateBeforeRestore = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var review in pending) EnsureReviewCanBeDismissed(stateBeforeRestore, review.Id);
         var failures = new List<string>();
         var processed = 0;
         var restored = 0;
@@ -593,7 +611,7 @@ public sealed class FileRouter
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                await RestoreReviewAsync(review, cancellationToken).ConfigureAwait(false);
+                await RestoreReviewCoreAsync(review, cancellationToken).ConfigureAwait(false);
                 restored++;
             }
             catch (Exception exception) when (
@@ -614,7 +632,14 @@ public sealed class FileRouter
         return new ReviewRestoreResult(pending.Length, restored, failures);
     }
 
-    public Task DismissReviewAsync(Guid reviewItemId, CancellationToken cancellationToken = default)
+    public async Task DismissReviewAsync(Guid reviewItemId, CancellationToken cancellationToken = default)
+    {
+        await _groupGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { await DismissReviewCoreAsync(reviewItemId, cancellationToken).ConfigureAwait(false); }
+        finally { _groupGate.Release(); }
+    }
+
+    private Task DismissReviewCoreAsync(Guid reviewItemId, CancellationToken cancellationToken)
     {
         if (reviewItemId == Guid.Empty)
         {
@@ -624,6 +649,7 @@ public sealed class FileRouter
         return _stateStore.UpdateAsync(
             state =>
             {
+                EnsureReviewCanBeDismissed(state, reviewItemId);
                 var review = state.ReviewQueue.SingleOrDefault(item => item.Id == reviewItemId);
                 if (review is null)
                 {
@@ -935,7 +961,7 @@ public sealed class FileRouter
             state =>
             {
                 var entries = state.OperationJournal
-                    .Where(item => item.Phase == JournalPhase.NeedsAttention)
+                    .Where(item => item.Phase == JournalPhase.NeedsAttention && item.GroupDecisionId is null)
                     .ToArray();
                 foreach (var entry in entries)
                 {
@@ -989,6 +1015,8 @@ public sealed class FileRouter
         // intermediate phases were only reachable in the window this removes: a crash after the
         // side effect still leaves SideEffectStarted, which reconciliation resolves correctly
         // from what is actually on disk.
+        if (entry.GroupDecisionId is not null)
+            await RestoreCarriedFingerprintAsync(entry, cancellationToken).ConfigureAwait(false);
         await CommitMutationAsync(entry, cancellationToken).ConfigureAwait(false);
         return new FileRouteResult(entry.Id, entry.DestinationPath, entry.IndexedImageAfterCommit?.Id);
     }
@@ -1011,6 +1039,16 @@ public sealed class FileRouter
 
     private async Task ApplySideEffectAsync(JournalEntry entry, CancellationToken cancellationToken)
     {
+        await VerifyGroupBeforeEffectAsync(entry, cancellationToken).ConfigureAwait(false);
+        if (entry.OperationType is JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming
+            && entry.Purpose is JournalOperationPurpose.RemoveArchiveDuplicate or JournalOperationPurpose.AutoKeepArchived or JournalOperationPurpose.AutoKeepHeld)
+        {
+            var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+            var info = new FileInfo(entry.SourcePath);
+            if (state.ManualKeeps.Any(p => PathsMatch(p.Path, entry.SourcePath)
+                && p.Fingerprint == entry.ExpectedSource.Fingerprint && p.FileSize == info.Length && p.LastWriteUtc == info.LastWriteTimeUtc))
+                throw new InvalidOperationException("This copy was explicitly kept and cannot be removed automatically.");
+        }
         if (entry.OperationType == JournalOperationType.DeleteExactIncoming)
         {
             if (entry.Purpose != JournalOperationPurpose.AutoKeepArchived
@@ -1130,6 +1168,13 @@ public sealed class FileRouter
 
     private static void ApplyMutation(AppStateDocument state, JournalEntry entry)
     {
+        if (entry.GroupDecisionId is not null)
+        {
+            ApplyGroupMutation(state, entry);
+            return;
+        }
+        if (entry.OperationType == JournalOperationType.Move && entry.DestinationPath is not null)
+            ManualKeepRules.Repoint(state, entry.SourcePath, entry.DestinationPath);
         var index = state.ArchiveIndex.Categories.Single(item => item.Category == entry.Category);
         switch (entry.Purpose)
         {

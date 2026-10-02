@@ -11,6 +11,26 @@ namespace VrcPicSorter.Tests.Storage;
 public sealed class JsonStateStoreTests
 {
     [Fact]
+    public async Task VersionFiveMigrationPreservesSidecarAndDefaultsManualDecisions()
+    {
+        using var directory = new TestDirectory();
+        var (seed, fingerprint, recordId) = SeedWithIndexedImage(directory);
+        using var store = new JsonStateStore(directory.GetPath("state"), () => seed);
+        await store.LoadAsync();
+        var sidecar = await File.ReadAllTextAsync(store.FingerprintPath);
+        var node = JsonNode.Parse(await File.ReadAllTextAsync(store.StatePath))!.AsObject();
+        node["schemaVersion"] = 5;
+        node.Remove("manualKeeps"); node.Remove("reviewDecisions"); node.Remove("suppressedAnimations");
+        await File.WriteAllTextAsync(store.StatePath, node.ToJsonString());
+        using var reopened = new JsonStateStore(store.StateDirectory, () => seed);
+        var loaded = await reopened.LoadAsync();
+        Assert.Equal(AppStateDocument.CurrentSchemaVersion, loaded.SchemaVersion);
+        Assert.Empty(loaded.ManualKeeps); Assert.Empty(loaded.ReviewDecisions); Assert.Empty(loaded.SuppressedAnimations);
+        Assert.Equal(fingerprint.ExactIdentity, loaded.ArchiveIndex.Categories.SelectMany(c => c.Images).Single(i => i.Id == recordId).Fingerprint!.ExactIdentity);
+        Assert.Equal(sidecar, await File.ReadAllTextAsync(store.FingerprintPath));
+    }
+
+    [Fact]
     public async Task CorruptStateIsQuarantinedAndDefaultsRemainUsable()
     {
         using var directory = new TestDirectory();

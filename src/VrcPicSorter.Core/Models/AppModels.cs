@@ -117,6 +117,8 @@ public enum JournalOperationPurpose
     /// index by this point, so the commit moves the record rather than adding one.
     /// </summary>
     FileAnimatedSheet,
+    GroupArchiveIncoming,
+    GroupRecycleFile,
 }
 
 public enum JournalPhase
@@ -131,7 +133,7 @@ public enum JournalPhase
 
 public sealed class AppStateDocument
 {
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 6;
 
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
 
@@ -154,6 +156,9 @@ public sealed class AppStateDocument
     public List<string> SkippedAnimations { get; set; } = [];
 
     public List<JournalEntry> OperationJournal { get; set; } = [];
+    public List<ReviewGroupDecision> ReviewDecisions { get; set; } = [];
+    public List<ManualKeepProtection> ManualKeeps { get; set; } = [];
+    public List<string> SuppressedAnimations { get; set; } = [];
 
     public List<ActivityEntry> History { get; set; } = [];
 }
@@ -403,6 +408,7 @@ public sealed class ExpectedFileIdentity
 
 public sealed class JournalEntry
 {
+    public Guid? GroupDecisionId { get; set; }
     public Guid Id { get; set; }
 
     public JournalOperationType OperationType { get; set; }
@@ -564,6 +570,9 @@ public static class AppStateValidator
         ArgumentNullException.ThrowIfNull(state.ArchiveIndex.Categories);
         ArgumentNullException.ThrowIfNull(state.ReviewQueue);
         ArgumentNullException.ThrowIfNull(state.OperationJournal);
+        ArgumentNullException.ThrowIfNull(state.ReviewDecisions);
+        ArgumentNullException.ThrowIfNull(state.ManualKeeps);
+        ArgumentNullException.ThrowIfNull(state.SuppressedAnimations);
         ArgumentNullException.ThrowIfNull(state.History);
 
         ValidateFixedCategories(
@@ -618,7 +627,7 @@ public static class AppStateMigrator
             return false;
         }
 
-        if (state.SchemaVersion == 4)
+        if (state.SchemaVersion is 4 or 5)
         {
             // Fingerprints moved out of the state document. The store lifts them into the
             // sidecar before this runs, so nothing needs rebuilding here.

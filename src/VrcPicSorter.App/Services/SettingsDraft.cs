@@ -123,6 +123,13 @@ public sealed record SettingsDraft(
             outputRoot,
             StringComparison.OrdinalIgnoreCase);
 
+        if (state.ReviewDecisions.Count > 0 && (rootChanged
+            || OrganizationPolicy != state.Settings.OrganizationPolicy
+            || Categories.Any(draft => !state.Settings.CategoryMappings.Any(mapping =>
+                mapping.Category == draft.Category
+                && string.Equals(mapping.SourcePath, draft.SourcePath, StringComparison.OrdinalIgnoreCase)))))
+            throw new InvalidOperationException("Finish the pending review decision with Retry remaining before changing folders or archive organization.");
+
         if (rootChanged)
         {
             state.Settings.OutputFolderRevision++;

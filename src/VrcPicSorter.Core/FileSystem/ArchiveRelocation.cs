@@ -16,7 +16,12 @@ public sealed record ArchiveRelocationStep(
 /// The unit everything downstream works from. A plan describes what was hoped for; this describes
 /// what happened, one file at a time, which is the only thing an index may be rewritten from.
 /// </remarks>
-public sealed record ArchiveRelocationMove(VrcImageCategory Category, string From, string To);
+public sealed record ArchiveRelocationMove(VrcImageCategory Category, string From, string To)
+{
+    public long? SourceSize { get; init; }
+    public DateTimeOffset? SourceStamp { get; init; }
+    public DateTimeOffset? DestinationStamp { get; init; }
+}
 
 /// <summary>What a relocation managed to do.</summary>
 /// <param name="Moved">Files that reached the new archive.</param>
@@ -198,11 +203,16 @@ public static class ArchiveRelocation
 
                 var relative = Path.GetRelativePath(step.From, file);
                 var destination = Path.Combine(step.To, relative);
+                long? sourceSize = null;
+                DateTimeOffset? sourceStamp = null;
                 try
                 {
                     PathBoundary.EnsureSafeDestination(step.To, destination, "Relocated archive file");
                     PathBoundary.EnsureContained(step.From, file, "Relocation source");
                     PathBoundary.EnsureNoReparsePoints(file, "Relocation source");
+                    var sourceInfo = new FileInfo(file);
+                    sourceSize = sourceInfo.Length;
+                    sourceStamp = sourceInfo.LastWriteTimeUtc;
                     destination = VerifiedArchiveTransfer.Move(file, step.To, destination);
                 }
                 catch (Exception exception) when (
@@ -219,7 +229,11 @@ public static class ArchiveRelocation
                 // A successful move is a completed effect even if the destination goes offline
                 // immediately afterwards. Preserve its receipt before reporting progress.
                 moved++;
-                moves.Add(new ArchiveRelocationMove(step.Category, file, destination));
+                DateTimeOffset? destinationStamp = null;
+                try { destinationStamp = new FileInfo(destination).LastWriteTimeUtc; }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+                moves.Add(new ArchiveRelocationMove(step.Category, file, destination)
+                { SourceSize = sourceSize, SourceStamp = sourceStamp, DestinationStamp = destinationStamp });
                 try
                 {
                     progress?.Report(new ArchiveRelocationProgress(moved, total, Path.GetFileName(file)));
@@ -284,11 +298,26 @@ public static class ArchiveRelocation
             }
 
             landed[NormalizeOrRaw(move.From)] = move.To;
+            if (move.SourceSize is { } size && move.SourceStamp is { } stamp && move.DestinationStamp is { } destinationStamp)
+            {
+                for (var i = 0; i < state.ManualKeeps.Count; i++)
+                {
+                    var keep = state.ManualKeeps[i];
+                    if (string.Equals(NormalizeOrRaw(keep.Path), NormalizeOrRaw(move.From), StringComparison.OrdinalIgnoreCase)
+                        && keep.FileSize == size && keep.LastWriteUtc == stamp)
+                        state.ManualKeeps[i] = keep with { LastWriteUtc = destinationStamp };
+                }
+            }
         }
 
         if (landed.Count == 0)
         {
             return 0;
+        }
+
+        foreach (var (source, destination) in landed)
+        {
+            ManualKeepRules.Repoint(state, source, destination);
         }
 
         var rebased = 0;

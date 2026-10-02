@@ -71,6 +71,7 @@ public partial class MainWindow : Window
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
+        await _runtime.Router.RestorePendingReviewVisibilityAsync();
         var duplicateCleanup = await _runtime.Scanner.CleanArchiveDuplicatesAsync();
         await RefreshAsync(selectFirst: false, refreshSettings: true);
         var state = await _runtime.StateStore.LoadAsync();
@@ -117,7 +118,8 @@ public partial class MainWindow : Window
             .ToArray();
         QueueList.ItemsSource = queue;
         QueueCountText.Text = $"{queue.Length} pending";
-        ClearQueueButton.IsEnabled = !_busy && queue.Length > 0;
+        _anyPendingGroups = state.ReviewDecisions.Count > 0;
+        ClearQueueButton.IsEnabled = !_busy && !_anyPendingGroups && queue.Length > 0;
         HistoryList.ItemsSource = state.History.OrderByDescending(item => item.OccurredUtc).ToArray();
         var pendingOperations = state.OperationJournal.Where(item => item.Phase != JournalPhase.Completed).ToArray();
         var attentionCount = pendingOperations.Count(item => item.Phase == JournalPhase.NeedsAttention);
@@ -241,92 +243,13 @@ public partial class MainWindow : Window
 
     private async void QueueSelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
-        var displayRequest = _reviewDisplayRequests.Begin();
-        var review = SelectedReview;
-        if (review is null)
-        {
-            ShowEmptyReview();
-            return;
-        }
-
-        ReviewTitle.Text = Path.GetFileName(review.IncomingOriginalPath);
-        ReviewTitle.ToolTip = review.IncomingOriginalPath;
-        _validatedIncomingReviewId = review.Id;
-        _validatedIncomingCurrent = false;
-        MoveUniqueButton.IsEnabled = false;
-        CandidateList.IsEnabled = false;
-        RemoveReviewButton.IsEnabled = !_busy;
-        var incomingTiming = review.IncomingImageFingerprint is { FrameCount: > 1 } incoming
-            ? $" | {incoming.FrameCount} frames, {incoming.FrameDelaysMilliseconds.Sum()} ms"
-            : string.Empty;
-        ReviewSubtitle.Text = review.Candidates.Count == 0
-            ? $"{review.Category} | Matches need rechecking{incomingTiming}"
-            : $"{review.Category} | {review.Candidates.Count} possible match(es) | {review.Status}{incomingTiming}";
-        IncomingResolutionText.Text = review.IncomingImageFingerprint is { } incomingFingerprint
-            ? $"{incomingFingerprint.Width} x {incomingFingerprint.Height}"
-            : "Resolution unavailable";
-        IncomingAvailabilityText.Text = "Checking incoming file...";
-        IncomingLocationText.Text = review.IsIncomingInPlace
-            ? $"Incoming file: {review.IncomingOriginalPath}"
-            : $"Original: {review.IncomingOriginalPath}\nLegacy review copy: {review.HeldFilePath}";
-        IncomingLocationText.ToolTip = IncomingLocationText.Text;
-        IncomingLocationText.SetValue(
-            System.Windows.Automation.AutomationProperties.HelpTextProperty,
-            IncomingLocationText.Text);
-        await _previewService.ShowAsync(IncomingPreview, review.HeldFilePath);
-        if (!_reviewDisplayRequests.IsCurrent(displayRequest) || SelectedReview?.Id != review.Id)
-        {
-            return;
-        }
-
-        var incomingCurrent = await IsIncomingCurrentAsync(review);
-        if (!_reviewDisplayRequests.IsCurrent(displayRequest) || SelectedReview?.Id != review.Id)
-        {
-            return;
-        }
-
-        _validatedIncomingReviewId = review.Id;
-        _validatedIncomingCurrent = incomingCurrent;
-        IncomingAvailabilityText.Text = incomingCurrent
-            ? "Incoming file is available and unchanged."
-            : "Incoming file is missing or changed. Remove this item or scan the file again.";
-
-        var state = await _runtime.StateStore.LoadAsync();
-        if (!_reviewDisplayRequests.IsCurrent(displayRequest) || SelectedReview?.Id != review.Id)
-        {
-            return;
-        }
-
-        // Grouped rather than ToDictionary: a duplicate id would otherwise throw from a
-        // selection-changed handler and take the whole page down.
-        var indexed = state.ArchiveIndex.Categories
-            .SelectMany(category => category.Images)
-            .GroupBy(image => image.Id)
-            .ToDictionary(group => group.Key, group => group.First());
-        CandidateList.ItemsSource = review.Candidates.Select(candidate =>
-        {
-            indexed.TryGetValue(candidate.IndexedImageId, out var record);
-            var resolution = record is null
-                ? "Resolution unavailable"
-                : $"{record.Width} x {record.Height}";
-            var timing = record?.Fingerprint is { FrameCount: > 1 } fingerprint
-                ? $" Frames: {fingerprint.FrameCount}; duration: {fingerprint.FrameDelaysMilliseconds.Sum()} ms."
-                : string.Empty;
-            return new CandidatePreviewItem(
-                candidate,
-                $"{candidate.MatchKind} | {candidate.SimilarityScore:P1} similar",
-                resolution,
-                string.Join("  ", candidate.MatchReasons) + timing,
-                candidate.ArchivePath);
-        }).ToArray();
-        CandidateHint.Text = review.Candidates.Count == 0
-            ? "Previous matches were cleared. Scan this file's folder again to compare it with the current archive."
-            : $"{review.Candidates.Count} ranked candidate(s)";
-        UpdateActionAvailability(review);
+        if (!ReferenceEquals(e.Source, QueueList)) return;
+        await LoadGroupReviewAsync();
     }
 
     private void ShowEmptyReview(bool isConfigured = true)
     {
+        ClearGroupReview();
         ReviewTitle.Text = isConfigured ? "Review queue is clear" : "Set up your image folders";
         ReviewTitle.ToolTip = null;
         ReviewSubtitle.Text = isConfigured
@@ -349,17 +272,7 @@ public partial class MainWindow : Window
 
     private void UpdateActionAvailability(ReviewItem review)
     {
-        var incomingCurrent = _validatedIncomingReviewId == review.Id
-            ? _validatedIncomingCurrent
-            : File.Exists(review.HeldFilePath);
-        MoveUniqueButton.IsEnabled = !_busy && incomingCurrent;
-        CandidateList.IsEnabled = !_busy && incomingCurrent;
-        RemoveReviewButton.IsEnabled = !_busy;
-        ClearQueueButton.IsEnabled = !_busy && QueueList.Items.Count > 0;
-        if (!incomingCurrent)
-        {
-            CandidateHint.Text = "The incoming file is missing or changed. Remove this review or scan the file again.";
-        }
+        UpdateGroupAvailability();
     }
 
     private async Task<bool> IsIncomingCurrentAsync(ReviewItem review)
@@ -637,6 +550,11 @@ public partial class MainWindow : Window
             .Where(review => review.Status != ReviewStatus.Resolved)
             .OrderBy(review => review.CreatedUtc)
             .ToArray();
+        if (state.ReviewDecisions.Count > 0)
+        {
+            SetStatus("Retry or cancel remaining review actions before clearing the queue.");
+            return;
+        }
         if (reviews.Length == 0)
         {
             return;
@@ -1008,7 +926,10 @@ public partial class MainWindow : Window
                 ArchiveRelocationResult result = new(0, 0, [], []);
                 await _runtime.Scanner.RunExclusiveAsync(async () =>
                 {
-                    ArchiveRelocation.EnsurePlanMatchesSettings((await _runtime.StateStore.LoadAsync()).Settings, relocation);
+                    var currentState = await _runtime.StateStore.LoadAsync();
+                    if (currentState.ReviewDecisions.Count > 0)
+                        throw new InvalidOperationException("Finish the pending review decision with Retry remaining before moving archives.");
+                    ArchiveRelocation.EnsurePlanMatchesSettings(currentState.Settings, relocation);
                     result = await ArchiveRelocation.RelocateAsync(relocation, progress, CurrentCancellation);
                     var emptied = await Task.Run(() => relocation.Where(step => ArchiveRelocation.IsVerifiedEmpty(step.From)).ToArray());
                     // Completed moves must be persisted even when Stop was requested.
@@ -1545,13 +1466,28 @@ public partial class MainWindow : Window
 
         IncomingScale.ScaleX = e.NewValue;
         IncomingScale.ScaleY = e.NewValue;
+        if (ComparisonScale is not null)
+        {
+            ComparisonScale.ScaleX = e.NewValue;
+            ComparisonScale.ScaleY = e.NewValue;
+        }
     }
 
     private async void CandidatePreviewLoaded(object sender, RoutedEventArgs e)
     {
         if (sender is System.Windows.Controls.Image { Tag: string path } preview)
         {
-            await _previewService.ShowAsync(preview, path, decodeWidth: 360);
+            if (preview.DataContext is GroupFileCard card)
+            {
+                card.PreviewControl = preview;
+                if (card.CandidateId is null) return;
+                if (ReferenceEquals(CandidateList.SelectedItem, card))
+                {
+                    await ActivateMatchPreviewAsync(card);
+                    return;
+                }
+            }
+            await _previewService.ShowAsync(preview, path, decodeWidth: 640, animate: false);
         }
     }
 
@@ -1559,11 +1495,24 @@ public partial class MainWindow : Window
     {
         if (sender is System.Windows.Controls.Image preview)
         {
+            _comparisonPlayback.Stop(preview);
+            if (ReferenceEquals(_activeMatchPreview, preview)) _activeMatchPreview = null;
+            if (preview.DataContext is GroupFileCard card)
+            {
+                preview.RenderTransform = System.Windows.Media.Transform.Identity;
+                if (ReferenceEquals(card.PreviewControl, preview)) card.PreviewControl = null;
+            }
             _previewService.Stop(preview);
         }
     }
 
-    public Task RefreshFromExternalAsync() => RefreshAsync(SelectedReview?.Id, selectFirst: false);
+    public async Task RefreshFromExternalAsync()
+    {
+        var previous = _externalGroupDraft;
+        _externalGroupDraft = CaptureGroupDraft();
+        try { await RefreshAsync(SelectedReview?.Id, selectFirst: false); }
+        finally { _externalGroupDraft = previous; }
+    }
 
     public async Task ScanFromTrayAsync()
     {
@@ -1728,6 +1677,7 @@ public partial class MainWindow : Window
         _uiHeartbeat.Stop();
         _runtime.Scanner.Concurrency.StatusChanged -= WorkerStatusChanged;
         _runtime.Scanner.Concurrency.UiDelayMilliseconds = null;
+        _comparisonPlayback.Dispose();
         _previewService.Dispose();
         base.OnClosed(e);
     }

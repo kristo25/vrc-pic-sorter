@@ -6,6 +6,18 @@ namespace VrcPicSorter.Tests.Services;
 public sealed class SettingsDraftTests
 {
     [Fact]
+    public void PendingGroupPreventsChangingOutputFolder()
+    {
+        using var directory = new TestDirectory();
+        var state = AppStateDefaults.Create(directory.GetPath("profile"), directory.GetPath("local"));
+        state.ReviewDecisions.Add(new ReviewGroupDecision());
+        var original = state.Settings.OutputRootPath;
+        var draft = Draft(directory.GetPath("new-output"), VrcImageCategory.Emoji, directory.GetPath("incoming"));
+        Assert.Throws<InvalidOperationException>(() => draft.ApplyTo(state));
+        Assert.Equal(original, state.Settings.OutputRootPath);
+    }
+
+    [Fact]
     public void OutputNestedInExistingArchiveIsRejected()
     {
         using var directory = new TestDirectory();

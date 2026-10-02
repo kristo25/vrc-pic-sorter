@@ -403,6 +403,8 @@ public sealed partial class ScanCoordinator
         bool reconcileAllPending)
     {
         var initial = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        if (initial.ReviewDecisions.Any(g => g.Category == category))
+            throw new InvalidOperationException("Finish the pending group decision with Retry remaining before scanning this category.");
         if (!initial.Settings.OutputRootConfirmed)
         {
             return new CategoryScanResult(
@@ -1069,6 +1071,10 @@ public sealed partial class ScanCoordinator
             // Fall through and let the writer report the failure in its own words.
         }
 
+        var suppressionState = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        if (ManualKeepRules.IsAnimationSuppressed(suppressionState, archivedPath))
+            return new AtlasAnimationResult(false, null, null);
+
         return await _animationWriter
             .TryWriteAsync(archivedPath, archiveRoot, cancellationToken)
             .ConfigureAwait(false);
@@ -1155,6 +1161,7 @@ public sealed partial class ScanCoordinator
 
             if (!File.Exists(companionPath))
             {
+                if (ManualKeepRules.IsAnimationSuppressed(ownerState, sheet.Path)) return null;
                 var written = await _animationWriter
                     .TryWriteAsync(sheet.Path, archiveRoot, cancellationToken)
                     .ConfigureAwait(false);
@@ -1542,7 +1549,7 @@ public sealed partial class ScanCoordinator
             // A skipped sheet is one a person has already looked at and decided against. Without
             // this it would be decoded in full on every single scan forever: a sheet that cannot
             // be animated never produces the file whose absence is what puts it back on the list.
-            if (skipped.Contains(image.ExactFingerprint))
+            if (skipped.Contains(image.ExactFingerprint) || ManualKeepRules.IsAnimationSuppressed(state, image.Path))
             {
                 continue;
             }

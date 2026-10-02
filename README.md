@@ -23,7 +23,7 @@ In a fixed held-out test, padded-image detection improved from **0/96 to 77/96**
 - Images are processed in path order. Each unique image moves into the archive immediately, so later files in the same scan are compared against the updated archive.
 - Possible matches remain in their incoming folders while the Review queue stores references to them; scanning does not create or move a review copy.
 - Clearing the Review queue leaves those incoming files untouched. Reviews created by older versions are still returned safely from the legacy holding folder.
-- `Keep incoming` and `Keep match` use the Windows Recycle Bin for the image that is not kept. Permanent deletion is never used as a fallback.
+- Manual review removals use the Windows Recycle Bin, including local staging for network files. Permanent deletion is never used as a fallback.
 - Completed operations and resolved reviews are compacted automatically; the activity history retains the newest 1,000 entries.
 - Oversized or unusually frame-heavy images are rejected before full decoding to protect application memory.
 - Interrupted moves and recycle requests are recorded in a durable operation journal and reconciled on restart.
@@ -172,7 +172,30 @@ PNG, animated GIF, JPG/JPEG, WebP, and BMP are supported. MP4, `.temp`, and unsu
 5. Settings save automatically as you change them. Select **Scan now** when you are ready; the output folder is created if it does not exist yet.
 6. Use **Scan another folder** for a one-time recursive scan outside the configured VRCX folders.
 7. Use **Start watching** when you want the app to monitor configured folders during the current session. Choose **OnDetection** to analyze each image as it arrives, or **OnInterval** to ignore individual arrivals and sweep the folders on a timer instead (default 60 seconds, range 15–3600). Temporarily unavailable folders are attached automatically when they return.
-8. Review matches with **Keep incoming**, **Keep match**, or **Move as Unique**. **Keep incoming** applies without an extra confirmation popup; file validation and recycling safeguards still apply.
+8. Select images to compare. Each archived match has immediate **Keep** and **Delete** buttons. **Keep incoming only** recycles the remaining displayed matches; **Keep all** preserves them. Both archive incoming. No extra confirmation popup appears.
+
+### Reviewing several matches (local preview)
+
+Incoming has one large preview on the left. Archived matches appear as large preview cards stacked
+in a scrollable column on the right. Selecting a card only changes the comparison. The selected match
+shares zoom, panning, and GIF playback with incoming; independent playback is available for different timings.
+
+- **Keep** on a match preserves that archived file and removes its card from this review.
+- **Delete** on a match sends only that file to the Recycle Bin and removes its card.
+- **Keep incoming only** archives incoming and recycles every remaining match shown in the review. Matches already dismissed with Keep are preserved.
+- **Keep all** archives incoming and keeps every remaining match.
+- **Delete incoming** immediately recycles incoming alone, even when there are no matches.
+
+Keeping or deleting the last match leaves incoming available for a separate decision.
+Explicit Keep choices protect those copies from automatic cleanup across restarts, index rebuilds,
+and app-managed moves. New incoming duplicates are still handled normally. A later explicit Delete
+overrides protection for that file.
+
+If an operation stops, **Retry remaining** resumes the saved decision without repeating completed
+removals. **Cancel remaining actions** checks interrupted operations, preserves completed changes, and
+returns the surviving files for a new decision. It does not undo completed moves or recycling. If storage
+cannot be verified, the decision stays pending until access returns. Clearing the queue, folder changes,
+and archive relocation wait until the pending decision is completed or safely cancelled.
 9. Open **Animations** to turn emoji sheets into GIFs. See *Animated emoji* above.
 10. **Stop** interrupts a running scan. It stops between images, never during one, so nothing is left half-moved.
 

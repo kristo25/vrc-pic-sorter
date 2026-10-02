@@ -450,7 +450,7 @@ public sealed class JsonStateStore : IDisposable
             using var document = JsonDocument.Parse(utf8);
             if (!document.RootElement.TryGetProperty("schemaVersion", out var version)
                 || version.ValueKind != JsonValueKind.Number
-                || version.GetInt32() >= AppStateDocument.CurrentSchemaVersion)
+                || version.GetInt32() >= 5)
             {
                 return null;
             }

@@ -8,7 +8,7 @@
         MinWidth="920"
         MinHeight="640"
         WindowStartupLocation="CenterScreen"
-        Loaded="OnLoaded">
+        Loaded="OnLoaded" SizeChanged="ReviewWindowResized">
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -48,13 +48,11 @@
         </Border>
 
         <Grid Grid.Row="1" Background="{StaticResource WindowBrush}">
-            <Grid x:Name="ReviewPage" Margin="20">
+            <Grid x:Name="ReviewPage" Margin="12">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="240" />
+                    <ColumnDefinition Width="200" />
                     <ColumnDefinition Width="12" />
                     <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="12" />
-                    <ColumnDefinition Width="420" />
                 </Grid.ColumnDefinitions>
 
                 <DockPanel Grid.Column="0">
@@ -95,98 +93,105 @@
                 <Grid Grid.Column="2">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="*" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
-                    <Grid Grid.Row="0" Margin="0,0,0,10">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <StackPanel>
-                            <TextBlock x:Name="ReviewTitle" FontSize="17" FontWeight="SemiBold" Text="Select an item to review" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" />
-                            <TextBlock x:Name="ReviewSubtitle" Foreground="{StaticResource MutedTextBrush}" FontSize="12" />
-                            <TextBlock x:Name="IncomingResolutionText" Foreground="{StaticResource PurpleHoverBrush}" FontSize="12" FontWeight="SemiBold" />
-                            <TextBlock x:Name="IncomingAvailabilityText" Foreground="{StaticResource MutedTextBrush}" FontSize="12" />
-                            <TextBlock x:Name="IncomingLocationText"
-                                       MaxWidth="610"
-                                       FontSize="11"
-                                       Foreground="{StaticResource MutedTextBrush}"
-                                       TextWrapping="Wrap"
-                                       TextTrimming="CharacterEllipsis"
-                                       automation:AutomationProperties.Name="Incoming image locations" />
-                        </StackPanel>
-                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                            <TextBlock VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" Text="Zoom" Margin="0,0,8,0" />
-                            <Slider x:Name="ZoomSlider" Width="110" Minimum="0.5" Maximum="2.5" Value="1" TickFrequency="0.25" ValueChanged="ZoomChanged" automation:AutomationProperties.Name="Incoming preview zoom" />
-                        </StackPanel>
-                    </Grid>
-
-                    <Border Grid.Row="1" Background="{StaticResource PreviewBackdropBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="5">
-                        <Grid>
-                            <Image x:Name="IncomingPreview" Stretch="Uniform" RenderTransformOrigin="0.5,0.5" automation:AutomationProperties.Name="Incoming image preview">
-                                <Image.RenderTransform><ScaleTransform x:Name="IncomingScale" ScaleX="1" ScaleY="1" /></Image.RenderTransform>
-                            </Image>
-                            <TextBlock HorizontalAlignment="Left" VerticalAlignment="Top" Margin="10" Padding="7,4" Background="#CC1B1C22" Text="Incoming" />
+                    <StackPanel>
+                        <TextBlock x:Name="ReviewTitle" FontSize="17" FontWeight="SemiBold" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" />
+                        <TextBlock x:Name="ReviewSubtitle" FontSize="12" Foreground="{StaticResource MutedTextBrush}" />
+                        <TextBlock x:Name="IncomingResolutionText" Visibility="Collapsed" />
+                        <TextBlock x:Name="IncomingAvailabilityText" FontSize="11" />
+                        <TextBlock x:Name="IncomingLocationText" Visibility="Collapsed" />
+                        <TextBlock x:Name="CandidateHint" FontSize="11" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" Foreground="{StaticResource MutedTextBrush}" />
+                    </StackPanel>
+                        <WrapPanel Grid.Row="1" Margin="0,2,0,5">
+                            <TextBlock Text="Linked zoom" VerticalAlignment="Center" />
+                            <Slider x:Name="ZoomSlider" Width="100" Minimum="1" Maximum="8" Value="1" ValueChanged="ZoomChanged" />
+                            <TextBlock Text="Drag either preview to pan" VerticalAlignment="Center" Margin="6,0" FontSize="11" />
+                            <CheckBox x:Name="IndependentPlaybackCheck" Content="Independent playback" Checked="ComparisonPlaybackChanged" Unchecked="ComparisonPlaybackChanged" />
+                            <CheckBox x:Name="PauseComparisonCheck" Content="Pause" Margin="10,0" Checked="ComparisonPlaybackChanged" Unchecked="ComparisonPlaybackChanged" />
+                        </WrapPanel>
+                    <Grid Grid.Row="2">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="1.3*" /><ColumnDefinition Width="12" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.Resources>
+                            <Style x:Key="FileDecisionButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+                                <Setter Property="FontSize" Value="12" />
+                                <Setter Property="Padding" Value="8,4" />
+                                <Setter Property="MinHeight" Value="30" />
+                                <Setter Property="Margin" Value="0,2,3,0" />
+                            </Style>
+                        </Grid.Resources>
+                        <Grid x:Name="IncomingColumn">
+                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                            <ContentControl x:Name="IncomingCard" Margin="0,6" ContentTemplate="{Binding ItemTemplate, ElementName=CandidateList}" />
+                            <Border Grid.Row="1" Background="{StaticResource PreviewBackdropBrush}" ClipToBounds="True" MouseLeftButtonDown="ComparisonPanStarted" MouseMove="ComparisonPanMoved" MouseLeftButtonUp="ComparisonPanEnded">
+                                <Grid>
+                                    <Image x:Name="IncomingPreview" Stretch="Uniform" RenderTransformOrigin="0.5,0.5">
+                                        <Image.RenderTransform><TransformGroup><ScaleTransform x:Name="IncomingScale" /><TranslateTransform x:Name="IncomingPan" /></TransformGroup></Image.RenderTransform>
+                                    </Image>
+                                    <TextBlock Text="Incoming" VerticalAlignment="Top" HorizontalAlignment="Left" Background="#CC1B1C22" Padding="5" />
+                                </Grid>
+                            </Border>
                         </Grid>
-                    </Border>
-
-                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,10,0,0">
-                        <Button x:Name="MoveUniqueButton" Style="{StaticResource PrimaryButton}" Content="Move as Unique" Click="MoveAsUnique" automation:AutomationProperties.Name="Reject all matches and move incoming image as unique" />
-                        <Button x:Name="RemoveReviewButton" Margin="8,0,0,0" Content="Remove from Queue" Click="RemoveSelectedReview" automation:AutomationProperties.Name="Remove selected item from the review queue without deleting its incoming file" />
-                    </StackPanel>
-                </Grid>
-
-                <DockPanel Grid.Column="4">
-                    <StackPanel DockPanel.Dock="Top">
-                        <TextBlock FontSize="17" FontWeight="SemiBold" Text="Matches" />
-                        <TextBlock x:Name="CandidateHint" Margin="0,3,0,10" FontSize="12" Foreground="{StaticResource MutedTextBrush}" Text="No pending matches." />
-                    </StackPanel>
-                    <ListBox x:Name="CandidateList"
-                             BorderThickness="0"
-                             Background="Transparent"
-                             HorizontalContentAlignment="Stretch"
-                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
-                             automation:AutomationProperties.Name="All matching archive candidates">
+                        <Grid x:Name="ArchiveColumn" Grid.Column="2">
+                            <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                            <TextBlock Text="Matches" FontSize="17" FontWeight="SemiBold" Margin="0,0,0,4" />
+                    <ListBox x:Name="CandidateList" Grid.Row="1" Margin="0" Background="Transparent" BorderThickness="0" SelectionChanged="GroupCardSelected"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled" HorizontalContentAlignment="Stretch"
+                             automation:AutomationProperties.Name="Archived matches; selection changes comparison only">
                         <ListBox.ItemTemplate>
                             <DataTemplate>
-                                <Border Margin="0,0,0,10" Padding="10" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="5">
-                                    <Grid>
-                                        <Grid.RowDefinitions>
-                                            <RowDefinition Height="150" />
-                                            <RowDefinition Height="Auto" />
-                                            <RowDefinition Height="Auto" />
-                                            <RowDefinition Height="Auto" />
-                                            <RowDefinition Height="Auto" />
-                                        </Grid.RowDefinitions>
-                                        <Border Background="{StaticResource PreviewBackdropBrush}" CornerRadius="4">
-                                            <Image Tag="{Binding ArchivePath}" Loaded="CandidatePreviewLoaded" Unloaded="CandidatePreviewUnloaded" Stretch="Uniform" automation:AutomationProperties.Name="Archive match preview" />
+                                <Border Padding="8" Margin="0,0,0,8" CornerRadius="4" BorderThickness="1" BorderBrush="{StaticResource BorderBrush}" Background="{StaticResource SurfaceBrush}">
+                                    <StackPanel>
+                                        <Border Height="{Binding PreviewHeight}" Background="{StaticResource PreviewBackdropBrush}" ClipToBounds="True" MouseLeftButtonDown="ComparisonPanStarted" MouseMove="ComparisonPanMoved" MouseLeftButtonUp="ComparisonPanEnded">
+                                            <Image Tag="{Binding Path}" Loaded="CandidatePreviewLoaded" Unloaded="CandidatePreviewUnloaded" Stretch="Uniform" />
                                         </Border>
-                                        <Grid Grid.Row="1" Margin="0,8,0,0">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="*" />
-                                                <ColumnDefinition Width="Auto" />
-                                            </Grid.ColumnDefinitions>
-                                            <TextBlock FontWeight="SemiBold" Text="{Binding MatchLabel}" />
-                                            <TextBlock Grid.Column="1" Foreground="{StaticResource PurpleHoverBrush}" FontWeight="SemiBold" Text="{Binding Resolution}" />
-                                        </Grid>
-                                        <TextBlock Grid.Row="2" Margin="0,4,0,0" FontSize="11" Foreground="{StaticResource MutedTextBrush}" Text="{Binding ArchivePath}" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" ToolTip="{Binding ArchivePath}" />
-                                        <TextBlock Grid.Row="3" Margin="0,4,0,8" FontSize="11" Foreground="{StaticResource MutedTextBrush}" Text="{Binding Details}" TextWrapping="Wrap" />
-                                        <Grid Grid.Row="4">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="*" />
-                                                <ColumnDefinition Width="8" />
-                                                <ColumnDefinition Width="*" />
-                                            </Grid.ColumnDefinitions>
-                                            <Button Style="{StaticResource PrimaryButton}" Content="Keep Incoming" CommandParameter="{Binding Candidate}" Click="KeepIncoming" automation:AutomationProperties.Name="Keep incoming image instead of this archive match" />
-                                            <Button Grid.Column="2" Content="Keep Match" CommandParameter="{Binding Candidate}" Click="KeepMatch" automation:AutomationProperties.Name="Keep this archive match instead of the incoming image" />
-                                        </Grid>
-                                    </Grid>
+                                        <TextBlock Text="{Binding Label}" FontWeight="SemiBold" FontSize="11" />
+                                        <TextBlock Text="{Binding Path}" ToolTip="{Binding Path}" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" FontSize="11" />
+                                        <TextBlock Text="{Binding Details}" ToolTip="{Binding Details}" TextWrapping="Wrap" FontSize="11" />
+                                        <TextBlock Text="{Binding MatchDetails}" TextWrapping="Wrap" FontSize="11" Foreground="{StaticResource MutedTextBrush}" Margin="0,3">
+                                            <TextBlock.Style><Style TargetType="TextBlock"><Style.Triggers>
+                                                <DataTrigger Binding="{Binding MatchDetails}" Value=""><Setter Property="Visibility" Value="Collapsed" /></DataTrigger>
+                                            </Style.Triggers></Style></TextBlock.Style>
+                                        </TextBlock>
+                                        <StackPanel Orientation="Horizontal" IsEnabled="{Binding Editable}">
+                                            <StackPanel.Style><Style TargetType="StackPanel"><Style.Triggers>
+                                                <DataTrigger Binding="{Binding CandidateId}" Value="{x:Null}"><Setter Property="Visibility" Value="Collapsed" /></DataTrigger>
+                                            </Style.Triggers></Style></StackPanel.Style>
+                                            <Button Content="Keep" Tag="Keep" Click="GroupFileActionClicked" Style="{StaticResource FileDecisionButton}" Background="{StaticResource PurpleBrush}" ToolTip="Keep this copy in the archive and remove it from this review now" />
+                                            <Button Content="Delete" Tag="Remove" Click="GroupFileActionClicked" Style="{StaticResource FileDecisionButton}" ToolTip="Send this archive match to the Recycle Bin now" />
+                                        </StackPanel>
+                                    </StackPanel>
                                 </Border>
                             </DataTemplate>
                         </ListBox.ItemTemplate>
                     </ListBox>
-                </DockPanel>
+                            <Image x:Name="ComparisonPreview" Visibility="Collapsed">
+                                <Image.RenderTransform><TransformGroup><ScaleTransform x:Name="ComparisonScale" /><TranslateTransform x:Name="ComparisonPan" /></TransformGroup></Image.RenderTransform>
+                            </Image>
+                            <TextBlock x:Name="ComparisonLabel" Visibility="Collapsed" />
+
+                        </Grid>
+                    </Grid>
+
+                    <Border Grid.Row="4" Background="{StaticResource SurfaceBrush}" Padding="8">
+                        <StackPanel>
+                            <TextBlock x:Name="GroupSummary" Visibility="Collapsed" />
+                            <TextBox x:Name="GroupAffectedFiles" Visibility="Collapsed" />
+                            <WrapPanel Margin="0,5,0,0">
+                                <Button x:Name="ApplyGroupButton" Content="Keep incoming only" Style="{StaticResource PrimaryButton}" Click="ApplyGroupDecision" Margin="0,0,6,0" />
+                                <Button x:Name="KeepAllButton" Content="Keep all" Click="KeepAllGroupDecision" Margin="0,0,6,0" ToolTip="Keep incoming and every remaining archived match." />
+                                <Button x:Name="DeleteIncomingButton" Content="Delete incoming" Style="{StaticResource DangerButton}" Click="DeleteGroupIncoming" Margin="0,0,6,0" ToolTip="Immediately recycle only the incoming file. All archived copies are preserved." />
+                                <Button x:Name="RetryGroupButton" Content="Retry remaining" Click="RetryGroupDecision" Margin="0,0,6,0" />
+                                <Button x:Name="CancelGroupButton" Content="Cancel remaining actions" Click="CancelGroupDecision" Margin="0,0,6,0" ToolTip="Stop remaining actions after checking recovery. Completed moves and recycling are not undone." />
+                                <Button x:Name="RemoveReviewButton" Content="Remove from Queue" Click="RemoveSelectedReview" />
+                                <Button x:Name="MoveUniqueButton" Visibility="Collapsed" Click="MoveAsUnique" />
+                            </WrapPanel>
+                        </StackPanel>
+                    </Border>
+                </Grid>
             </Grid>
 
             <Grid x:Name="AnimationsPage" Visibility="Collapsed" Margin="24">

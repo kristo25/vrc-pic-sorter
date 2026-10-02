@@ -133,7 +133,7 @@ public sealed class AtlasAnimationCatalog
     /// Exports one sheet using <paramref name="name"/>, which may differ from the one in the file
     /// name when the name is wrong and you are correcting it by hand.
     /// </summary>
-    public Task<AtlasAnimationResult> ExportAsync(
+    public async Task<AtlasAnimationResult> ExportAsync(
         ArchivedSheet sheet,
         EmojiAtlasName name,
         CancellationToken cancellationToken = default)
@@ -144,21 +144,35 @@ public sealed class AtlasAnimationCatalog
         if (sheet.HasAnimation && !string.Equals(current, sheet.AnimationPath, StringComparison.OrdinalIgnoreCase)
             || !sheet.HasAnimation && current is not null)
         {
-            return Task.FromResult(new AtlasAnimationResult(false, null,
-                "The existing animation changed. Refresh the list and confirm the replacement again."));
+            return new AtlasAnimationResult(false, null,
+                "The existing animation changed. Refresh the list and confirm the replacement again.");
         }
 
-        return sheet.HasAnimation
+        var result = await (sheet.HasAnimation
             ? sheet.AnimationFingerprint is null
                 ? Task.FromResult(new AtlasAnimationResult(false, null, "Refresh the list before replacing an existing animation."))
                 : _writer.TryWriteAsync(sheet.AtlasPath, sheet.ArchiveRoot, name, cancellationToken,
                     sheet.AnimationPath, sheet.AnimationFingerprint)
-            : _writer.TryWriteMissingAsync(sheet.AtlasPath, sheet.ArchiveRoot, name, cancellationToken);
+            : _writer.TryWriteMissingAsync(sheet.AtlasPath, sheet.ArchiveRoot, name, cancellationToken)).ConfigureAwait(false);
+        await ClearSuppressionAfterExportAsync(result, cancellationToken).ConfigureAwait(false);
+        return result;
     }
 
-    public Task<AtlasAnimationResult> ExportMissingAsync(
-        ArchivedSheet sheet, CancellationToken cancellationToken = default) =>
-        _writer.TryWriteMissingAsync(sheet.AtlasPath, sheet.ArchiveRoot, sheet.Name, cancellationToken);
+    public async Task<AtlasAnimationResult> ExportMissingAsync(
+        ArchivedSheet sheet, CancellationToken cancellationToken = default)
+    {
+        var result = await _writer.TryWriteMissingAsync(sheet.AtlasPath, sheet.ArchiveRoot, sheet.Name, cancellationToken)
+            .ConfigureAwait(false);
+        await ClearSuppressionAfterExportAsync(result, cancellationToken).ConfigureAwait(false);
+        return result;
+    }
+
+    private async Task ClearSuppressionAfterExportAsync(AtlasAnimationResult result, CancellationToken cancellationToken)
+    {
+        if (!result.Exported || result.Path is null || ManualKeepRules.AnimationKey(result.Path) is not { } key) return;
+        await _stateStore.UpdateAsync(state => state.SuppressedAnimations.RemoveAll(
+            item => string.Equals(item, key, StringComparison.OrdinalIgnoreCase)) > 0, cancellationToken).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Marks sheets as skipped, so they stop counting as work still to do. Nothing on disk moves
