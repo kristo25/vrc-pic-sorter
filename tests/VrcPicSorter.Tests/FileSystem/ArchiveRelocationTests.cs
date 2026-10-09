@@ -6,6 +6,67 @@ namespace VrcPicSorter.Tests.FileSystem;
 
 public sealed class ArchiveRelocationTests
 {
+    [Fact]
+    public void ExplicitDestinationPreparationCreatesNestedOutputOnAccessibleStorage()
+    {
+        using var directory = new TestDirectory();
+        var output = directory.GetPath("new", "nested", "archive");
+        var settings = Settings(Path.Combine(output, "Emoji"));
+        Assert.Empty(ArchiveRelocation.PrepareMissingArchiveFolders(settings, output));
+        Assert.True(Directory.Exists(settings.CategoryMappings.Single().ArchivePath));
+    }
+
+    [Fact]
+    public async Task ExplicitPreparationCreatesMissingCategoryAndUnblocksValidMove()
+    {
+        using var directory = new TestDirectory();
+        var oldEmoji = directory.GetPath("old", "Emoji");
+        var oldPrints = directory.GetPath("old", "Prints");
+        var newRoot = directory.GetPath("new");
+        Directory.CreateDirectory(oldEmoji);
+        Directory.CreateDirectory(newRoot);
+        File.WriteAllText(Path.Combine(oldEmoji, "a.png"), "image");
+        var settings = Settings(Path.Combine(newRoot, "Emoji"), oldEmoji);
+        settings.CategoryMappings.Add(new CategoryMapping
+        {
+            Category = VrcImageCategory.Prints,
+            IsEnabled = true,
+            ArchivePath = Path.Combine(newRoot, "Prints"),
+        });
+        settings.LegacyArchiveMappings.Add(new LegacyArchiveMapping
+        {
+            Category = VrcImageCategory.Prints,
+            ArchivePath = oldPrints,
+        });
+        Assert.Contains(ArchiveRelocation.Plan(settings, newRoot), step => step.InventoryError is not null);
+        Assert.False(Directory.Exists(oldPrints)); // Plan has no filesystem side effects.
+        Assert.Empty(ArchiveRelocation.PrepareMissingArchiveFolders(settings));
+        Assert.True(Directory.Exists(oldPrints));
+        var step = Assert.Single(ArchiveRelocation.Plan(settings, newRoot));
+        Assert.Null(step.InventoryError);
+        var result = await ArchiveRelocation.RelocateAsync([step]);
+        Assert.True(result.InventoryComplete);
+        Assert.Equal(1, result.Moved);
+        Assert.Equal("image", File.ReadAllText(Path.Combine(newRoot, "Emoji", "a.png")));
+    }
+
+    [Fact]
+    public void PreparationDoesNotRecreateUnavailableParentOrReplaceFile()
+    {
+        using var directory = new TestDirectory();
+        var current = directory.GetPath("new", "Emoji");
+        Directory.CreateDirectory(current);
+        var missing = directory.GetPath("unavailable-parent", "Emoji");
+        var settings = Settings(current, missing);
+        Assert.Single(ArchiveRelocation.PrepareMissingArchiveFolders(settings));
+        Assert.False(Directory.Exists(Path.GetDirectoryName(missing)));
+        Assert.NotNull(Assert.Single(ArchiveRelocation.Plan(settings, directory.GetPath("new"))).InventoryError);
+        Directory.CreateDirectory(Path.GetDirectoryName(missing)!);
+        File.WriteAllText(missing, "preserve");
+        Assert.Single(ArchiveRelocation.PrepareMissingArchiveFolders(settings));
+        Assert.Equal("preserve", File.ReadAllText(missing));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -515,7 +576,7 @@ public sealed class ArchiveRelocationTests
 
     private static AppSettings Settings(string currentArchive, string? retainedArchive = null)
     {
-        var settings = new AppSettings();
+        var settings = new AppSettings { OutputRootPath = Path.GetDirectoryName(currentArchive)! };
         settings.CategoryMappings.Add(new CategoryMapping
         {
             Category = VrcImageCategory.Emoji,

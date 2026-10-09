@@ -274,6 +274,12 @@ public sealed class OperationJournal
             throw new ArgumentException("Move journal entries require a destination path.", nameof(entry));
         }
 
+        if (entry.Purpose == JournalOperationPurpose.FilterRecycle
+            && (entry.OperationType != JournalOperationType.Recycle || entry.FilterReasons.Count == 0
+                || entry.FilterReasons.Any(reason => !Enum.IsDefined(reason))
+                || (entry.FilterRemovalExplicit && entry.ReviewItemId is null)))
+            throw new ArgumentException("Filter recycling requires filter evidence and an explicit review for manual removal.", nameof(entry));
+
         if (entry.OperationType == JournalOperationType.DeleteExactIncoming
             && (entry.Purpose != JournalOperationPurpose.AutoKeepArchived
                 || !string.Equals(entry.ExpectedSource.Fingerprint, entry.SurvivingFingerprint, StringComparison.Ordinal)))

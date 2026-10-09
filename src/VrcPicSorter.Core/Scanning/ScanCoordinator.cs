@@ -15,7 +15,9 @@ public sealed record CategoryScanResult(
     IReadOnlyList<string> Errors,
     int AutoKeptArchived = 0,
     int Animated = 0,
-    int ArchiveDuplicatesRemoved = 0);
+    int ArchiveDuplicatesRemoved = 0,
+    int FilterRecycled = 0,
+    bool RetryRequired = false);
 
 /// <summary><see cref="Activity"/> and <see cref="FileName"/> describe what the scan is doing
 /// right now, so the UI can say more than a bare count.</summary>
@@ -78,7 +80,7 @@ public sealed partial class ScanCoordinator
     /// </summary>
     private const int MaximumUnrecognisedAnimations = 25;
 
-    private sealed record PreparedImage(ImageFingerprint? Fingerprint, string? Error);
+    private sealed record PreparedImage(ImageFingerprint? Fingerprint, string? Error, bool RetryRequired = false);
 
     private readonly JsonStateStore _stateStore;
     private readonly ArchiveIndexer _indexer;
@@ -403,6 +405,7 @@ public sealed partial class ScanCoordinator
         bool reconcileAllPending)
     {
         var initial = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        ArchiveRelocation.EnsureResolved(initial);
         if (initial.ReviewDecisions.Any(g => g.Category == category))
             throw new InvalidOperationException("Finish the pending group decision with Retry remaining before scanning this category.");
         if (!initial.Settings.OutputRootConfirmed)
@@ -419,13 +422,13 @@ public sealed partial class ScanCoordinator
         var mapping = initial.Settings.CategoryMappings.Single(item => item.Category == category);
         if ((requireEnabled && !mapping.IsEnabled) || !Directory.Exists(sourceRoot))
         {
-            return new CategoryScanResult(category, 0, 0, 0, 0, ["Source folder is unavailable or disabled."]);
+            return new CategoryScanResult(category, 0, 0, 0, 0, ["Source folder is unavailable or disabled."], RetryRequired: mapping.IsEnabled);
         }
 
         sourceSnapshot ??= CreateSourceSnapshotSafe(sourceRoot);
         if (sourceSnapshot.Error is not null)
         {
-            return new CategoryScanResult(category, 0, 0, 0, 0, [sourceSnapshot.Error]);
+            return new CategoryScanResult(category, 0, 0, 0, 0, [sourceSnapshot.Error], RetryRequired: sourceSnapshot.RetryRequired);
         }
 
         // The output folder is where this scan puts files, so create it on demand instead of
@@ -448,7 +451,7 @@ public sealed partial class ScanCoordinator
                 0,
                 0,
                 0,
-                [$"The {category} output folder could not be created: {exception.Message}"]);
+                [$"The {category} output folder could not be created: {exception.Message}"], RetryRequired: ScanRetry.IsTransient(exception));
         }
 
         await Concurrency.PrepareAsync(initial.Settings, null, sourceSnapshot.Paths, cancellationToken).ConfigureAwait(false);
@@ -460,7 +463,7 @@ public sealed partial class ScanCoordinator
                 "Archive index unavailable",
                 onImageScanned,
                 onImageProcessed);
-            return new CategoryScanResult(category, 0, 0, 0, 0, indexResult.Errors);
+            return new CategoryScanResult(category, 0, 0, 0, 0, indexResult.Errors, RetryRequired: indexResult.RetryRequired);
         }
 
         var duplicateCleanup = await CleanIndexedArchiveDuplicatesCoreAsync([category], cancellationToken)
@@ -468,6 +471,7 @@ public sealed partial class ScanCoordinator
 
         // Individual unreadable archive files are surfaced as scan warnings, not as a
         // reason to abort the category.
+        var retryRequired = duplicateCleanup.RetryRequired;
         var errors = new List<string>(
             indexResult.SkippedFiles.Select(skipped => $"Archive file skipped - {skipped}"));
         errors.AddRange(duplicateCleanup.Warnings);
@@ -482,6 +486,42 @@ public sealed partial class ScanCoordinator
         var held = 0;
         var autoKept = 0;
         var skipped = 0;
+        var filterRecycled = 0;
+
+        // Filters own their decisions before duplicate matching can consume a queued input.
+        if (initial.Settings.RemovePrintFrame || initial.Settings.RemoveMyImages
+            || initial.ReviewQueue.Any(r => r.Category == category && r.Status != ReviewStatus.Resolved && r.FilterReview is not null))
+        {
+            var remaining = new List<string>();
+            var stable = await FindSettledPathsAsync(sourceSnapshot.Paths, cancellationToken).ConfigureAwait(false);
+            foreach (var path in sourceSnapshot.Paths)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!stable.Contains(path)) { remaining.Add(path); continue; }
+                var handled = false;
+                try
+                {
+                    var outcome = await FilterFileAsync(path, category, false, cancellationToken, sourceRoot).ConfigureAwait(false);
+                    handled = outcome != FilterOutcome.None;
+                    if (outcome == FilterOutcome.Review) held++;
+                    if (outcome == FilterOutcome.Recycled) filterRecycled++;
+                }
+                catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException or NotSupportedException)
+                {
+                    errors.Add($"{path}: removal filter failed ({error.Message}).");
+                    retryRequired |= ScanRetry.IsTransient(error);
+                    handled = true;
+                }
+                if (!handled) remaining.Add(path);
+                else
+                {
+                    examined++;
+                    onImageScanned?.Invoke("Removal filters", Path.GetFileName(path));
+                    onImageProcessed?.Invoke("Removal filters", Path.GetFileName(path));
+                }
+            }
+            sourceSnapshot = sourceSnapshot with { Paths = remaining };
+        }
 
         // Sheets already in the archive were archived before this existed, so animating only what
         // a scan newly archives would leave the whole existing archive untouched. This fills in
@@ -513,21 +553,24 @@ public sealed partial class ScanCoordinator
                     "Archive index unavailable",
                     onImageScanned,
                     onImageProcessed);
-                return new CategoryScanResult(category, 0, 0, 0, 0, [.. errors, .. reindexed.Errors]);
+                return new CategoryScanResult(category, 0, 0, 0, 0, [.. errors, .. reindexed.Errors], RetryRequired: retryRequired || reindexed.RetryRequired);
             }
         }
 
         var resolvedQueuedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var requestedPaths = sourceSnapshot.Paths.Select(PathBoundary.Normalize)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        await RefreshQueuedScoresAsync(category, requestedPaths, reconcileAllPending, errors, cancellationToken)
+            .ConfigureAwait(false);
         var refreshed = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
         var archivedImages = refreshed.ArchiveIndex.Categories.Single(item => item.Category == category).Images;
         // Archive relocation/retirement can invalidate every match. Let files included in this
         // scan go through fresh matching instead of being skipped forever as already queued.
         // Never release a partially applied decision, a legacy held file, or an unrelated path.
         foreach (var waiting in refreshed.ReviewQueue.Where(item =>
-                     item.Category == category && item.Status != ReviewStatus.Resolved
+                     item.Category == category && item.Status != ReviewStatus.Resolved && item.FilterReview is null
                      && item.Candidates.Count == 0 && item.IsIncomingInPlace
+                     && !item.AwaitingDecisionAfterScoringRefresh
                      && string.IsNullOrWhiteSpace(item.KeptIncomingArchivedPath)
                      && requestedPaths.Contains(PathBoundary.Normalize(item.IncomingOriginalPath))
                      && !refreshed.OperationJournal.Any(entry => entry.Phase != JournalPhase.Completed
@@ -537,7 +580,7 @@ public sealed partial class ScanCoordinator
             await _router.DismissReviewAsync(waiting.Id, cancellationToken).ConfigureAwait(false);
         }
         foreach (var waiting in refreshed.ReviewQueue.Where(item =>
-                     item.Category == category && item.Status == ReviewStatus.Pending
+                     item.Category == category && item.Status == ReviewStatus.Pending && item.FilterReview is null
                      && (reconcileAllPending || requestedPaths.Contains(PathBoundary.Normalize(item.IncomingOriginalPath)))
                      && item.IncomingImageFingerprint is not null
                      && item.Candidates.Any(candidate => candidate.MatchKind == MatchKind.Exact)))
@@ -568,6 +611,7 @@ public sealed partial class ScanCoordinator
                                                  or InvalidOperationException or NotSupportedException)
             {
                 errors.Add($"{waiting.HeldFilePath}: could not resolve queued exact match ({exception.Message}).");
+                retryRequired |= ScanRetry.IsTransient(exception);
             }
         }
 
@@ -588,6 +632,7 @@ public sealed partial class ScanCoordinator
         foreach (var waiting in initial.ReviewQueue)
         {
             if (waiting.Status == ReviewStatus.Resolved
+                || waiting.FilterReview is not null
                 || waiting.Category != category
                 || waiting.IncomingImageFingerprint is null)
             {
@@ -649,6 +694,7 @@ public sealed partial class ScanCoordinator
 
                     if (!settledPaths.Contains(path))
                     {
+                        retryRequired = true;
                         errors.Add($"{path}: file is still being written or locked.");
                         outcome = "Still being written";
                         continue;
@@ -668,6 +714,7 @@ public sealed partial class ScanCoordinator
                     if (prepared.Fingerprint is null)
                     {
                         errors.Add($"{path}: {prepared.Error}");
+                        retryRequired |= prepared.RetryRequired;
                         outcome = "Could not be read";
                         continue;
                     }
@@ -846,6 +893,7 @@ public sealed partial class ScanCoordinator
                             IncomingFingerprint = fingerprint.ExactIdentity,
                             IncomingImageFingerprint = fingerprint,
                             IndexGeneration = index.Generation,
+                            ScoringVersion = ImageMatcher.CurrentScoringVersion,
                             CreatedUtc = _timeProvider.GetUtcNow(),
                             RoutingContext = routingContext,
                             Candidates = matches.Select(
@@ -972,6 +1020,7 @@ public sealed partial class ScanCoordinator
                         or NotSupportedException)
                 {
                     errors.Add($"{path}: {exception.Message}");
+                    retryRequired |= ScanRetry.IsTransient(exception);
                     outcome = "Failed";
                 }
                 finally
@@ -1036,7 +1085,9 @@ public sealed partial class ScanCoordinator
             errors,
             autoKept,
             animated,
-            duplicateCleanup.Removed);
+            duplicateCleanup.Removed,
+            filterRecycled,
+            retryRequired);
     }
 
     /// <summary>
@@ -1746,7 +1797,7 @@ public sealed partial class ScanCoordinator
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
-            return new SourceSnapshot([], 0, exception.Message);
+            return new SourceSnapshot([], 0, exception.Message, ScanRetry.IsTransient(exception));
         }
     }
 
@@ -1815,7 +1866,7 @@ public sealed partial class ScanCoordinator
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or ArgumentException)
         {
-            return new SourceSnapshot([], 0, exception.Message);
+            return new SourceSnapshot([], 0, exception.Message, ScanRetry.IsTransient(exception));
         }
     }
 
@@ -1832,7 +1883,7 @@ public sealed partial class ScanCoordinator
         }
     }
 
-    private sealed record SourceSnapshot(IReadOnlyList<string> Paths, int UnsupportedFiles, string? Error)
+    private sealed record SourceSnapshot(IReadOnlyList<string> Paths, int UnsupportedFiles, string? Error, bool RetryRequired = false)
     {
         public static SourceSnapshot Empty { get; } = new([], 0, null);
     }
@@ -1864,7 +1915,7 @@ public sealed partial class ScanCoordinator
                 or SixLabors.ImageSharp.UnknownImageFormatException
                 or SixLabors.ImageSharp.ImageFormatException)
         {
-            return new PreparedImage(null, exception.Message);
+            return new PreparedImage(null, exception.Message, ScanRetry.IsTransient(exception));
         }
     }
 

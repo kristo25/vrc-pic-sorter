@@ -30,10 +30,12 @@ public sealed record ImageSimilarityComponents(
     double ColorScore,
     double AspectScore,
     double AnimationScore,
-    double InsetAlignmentScore);
+    double InsetAlignmentScore,
+    double StructuralScore = 1);
 
 public static class ImageMatcher
 {
+    public const int CurrentScoringVersion = 2;
     private static readonly IReadOnlyDictionary<SimilarityProfile, MatchingProfileDefinition> Profiles =
         new Dictionary<SimilarityProfile, MatchingProfileDefinition>
         {
@@ -177,6 +179,12 @@ public static class ImageMatcher
             };
         }
 
+        return !HasLocalizedContentConflict(comparison)
+            && comparison.Score >= GetProfile(profile).MinimumScore;
+    }
+
+    private static bool HasLocalizedContentConflict(PerceptualComparison comparison)
+    {
         var detailGap = comparison.ColorThumbnailScore - comparison.LocalDetailScore;
         var coherentLargeTransformation = comparison.Score >= 0.82
             && comparison.HashScore >= 0.95
@@ -185,16 +193,11 @@ public static class ImageMatcher
             && comparison.ColorScore >= 0.985
             && comparison.LocalDetailScore < 0.80;
         var cropAligned = comparison.InsetAlignmentScore >= 0.50
+            && comparison.StructuralScore >= 0.90
             && comparison.ColorScore >= 0.985;
-        var localizedContentConflict = detailGap >= 0.09
+        return detailGap >= 0.09
             && !cropAligned
             && !coherentLargeTransformation;
-        if (localizedContentConflict)
-        {
-            return false;
-        }
-
-        return comparison.Score >= GetProfile(profile).MinimumScore;
     }
 
     private static PerceptualComparison Compare(ImageFingerprint first, ImageFingerprint second)
@@ -214,7 +217,10 @@ public static class ImageMatcher
             + (frameComparison.ColorScore * 0.05)
             + (aspectScore * 0.05)
             + (animationScore * 0.10);
-        return new PerceptualComparison(
+        // Common opacity, darkness, aspect and static timing are not evidence that
+        // content agrees. Contrast-normalized structure bounds their contribution.
+        score = Math.Min(score, StructuralCeiling(frameComparison.StructuralScore));
+        var result = new PerceptualComparison(
             Math.Clamp(Math.Min(score, allFramesScore), 0, 1),
             frameComparison.HashScore,
             frameComparison.ThumbnailScore,
@@ -224,7 +230,15 @@ public static class ImageMatcher
             frameComparison.ColorScore,
             aspectScore,
             animationScore,
-            frameComparison.InsetAlignmentScore);
+            frameComparison.InsetAlignmentScore,
+            frameComparison.StructuralScore);
+        // Apply localized-change evidence to the score itself so custom thresholds
+        // cannot bypass it. A changed caption/object must not inherit its background's score.
+        if (first.FrameCount == 1 && second.FrameCount == 1
+            && first.HasCurrentFeatures && second.HasCurrentFeatures
+            && HasLocalizedContentConflict(result))
+            result = result with { Score = Math.Min(result.Score, result.LocalDetailScore) };
+        return result;
     }
 
     private static double AllFramesSimilarity(ImageFingerprint first, ImageFingerprint second)
@@ -389,7 +403,37 @@ public static class ImageMatcher
             alphaScore,
             localDetailScore,
             0,
-            insetAlignmentScore);
+            insetAlignmentScore,
+            StructuralSimilarity(firstDetailLuminance ?? firstThumbnail, secondDetailLuminance ?? secondThumbnail));
+    }
+
+    private static double StructuralCeiling(double structure) => 0.5 + (0.5 * structure);
+
+    private static double StructuralSimilarity(byte[] first, byte[] second)
+    {
+        if (first.Length == 0 || first.Length != second.Length) return 0;
+        double firstSum = 0, secondSum = 0;
+        for (var i = 0; i < first.Length; i++)
+        {
+            firstSum += first[i];
+            secondSum += second[i];
+        }
+        var firstMean = firstSum / first.Length;
+        var secondMean = secondSum / second.Length;
+        double firstEnergy = 0, secondEnergy = 0, covariance = 0;
+        for (var i = 0; i < first.Length; i++)
+        {
+            var a = first[i] - firstMean;
+            var b = second[i] - secondMean;
+            firstEnergy += a * a;
+            secondEnergy += b * b;
+            covariance += a * b;
+        }
+        // Uniform images have no structure; existing colour/alpha distances compare
+        // them. One uniform image and one textured image do not agree structurally.
+        if (firstEnergy == 0 || secondEnergy == 0)
+            return firstEnergy == secondEnergy ? 1 : 0;
+        return Math.Clamp(covariance / Math.Sqrt(firstEnergy * secondEnergy), 0, 1);
     }
 
     private static double AlphaSimilarity(byte[]? first, byte[]? second)
@@ -633,16 +677,17 @@ public static class ImageMatcher
             items.Average(item => item.AlphaScore),
             items.Average(item => item.LocalDetailScore),
             items.Average(item => item.ColorScore),
-            items.Average(item => item.InsetAlignmentScore));
+            items.Average(item => item.InsetAlignmentScore),
+            items.Average(item => item.StructuralScore));
     }
 
-    private static double FrameScore(FrameComparison comparison) =>
+    private static double FrameScore(FrameComparison comparison) => Math.Min(
         (comparison.HashScore * 0.07)
         + (comparison.ThumbnailScore * 0.05)
         + (comparison.ColorThumbnailScore * 0.18)
         + (comparison.AlphaScore * 0.20)
         + (comparison.LocalDetailScore * 0.45)
-        + (comparison.ColorScore * 0.05);
+        + (comparison.ColorScore * 0.05), StructuralCeiling(comparison.StructuralScore));
 
     private static double AnimationSimilarity(ImageFingerprint first, ImageFingerprint second)
     {
@@ -686,6 +731,7 @@ public static class ImageMatcher
         var reasons = new List<string>
         {
             $"Perceptual structure is {comparison.HashScore:P1} similar.",
+            $"Contrast-normalized structure is {comparison.StructuralScore:P1} similar.",
             $"Normalized thumbnail pixels are {comparison.ThumbnailScore:P1} similar.",
             $"Normalized color layout is {comparison.ColorThumbnailScore:P1} similar.",
             $"Transparency layout is {comparison.AlphaScore:P1} similar.",
@@ -711,7 +757,8 @@ public static class ImageMatcher
             comparison.ColorScore,
             comparison.AspectScore,
             comparison.AnimationScore,
-            comparison.InsetAlignmentScore);
+            comparison.InsetAlignmentScore,
+            comparison.StructuralScore);
 
     private sealed record FrameComparison(
         double HashScore,
@@ -720,7 +767,8 @@ public static class ImageMatcher
         double AlphaScore,
         double LocalDetailScore,
         double ColorScore,
-        double InsetAlignmentScore);
+        double InsetAlignmentScore,
+        double StructuralScore);
 
     private sealed record PerceptualComparison(
         double Score,
@@ -732,5 +780,6 @@ public static class ImageMatcher
         double ColorScore,
         double AspectScore,
         double AnimationScore,
-        double InsetAlignmentScore);
+        double InsetAlignmentScore,
+        double StructuralScore);
 }

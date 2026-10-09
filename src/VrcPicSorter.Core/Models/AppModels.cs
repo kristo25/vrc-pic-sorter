@@ -119,6 +119,7 @@ public enum JournalOperationPurpose
     FileAnimatedSheet,
     GroupArchiveIncoming,
     GroupRecycleFile,
+    FilterRecycle,
 }
 
 public enum JournalPhase
@@ -156,8 +157,10 @@ public sealed class AppStateDocument
     public List<string> SkippedAnimations { get; set; } = [];
 
     public List<JournalEntry> OperationJournal { get; set; } = [];
+    public List<ArchiveRelocationJournalEntry> RelocationJournal { get; set; } = [];
     public List<ReviewGroupDecision> ReviewDecisions { get; set; } = [];
     public List<ManualKeepProtection> ManualKeeps { get; set; } = [];
+    public List<FilterKeepException> FilterKeeps { get; set; } = [];
     public List<string> SuppressedAnimations { get; set; } = [];
 
     public List<ActivityEntry> History { get; set; } = [];
@@ -165,6 +168,9 @@ public sealed class AppStateDocument
 
 public sealed class AppSettings
 {
+    public bool RemovePrintFrame { get; set; }
+    public bool RemoveMyImages { get; set; }
+    public string PlayerName { get; set; } = string.Empty;
     public const int MaximumScanWorkers = 8;
     public long OutputFolderRevision { get; set; }
     public AutoScanProfile? AutoScanProfile { get; set; }
@@ -334,6 +340,7 @@ public sealed class IndexedImageRecord
 
 public sealed class ReviewItem
 {
+    public FilterReviewInfo? FilterReview { get; set; }
     public Guid Id { get; set; }
 
     public VrcImageCategory Category { get; set; }
@@ -354,6 +361,11 @@ public sealed class ReviewItem
     public ImageFingerprint? IncomingImageFingerprint { get; set; }
 
     public long IndexGeneration { get; set; }
+
+    public int ScoringVersion { get; set; }
+
+    // A scoring upgrade may remove every suggestion, but must not silently archive the input.
+    public bool AwaitingDecisionAfterScoringRefresh { get; set; }
 
     /// <summary>
     /// Where a Keep incoming decision has already put the incoming image, once the first of its
@@ -414,6 +426,8 @@ public sealed class JournalEntry
     public JournalOperationType OperationType { get; set; }
 
     public JournalOperationPurpose Purpose { get; set; }
+    public List<RemovalFilterReason> FilterReasons { get; set; } = [];
+    public bool FilterRemovalExplicit { get; set; }
 
     public JournalPhase Phase { get; set; } = JournalPhase.IntentRecorded;
 

@@ -19,7 +19,10 @@ public sealed record SettingsDraft(
     WatchMode WatchMode = WatchMode.OnDetection,
     OrganizationPolicy OrganizationPolicy = OrganizationPolicy.CategoryRoot,
     SimilarityThresholds? CustomSimilarityThresholds = null,
-    int ScanWorkers = 0)
+    int ScanWorkers = 0,
+    bool RemovePrintFrame = false,
+    bool RemoveMyImages = false,
+    string PlayerName = "")
 {
     public bool ChangesOnlyScanWorkers(AppSettings settings) =>
         ScanWorkers != settings.ScanWorkers
@@ -32,6 +35,9 @@ public sealed record SettingsDraft(
         && BringReviewForwardWhenHeld == settings.BringReviewForwardWhenHeld
         && WatchScanSeconds == settings.Automation.WatchScanSeconds
         && WatchMode == settings.Automation.WatchMode
+        && RemovePrintFrame == settings.RemovePrintFrame
+        && RemoveMyImages == settings.RemoveMyImages
+        && string.Equals(PlayerName, settings.PlayerName, StringComparison.Ordinal)
         && !settings.Automation.WatchWhileOpen
         && Categories.Count == settings.CategoryMappings.Count
         && Categories.All(draft => settings.CategoryMappings.Any(mapping =>
@@ -48,6 +54,8 @@ public sealed record SettingsDraft(
     public string? DescribeBlockingProblem(AppSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
+        if (RemoveMyImages && string.IsNullOrWhiteSpace(PlayerName))
+            return "Enter your exact player name before enabling Remove my images.";
         if (CustomSimilarityThresholds is { } limits && !limits.IsValid())
             return "Similarity limits must be numbers from 0 to 100, with minimum no greater than maximum.";
 
@@ -197,6 +205,9 @@ public sealed record SettingsDraft(
         state.Settings.OutputRootConfirmed = true;
         state.Settings.SimilarityProfile = SimilarityProfile;
         state.Settings.ScanWorkers = ScanWorkers;
+        state.Settings.RemovePrintFrame = RemovePrintFrame;
+        state.Settings.RemoveMyImages = RemoveMyImages && !string.IsNullOrWhiteSpace(PlayerName);
+        state.Settings.PlayerName = PlayerName;
         state.Settings.CustomSimilarityThresholds = CustomSimilarityThresholds;
         state.Settings.OrganizationPolicy = OrganizationPolicy;
         state.Settings.Automation.WatchWhileOpen = false;

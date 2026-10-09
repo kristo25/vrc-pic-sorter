@@ -136,6 +136,7 @@ public sealed class ImageMatcherTests
             $"Changed foreground matched at {measurement.Score:F3}; "
             + $"hash={measurement.Components.HashScore:F3}, rgb={measurement.Components.ColorThumbnailScore:F3}, "
             + $"detail={measurement.Components.LocalDetailScore:F3}, color={measurement.Components.ColorScore:F3}.");
+        Assert.Empty(ImageMatcher.RankCandidates(incoming, [candidate], SimilarityProfile.Conservative, .82));
     }
 
     [Fact]

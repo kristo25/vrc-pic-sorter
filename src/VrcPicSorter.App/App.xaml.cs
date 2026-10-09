@@ -73,11 +73,12 @@ public partial class App : System.Windows.Application
         }
         catch (Exception exception)
         {
-            var diagnosticDirectory = options.DataDirectory ?? Path.Combine(
+            // Creating the new profile folder after a failed carry-over would prevent retry.
+            var diagnosticDirectory = exception is ProfileMigrationException migration
+                ? migration.PreviousDirectory : options.DataDirectory ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "VrcPicSorter");
-            Directory.CreateDirectory(diagnosticDirectory);
-            File.WriteAllText(Path.Combine(diagnosticDirectory, "startup-error.log"), exception.ToString());
+            _ = DiagnosticLog.TryWrite(diagnosticDirectory, exception);
             MessageBox.Show(
                 exception.Message,
                 "VRC Pic Sorter could not start",
@@ -224,6 +225,7 @@ public partial class App : System.Windows.Application
                         ActivateMainWindow();
                     }
                 }
+                if (MainWindow is MainWindow window) window.ReportFilterRecycling(result);
             });
     }
 

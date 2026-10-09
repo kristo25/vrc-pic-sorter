@@ -4,10 +4,60 @@ namespace VrcPicSorter.Core.FileSystem;
 
 public sealed partial class FileRouter
 {
+    public sealed record ReviewDismissalEligibility(bool CanDismiss, string Reason);
+
+    public async Task<ReviewDismissalEligibility> GetReviewDismissalEligibilityAsync(Guid reviewId, CancellationToken cancellationToken = default)
+    {
+        var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        return ReviewDismissalEligibilityFor(state, reviewId);
+    }
+
+    private static ReviewDismissalEligibility ReviewDismissalEligibilityFor(AppStateDocument state, Guid reviewId)
+    {
+        var review = state.ReviewQueue.SingleOrDefault(r => r.Id == reviewId);
+        if (review is null) return new(false, "Review is no longer queued.");
+        return ReviewDismissalEligibilityFor(state, review);
+    }
+
+    private static ReviewDismissalEligibility ReviewDismissalEligibilityFor(AppStateDocument state, ReviewItem review)
+    {
+        var reviewId = review.Id;
+        var paths = ReviewPaths(review).Where(p => !string.IsNullOrWhiteSpace(p)).ToArray();
+        bool Owns(string? path) => !string.IsNullOrWhiteSpace(path) && paths.Any(p => PathsMatch(p, path));
+        bool JournalOwns(JournalEntry entry) => entry.ReviewItemId == reviewId
+            || Owns(entry.SourcePath) || Owns(entry.DestinationPath) || Owns(entry.SurvivingPath)
+            || Owns(entry.IndexedImageAfterCommit?.Path)
+            || entry.ReviewItemAfterCommit is { } payload
+                && (payload.Id == reviewId || ReviewPaths(payload).Any(Owns));
+        if (state.OperationJournal.Any(JournalOwns)
+            || state.ReviewDecisions.Any(g => g.ReviewId == reviewId || g.Files.Any(f => Owns(f.Path))
+                || g.Steps.Any(step => JournalOwns(step.Operation)))
+            || state.RelocationJournal.Any(r => Owns(r.SourcePath) || Owns(r.DestinationPath)))
+            return new(false, "Pending recovery or review actions own this review's paths.");
+        if (review.FilterReview is not null)
+        {
+            try
+            {
+                PathBoundary.EnsureNoReparsePoints(review.HeldFilePath, "Filter review");
+                if (!PathBoundary.IsConfirmedMissingPath(review.HeldFilePath))
+                    return new(false, "File is present, changed, or its parent folder is unavailable. Keep or Remove requires an unchanged file.");
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
+            {
+                return new(false, $"File availability cannot be confirmed: {e.Message}");
+            }
+        }
+        return new(true, "Remove review metadata without changing files.");
+    }
+
+    private static IEnumerable<string?> ReviewPaths(ReviewItem review) =>
+        new[] { review.HeldFilePath, review.IncomingOriginalPath, review.KeptIncomingArchivedPath }
+            .Concat(review.Candidates.Select(c => c.ArchivePath));
     private static void EnsureReviewCanBeDismissed(AppStateDocument state, Guid reviewId)
     {
-        if (state.ReviewDecisions.Any(g => g.ReviewId == reviewId))
-            throw new InvalidOperationException("This review has unfinished actions. Retry or cancel remaining actions first.");
+        var eligibility = ReviewDismissalEligibilityFor(state, reviewId);
+        if (!eligibility.CanDismiss) throw new InvalidOperationException(eligibility.Reason);
+
     }
 
     public async Task RestorePendingReviewVisibilityAsync(CancellationToken cancellationToken = default)

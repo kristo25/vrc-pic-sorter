@@ -29,6 +29,7 @@ public sealed class GroupReviewWindowTests
                 {
                     var app = new VrcPicSorter.App.App();
                     app.InitializeComponent();
+                    app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
                     using var directory = new TestDirectory();
                     using var runtime = new AppRuntime(directory.GetPath("state"), allowStartupRegistration: false);
                     using var image = ImageFixtureFactory.CreatePattern(23);
@@ -148,11 +149,30 @@ public sealed class GroupReviewWindowTests
                         using var stream = File.Create(Path.ChangeExtension(largeRenderPath, ".large.png")); encoder.Save(stream);
                     }
                     var keptCard = cards.SelectedItem;
+                    Assert.Contains(Descendants(content).OfType<Button>(), b => ReferenceEquals(b.DataContext, keptCard) && (string?)b.Content == "Enlarge");
+                    var viewerPath = (string)keptCard.GetType().GetProperty("Path")!.GetValue(keptCard)!;
+                    var viewer = new MatchViewer(viewerPath);
+                    try
+                    {
+                        viewer.Show();
+                        var enlargedImage = (System.Windows.Controls.Image)viewer.FindName("Preview");
+                        for (var attempt = 0; attempt < 300 && enlargedImage.Source is null; attempt++) await Task.Delay(10);
+                        Assert.NotNull(enlargedImage.Source);
+                        ((Slider)viewer.FindName("Zoom")).Value = 3;
+                        Assert.Equal(3, ((ScaleTransform)viewer.FindName("Scale")).ScaleX);
+                        Assert.Equal(4, cards.Items.Count);
+                    }
+                    finally { viewer.Close(); }
+                    var decisionViewer = new MatchViewer(viewerPath);
+                    ((System.Collections.IList)typeof(MainWindow).GetField("_matchViewers", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!).Add(decisionViewer);
+                    decisionViewer.Show();
+                    Assert.True(window.IsEnabled);
                     var keptPath = (string)keptCard.GetType().GetProperty("Path")!.GetValue(keptCard)!;
                     var keepButton = Descendants(content).OfType<Button>().Single(b => ReferenceEquals(b.DataContext, keptCard) && (string?)b.Tag == "Keep");
                     keepButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
                     for (var attempt = 0; attempt < 300 && (cards.Items.Count != 3 || !apply.IsEnabled); attempt++) await Task.Delay(10);
                     Assert.Equal(3, cards.Items.Count);
+                    Assert.False(decisionViewer.IsVisible);
                     Assert.True(File.Exists(keptPath)); Assert.True(File.Exists(path));
                     var saved = await runtime.StateStore.LoadAsync();
                     Assert.Equal(3, Assert.Single(saved.ReviewQueue).Candidates.Count);
@@ -182,7 +202,15 @@ public sealed class GroupReviewWindowTests
                     Assert.Empty((await runtime.StateStore.LoadAsync()).ReviewDecisions);
                     Assert.True(File.Exists(path));
                     Assert.True(apply.IsEnabled);
+                    _ = new System.Windows.Interop.WindowInteropHelper(window).EnsureHandle();
+                    await (Task)Invoke(window, "ShowArchiveMoveDialogAsync")!;
+                    var archiveDialog = (Window)typeof(MainWindow).GetField("_archiveMoveDialog", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+                    Assert.True(archiveDialog.IsVisible);
+                    Assert.Equal("Move previous archives", archiveDialog.Title);
+                    archiveDialog.Close();
+                    Assert.Equal(Visibility.Collapsed, ((Border)window.FindName("RetainedArchivesPanel")).Visibility);
                     window.Close(); window = null;
+                    await RemovalFilterWindowTests.VerifyFilterReviewAsync();
                     completion.SetResult();
                 }
                 catch (Exception error) { completion.TrySetException(error); }

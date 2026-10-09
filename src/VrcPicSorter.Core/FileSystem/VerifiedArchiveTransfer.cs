@@ -76,7 +76,10 @@ internal static class VerifiedArchiveTransfer
             throw new IOException("Local recycling copy verification failed; the original was kept.");
     }
 
-    public static string Move(string source, string destinationRoot, string requestedDestination)
+    public static string Move(string source, string destinationRoot, string requestedDestination,
+        Action<string, string, long, DateTimeOffset>? saveIntent = null,
+        Action<string, DateTimeOffset>? saveVerified = null,
+        string? expectedHash = null, bool exactDestination = false)
     {
         // DELETE access lets us remove this exact open file, not whatever later occupies its path.
         // Read-only sharing prevents another process changing or replacing either verified copy.
@@ -84,12 +87,16 @@ internal static class VerifiedArchiveTransfer
         if (handle.IsInvalid) throw Error("Cannot lock relocation source");
         using var input = new FileStream(handle, FileAccess.Read);
         var hash = SHA256.HashData(input);
+        if (expectedHash is not null && !string.Equals(Convert.ToHexString(hash), expectedHash, StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Relocation source identity changed; the source was kept.");
         var suffix = Convert.ToHexString(hash)[..12].ToLowerInvariant();
         string? temporary = null;
         try
         {
             for (var attempt = 0; attempt < 10000; attempt++)
             {
+                if (exactDestination && attempt > 0)
+                    throw new IOException("Recorded relocation destination is occupied by different content.");
                 var destination = attempt == 0 ? requestedDestination : Path.Combine(
                     Path.GetDirectoryName(requestedDestination)!,
                     $"{Path.GetFileNameWithoutExtension(requestedDestination)}.relocated-{suffix}"
@@ -100,11 +107,14 @@ internal static class VerifiedArchiveTransfer
                 {
                     using var existing = new FileStream(destination, FileMode.Open, FileAccess.Read, FileShare.Read);
                     if (existing.Length != input.Length || !SHA256.HashData(existing).AsSpan().SequenceEqual(hash)) continue;
+                    saveIntent?.Invoke(destination, Convert.ToHexString(hash), input.Length, File.GetLastWriteTimeUtc(source));
+                    saveVerified?.Invoke(destination, File.GetLastWriteTimeUtc(destination));
                     DeleteLockedSource(handle);
                     input.Dispose(); // Complete deletion while the verified destination is still locked.
                     return destination;
                 }
 
+                saveIntent?.Invoke(destination, Convert.ToHexString(hash), input.Length, File.GetLastWriteTimeUtc(source));
                 Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
                 if (temporary is null)
                 {
@@ -131,6 +141,7 @@ internal static class VerifiedArchiveTransfer
                 using var verified = new FileStream(destination, FileMode.Open, FileAccess.Read, FileShare.Read);
                 if (verified.Length != input.Length || !SHA256.HashData(verified).AsSpan().SequenceEqual(hash))
                     throw new IOException("Destination changed during relocation; the source was kept.");
+                saveVerified?.Invoke(destination, File.GetLastWriteTimeUtc(destination));
                 DeleteLockedSource(handle);
                 input.Dispose();
                 return destination;

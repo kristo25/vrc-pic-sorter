@@ -207,6 +207,8 @@ public sealed partial class FileRouter
     {
         var review = state.ReviewQueue.SingleOrDefault(r => r.Id == request.ReviewId && r.Status != ReviewStatus.Resolved)
             ?? throw new InvalidOperationException("This review was already resolved. Refresh the queue.");
+        if (review.FilterReview is not null)
+            throw new InvalidOperationException("Use Keep or Remove to resolve this filter review.");
         var incoming = request.Files.Single(f => f.CandidateId is null);
         if (!PathsMatch(incoming.Path, review.HeldFilePath) || incoming.Fingerprint != review.IncomingFingerprint
             || request.Files.Count != review.Candidates.Count + 1)

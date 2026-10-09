@@ -7,6 +7,24 @@ namespace VrcPicSorter.Tests.Services;
 public sealed class LocalDataMigrationTests
 {
     [Fact]
+    public void LockedLegacyProfileStopsStartupAndCanBeRetried()
+    {
+        using var directory = new TestDirectory();
+        var previous = directory.GetPath("legacy");
+        var current = directory.GetPath("current");
+        Directory.CreateDirectory(previous);
+        var held = Path.Combine(previous, "held.png");
+        File.WriteAllText(held, "preserved");
+        using (var locked = new FileStream(held, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            Assert.ThrowsAny<IOException>(() => LocalDataMigration.CarryOver(previous, current));
+            Assert.False(Directory.Exists(current));
+        }
+        Assert.True(LocalDataMigration.CarryOver(previous, current));
+        Assert.Equal("preserved", File.ReadAllText(Path.Combine(current, "held.png")));
+    }
+
+    [Fact]
     public void TheOldFolderIsCarriedOverWhenThereIsNoNewOne()
     {
         using var directory = new TestDirectory();

@@ -80,6 +80,12 @@
                                                     <DataTrigger Binding="{Binding Candidates.Count}" Value="0">
                                                         <Setter Property="Text" Value="Needs rescan" />
                                                     </DataTrigger>
+                                                    <DataTrigger Binding="{Binding FilterReview.IsArchive}" Value="False">
+                                                        <Setter Property="Text" Value="Incoming filter review" />
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding FilterReview.IsArchive}" Value="True">
+                                                        <Setter Property="Text" Value="Archive filter review" />
+                                                    </DataTrigger>
                                                 </Style.Triggers>
                                             </Style>
                                         </TextBlock.Style>
@@ -131,7 +137,7 @@
                                     <Image x:Name="IncomingPreview" Stretch="Uniform" RenderTransformOrigin="0.5,0.5">
                                         <Image.RenderTransform><TransformGroup><ScaleTransform x:Name="IncomingScale" /><TranslateTransform x:Name="IncomingPan" /></TransformGroup></Image.RenderTransform>
                                     </Image>
-                                    <TextBlock Text="Incoming" VerticalAlignment="Top" HorizontalAlignment="Left" Background="#CC1B1C22" Padding="5" />
+                                    <TextBlock x:Name="IncomingOriginLabel" Text="Incoming" VerticalAlignment="Top" HorizontalAlignment="Left" Background="#CC1B1C22" Padding="5" />
                                 </Grid>
                             </Border>
                         </Grid>
@@ -162,6 +168,7 @@
                                             </Style.Triggers></Style></StackPanel.Style>
                                             <Button Content="Keep" Tag="Keep" Click="GroupFileActionClicked" Style="{StaticResource FileDecisionButton}" Background="{StaticResource PurpleBrush}" ToolTip="Keep this copy in the archive and remove it from this review now" />
                                             <Button Content="Delete" Tag="Remove" Click="GroupFileActionClicked" Style="{StaticResource FileDecisionButton}" ToolTip="Send this archive match to the Recycle Bin now" />
+                                            <Button Content="Enlarge" Click="EnlargeMatch" Margin="4,0,0,0" ToolTip="View this match alone in a larger window" />
                                         </StackPanel>
                                     </StackPanel>
                                 </Border>
@@ -180,7 +187,7 @@
                         <StackPanel>
                             <TextBlock x:Name="GroupSummary" Visibility="Collapsed" />
                             <TextBox x:Name="GroupAffectedFiles" Visibility="Collapsed" />
-                            <WrapPanel Margin="0,5,0,0">
+                            <WrapPanel x:Name="NormalReviewActions" Margin="0,5,0,0">
                                 <Button x:Name="ApplyGroupButton" Content="Keep incoming only" Style="{StaticResource PrimaryButton}" Click="ApplyGroupDecision" Margin="0,0,6,0" />
                                 <Button x:Name="KeepAllButton" Content="Keep all" Click="KeepAllGroupDecision" Margin="0,0,6,0" ToolTip="Keep incoming and every remaining archived match." />
                                 <Button x:Name="DeleteIncomingButton" Content="Delete incoming" Style="{StaticResource DangerButton}" Click="DeleteGroupIncoming" Margin="0,0,6,0" ToolTip="Immediately recycle only the incoming file. All archived copies are preserved." />
@@ -188,6 +195,11 @@
                                 <Button x:Name="CancelGroupButton" Content="Cancel remaining actions" Click="CancelGroupDecision" Margin="0,0,6,0" ToolTip="Stop remaining actions after checking recovery. Completed moves and recycling are not undone." />
                                 <Button x:Name="RemoveReviewButton" Content="Remove from Queue" Click="RemoveSelectedReview" />
                                 <Button x:Name="MoveUniqueButton" Visibility="Collapsed" Click="MoveAsUnique" />
+                            </WrapPanel>
+                            <WrapPanel x:Name="FilterReviewActions" Visibility="Collapsed" Margin="0,5,0,0">
+                                <Button x:Name="KeepFilterButton" Content="Keep" Click="KeepFilterReview" Style="{StaticResource PrimaryButton}" Margin="0,0,6,0" />
+                                <Button x:Name="DismissFilterReviewButton" Content="Remove review" Click="RemoveSelectedReview" Margin="0,0,6,0" ToolTip="Clear review metadata only when this file is confirmed absent" />
+                                <Button x:Name="RemoveFilterButton" Content="Remove" Click="RemoveFilterReview" Style="{StaticResource DangerButton}" ToolTip="Send this image to the Recycle Bin" />
                             </WrapPanel>
                         </StackPanel>
                     </Border>
@@ -391,6 +403,18 @@
                     </Grid>
 
                     <StackPanel Margin="0,0,0,20">
+                        <TextBlock FontWeight="SemiBold" Text="Removal filters" />
+                        <CheckBox x:Name="RemovePrintFrameCheck" Content="Remove Print Frame" Margin="0,8,0,4" Checked="SettingsToggled" Unchecked="SettingsToggled" />
+                        <TextBlock Text="Recycle complete Print images with a confirmed Captured by frame. Uncertain frames go to review." TextWrapping="Wrap" FontSize="12" Foreground="{StaticResource MutedTextBrush}" />
+                        <TextBlock Text="Your exact player name (case-sensitive)" Margin="0,10,0,4" />
+                        <TextBox x:Name="PlayerNameField" Width="300" HorizontalAlignment="Left" TextChanged="PlayerNameChanged" LostFocus="SettingsFieldCommitted" KeyDown="SettingsFieldKeyDown" automation:AutomationProperties.Name="Your exact player name" />
+                        <TextBlock Text="Stored locally in this app and used to match the player name in image filenames. Not uploaded." TextWrapping="Wrap" FontSize="12" Foreground="{StaticResource MutedTextBrush}" />
+                        <CheckBox x:Name="RemoveMyImagesCheck" Content="Remove my images" Margin="0,8,0,4" IsEnabled="False" Checked="SettingsToggled" Unchecked="SettingsToggled" />
+                        <TextBlock Text="Enabled filters recycle matching incoming images, including previously kept duplicates. Filter-review Keep choices are remembered. Archive rescan applies only to your current archive." TextWrapping="Wrap" FontSize="12" Foreground="{StaticResource MutedTextBrush}" />
+                        <Button x:Name="RescanFiltersButton" Content="Rescan archive with filters" HorizontalAlignment="Left" Margin="0,8,0,0" Click="RescanArchiveFilters" />
+                    </StackPanel>
+
+                    <StackPanel Margin="0,0,0,20">
                         <TextBlock FontWeight="SemiBold" Text="Scan workers" />
                         <ComboBox x:Name="ScanWorkersCombo" Width="300" HorizontalAlignment="Left" Margin="0,8,0,8"
                                   SelectionChanged="SettingsSelectionChanged" automation:AutomationProperties.Name="Parallel scan workers" />
@@ -453,8 +477,7 @@
 
                     <TextBlock x:Name="SettingsNoticeText" Margin="0,0,0,10" TextWrapping="Wrap" Foreground="{StaticResource MutedTextBrush}" Text="Settings save automatically." automation:AutomationProperties.Name="Settings status" />
 
-                    <!-- Collapsed unless something is actually left behind. A section that tells a
-                         person their archive is in one piece is noise on every other visit. -->
+                    <Button Content="Manage previous archives…" HorizontalAlignment="Left" Click="OpenArchiveMoveDialog" Margin="0,0,0,16" />
                     <Border x:Name="RetainedArchivesPanel" Visibility="Collapsed"
                             Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}"
                             BorderThickness="1" CornerRadius="5" Padding="16" Margin="0,0,0,20">

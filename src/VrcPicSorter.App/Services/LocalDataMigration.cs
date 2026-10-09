@@ -4,6 +4,14 @@ using VrcPicSorter.Core.Models;
 
 namespace VrcPicSorter.App.Services;
 
+public sealed class ProfileMigrationException(string previousDirectory, string currentDirectory, Exception inner)
+    : IOException($"Could not move your existing profile from '{previousDirectory}' to '{currentDirectory}'. "
+        + "Close applications using the old folder and launch VRC Pic Sorter again to retry. "
+        + "Your existing profile has been preserved.", inner)
+{
+    public string PreviousDirectory { get; } = previousDirectory;
+}
+
 /// <summary>
 /// Carries the local data folder across the rename from VRC Image Curator to VRC Pic Sorter.
 /// </summary>
@@ -14,9 +22,8 @@ namespace VrcPicSorter.App.Services;
 /// reviews stranded under a name nothing looks at any more.
 /// <para>
 /// The move happens once, and only when there is an old folder and no new one. Every other case -
-/// both present, neither present, or a failure part-way - leaves the new folder to be created
-/// empty. The old folder is never deleted, so the worst outcome of a failed carry-over is starting
-/// fresh with the previous data still sitting on disk.
+/// both present or neither present - preserves normal profile selection. A failed move stops
+/// startup before a new profile is created, so the next launch can retry.
 /// </para>
 /// </remarks>
 public static class LocalDataMigration
@@ -49,9 +56,7 @@ public static class LocalDataMigration
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException)
         {
-            // Starting fresh is a recoverable disappointment. Refusing to start is not, so a
-            // locked or unreadable old folder is stepped over rather than thrown from.
-            return false;
+            throw new ProfileMigrationException(previousDirectory, currentDirectory, exception);
         }
     }
 

@@ -551,74 +551,74 @@ public sealed partial class FileRouter
     {
         ArgumentNullException.ThrowIfNull(reviews);
         var pending = reviews.ToArray();
-        var stateBeforeRestore = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
-        foreach (var review in pending) EnsureReviewCanBeDismissed(stateBeforeRestore, review.Id);
         var failures = new List<string>();
         var processed = 0;
         var restored = 0;
         progress?.Report(new ReviewRestoreProgress(processed, pending.Length, restored));
 
-        var inPlace = pending.Where(review => review.IsIncomingInPlace).ToArray();
-        if (inPlace.Length > 0)
+        // Metadata-only reviews share one durable write, even for a large queue. Recheck
+        // eligibility inside that transaction so blocked rows stay pending.
+        var snapshot = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var pendingIds = pending.Select(r => r.Id).ToHashSet();
+        var metadataIds = snapshot.ReviewQueue
+            .Where(r => pendingIds.Contains(r.Id) && (r.FilterReview is not null || r.IsIncomingInPlace))
+            .Select(r => r.Id).ToHashSet();
+        if (metadataIds.Count > 0)
         {
+            var accepted = 0;
             try
             {
-                var reviewIds = inPlace.Select(review => review.Id).ToHashSet();
-                await _stateStore.UpdateAsync(
-                        state =>
-                        {
-                            foreach (var review in state.ReviewQueue.Where(item => reviewIds.Contains(item.Id)))
-                            {
-                                review.Status = ReviewStatus.Resolved;
-                                review.HeldFilePath = string.Empty;
-                            }
-
-                            state.History.Add(new ActivityEntry
-                            {
-                                Id = Guid.NewGuid(),
-                                OccurredUtc = _timeProvider.GetUtcNow(),
-                                Kind = ActivityKind.ReviewDecision,
-                                Level = ActivityLevel.Information,
-                                Message = $"Cleared {inPlace.Length} in-place review item(s) without changing their files.",
-                            });
-                            return true;
-                        },
-                        cancellationToken)
-                    .ConfigureAwait(false);
-                restored += inPlace.Length;
-            }
-            catch (Exception exception) when (
-                exception is IOException
-                    or UnauthorizedAccessException
-                    or InvalidOperationException
-                    or NotSupportedException)
-            {
-                failures.AddRange(inPlace.Select(
-                    review => $"{review.IncomingOriginalPath}: {exception.Message}"));
-            }
-            finally
-            {
-                foreach (var _ in inPlace)
+                await _stateStore.UpdateAsync(state =>
                 {
-                    processed++;
-                    progress?.Report(new ReviewRestoreProgress(processed, pending.Length, restored));
-                }
+                    var selected = state.ReviewQueue.Where(r => metadataIds.Contains(r.Id))
+                        .GroupBy(r => r.Id).Select(group => group.Single()).ToArray();
+                    foreach (var review in selected)
+                    {
+                        var eligibility = ReviewDismissalEligibilityFor(state, review);
+                        if (!eligibility.CanDismiss)
+                        {
+                            failures.Add($"{review.HeldFilePath}: {eligibility.Reason}");
+                            continue;
+                        }
+                        review.Status = ReviewStatus.Resolved;
+                        review.HeldFilePath = string.Empty;
+                        accepted++;
+                    }
+                    if (accepted == 0) return false;
+                    state.History.Add(new ActivityEntry
+                    {
+                        Id = Guid.NewGuid(),
+                        OccurredUtc = _timeProvider.GetUtcNow(),
+                        Kind = ActivityKind.ReviewDecision,
+                        Level = ActivityLevel.Information,
+                        Message = $"Cleared {accepted} review item(s) without changing their files."
+                    });
+                    return true;
+                }, cancellationToken).ConfigureAwait(false);
+                restored += accepted;
             }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException or NotSupportedException)
+            {
+                failures.Add($"Could not clear review metadata: {exception.Message}");
+            }
+            processed += metadataIds.Count;
+            progress?.Report(new ReviewRestoreProgress(processed, pending.Length, restored));
         }
 
-        foreach (var review in pending.Where(review => !review.IsIncomingInPlace))
+        foreach (var review in pending.Where(r => !metadataIds.Contains(r.Id)))
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                await RestoreReviewCoreAsync(review, cancellationToken).ConfigureAwait(false);
+                var current = (await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false)).ReviewQueue.SingleOrDefault(r => r.Id == review.Id);
+                if (current is null) continue;
+                if (current.FilterReview is not null || current.IsIncomingInPlace)
+                    await DismissReviewCoreAsync(current.Id, cancellationToken).ConfigureAwait(false);
+                else
+                    await RestoreReviewCoreAsync(current, cancellationToken).ConfigureAwait(false);
                 restored++;
             }
-            catch (Exception exception) when (
-                exception is IOException
-                    or UnauthorizedAccessException
-                    or InvalidOperationException
-                    or NotSupportedException)
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException or NotSupportedException)
             {
                 failures.Add($"{review.HeldFilePath}: {exception.Message}");
             }
@@ -628,7 +628,6 @@ public sealed partial class FileRouter
                 progress?.Report(new ReviewRestoreProgress(processed, pending.Length, restored));
             }
         }
-
         return new ReviewRestoreResult(pending.Length, restored, failures);
     }
 
@@ -1039,6 +1038,7 @@ public sealed partial class FileRouter
 
     private async Task ApplySideEffectAsync(JournalEntry entry, CancellationToken cancellationToken)
     {
+        await VerifyFilterBeforeEffectAsync(entry, cancellationToken).ConfigureAwait(false);
         await VerifyGroupBeforeEffectAsync(entry, cancellationToken).ConfigureAwait(false);
         if (entry.OperationType is JournalOperationType.Recycle or JournalOperationType.DeleteExactIncoming
             && entry.Purpose is JournalOperationPurpose.RemoveArchiveDuplicate or JournalOperationPurpose.AutoKeepArchived or JournalOperationPurpose.AutoKeepHeld)
@@ -1168,6 +1168,11 @@ public sealed partial class FileRouter
 
     private static void ApplyMutation(AppStateDocument state, JournalEntry entry)
     {
+        if (entry.Purpose == JournalOperationPurpose.FilterRecycle)
+        {
+            ApplyFilterMutation(state, entry);
+            return;
+        }
         if (entry.GroupDecisionId is not null)
         {
             ApplyGroupMutation(state, entry);
@@ -1333,6 +1338,7 @@ public sealed partial class FileRouter
                 JournalOperationPurpose.DeleteArchiveCandidate => ActivityKind.DeletionRequested,
                 JournalOperationPurpose.AutoKeepArchived => ActivityKind.DeletionRequested,
                 JournalOperationPurpose.AutoKeepHeld => ActivityKind.DeletionRequested,
+                JournalOperationPurpose.FilterRecycle => ActivityKind.DeletionRequested,
                 JournalOperationPurpose.RemoveArchiveDuplicate => ActivityKind.DeletionRequested,
                 _ => ActivityKind.ReviewDecision,
             },
@@ -1340,6 +1346,7 @@ public sealed partial class FileRouter
             Category = entry.Category,
             Message = entry.Purpose switch
             {
+                JournalOperationPurpose.FilterRecycle => "Recycled by removal filters: " + string.Join(", ", entry.FilterReasons),
                 JournalOperationPurpose.AutoKeepArchived when entry.OperationType == JournalOperationType.DeleteExactIncoming =>
                     "Exact duplicate: kept the archived image and permanently deleted the incoming copy (Recycle Bin unavailable).",
                 JournalOperationPurpose.AutoKeepArchived =>

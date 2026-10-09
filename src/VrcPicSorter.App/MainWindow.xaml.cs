@@ -118,15 +118,20 @@ public partial class MainWindow : Window
             .ToArray();
         QueueList.ItemsSource = queue;
         QueueCountText.Text = $"{queue.Length} pending";
-        _anyPendingGroups = state.ReviewDecisions.Count > 0;
-        ClearQueueButton.IsEnabled = !_busy && !_anyPendingGroups && queue.Length > 0;
+        _anyDismissibleReviews = false;
+        foreach (var review in queue)
+            if ((await _runtime.Router.GetReviewDismissalEligibilityAsync(review.Id)).CanDismiss)
+            { _anyDismissibleReviews = true; break; }
+        ClearQueueButton.IsEnabled = !_busy && _anyDismissibleReviews;
         HistoryList.ItemsSource = state.History.OrderByDescending(item => item.OccurredUtc).ToArray();
         var pendingOperations = state.OperationJournal.Where(item => item.Phase != JournalPhase.Completed).ToArray();
         var attentionCount = pendingOperations.Count(item => item.Phase == JournalPhase.NeedsAttention);
-        RecoveryStatusText.Text = pendingOperations.Length == 0
+        RecoveryStatusText.Text = state.RelocationJournal.Count > 0
+            ? $"{state.RelocationJournal.Count} interrupted archive relocation(s); retry recovery before cleanup."
+            : pendingOperations.Length == 0
             ? "No file operations need attention."
             : $"{pendingOperations.Length} operation(s) pending; {attentionCount} require a decision.";
-        RetryRecoveryButton.IsEnabled = !_busy && pendingOperations.Length > 0;
+        RetryRecoveryButton.IsEnabled = !_busy && (pendingOperations.Length > 0 || state.RelocationJournal.Count > 0);
         DismissRecoveryButton.IsEnabled = !_busy && attentionCount > 0;
         if (refreshSettings)
         {
@@ -178,6 +183,10 @@ public partial class MainWindow : Window
             UpdateResolvedDestinations(settings.OutputRootPath);
             SimilarityCombo.SelectedItem = settings.SimilarityProfile;
             ScanWorkersCombo.SelectedIndex = settings.ScanWorkers;
+            PlayerNameField.Text = settings.PlayerName;
+            RemovePrintFrameCheck.IsChecked = settings.RemovePrintFrame;
+            RemoveMyImagesCheck.IsEnabled = !string.IsNullOrWhiteSpace(settings.PlayerName);
+            RemoveMyImagesCheck.IsChecked = settings.RemoveMyImages && RemoveMyImagesCheck.IsEnabled;
             WorkerStatusText.Text = settings.ScanWorkers == 0
                 ? settings.AutoScanProfile is { } profile
                     ? $"Auto: archive {profile.ArchiveWorkers}, incoming {profile.IncomingWorkers} of {Environment.ProcessorCount} workers{(profile.Learning ? " (learning)" : "")}."
@@ -330,7 +339,7 @@ public partial class MainWindow : Window
                 SetStatus(
                     $"Scan complete: {examined} examined, {moved} archived, {autoKept} archive copies kept automatically, "
                     + $"{held} queued for review, {archiveDuplicatesRemoved} archive duplicates recycled, "
-                    + $"{skipped} skipped, {errors} failed.");
+                    + $"{results.Sum(result => result.FilterRecycled)} recycled by filters, {skipped} skipped, {errors} failed.");
                 await ReportScanErrorsAsync(results.SelectMany(result => result.Errors));
                 await RefreshAsync();
                 ShowPage(ReviewPage);
@@ -371,7 +380,7 @@ public partial class MainWindow : Window
                 SetStatus(
                     $"Folder scan complete: {result.Examined} examined, {result.MovedUnique} archived, "
                     + $"{result.AutoKeptArchived} archive copies kept automatically, {result.HeldForReview} queued for review, "
-                    + $"{result.ArchiveDuplicatesRemoved} archive duplicates recycled, {result.Skipped} skipped, "
+                    + $"{result.ArchiveDuplicatesRemoved} archive duplicates recycled, {result.FilterRecycled} recycled by filters, {result.Skipped} skipped, "
                     + $"{result.Errors.Count} failed.");
                 await ReportScanErrorsAsync(result.Errors);
                 await RefreshAsync();
@@ -550,11 +559,6 @@ public partial class MainWindow : Window
             .Where(review => review.Status != ReviewStatus.Resolved)
             .OrderBy(review => review.CreatedUtc)
             .ToArray();
-        if (state.ReviewDecisions.Count > 0)
-        {
-            SetStatus("Retry or cancel remaining review actions before clearing the queue.");
-            return;
-        }
         if (reviews.Length == 0)
         {
             return;
@@ -580,7 +584,9 @@ public partial class MainWindow : Window
             {
                 BeginReturnProgress(reviews.Length);
                 var progress = new Progress<ReviewRestoreProgress>(UpdateReturnProgress);
-                var result = await _runtime.Router.RestoreReviewsAsync(reviews, progress, CurrentCancellation);
+                ReviewRestoreResult result = null!;
+                await _runtime.Scanner.RunExclusiveAsync(async () =>
+                    result = await _runtime.Router.RestoreReviewsAsync(reviews, progress, CurrentCancellation), CurrentCancellation);
 
                 await RefreshAsync(selectFirst: false);
                 SetStatus(result.Failures.Count == 0
@@ -595,6 +601,7 @@ public partial class MainWindow : Window
 
     private async void RemoveSelectedReview(object sender, RoutedEventArgs e)
     {
+
         if (_busy)
         {
             SetStatus("Another operation is still running. Wait for it to finish, then try again.");
@@ -626,15 +633,18 @@ public partial class MainWindow : Window
             "Removing review item...",
             async () =>
             {
-                if (review.IsIncomingInPlace || !File.Exists(review.HeldFilePath))
+                await _runtime.Scanner.RunExclusiveAsync(async () =>
                 {
-                    await _runtime.Router.DismissReviewAsync(review.Id);
-                }
-                else
-                {
-                    await _runtime.Router.RestoreReviewAsync(review);
-                }
+                    if (review.FilterReview is not null || review.IsIncomingInPlace || !File.Exists(review.HeldFilePath))
+                    {
+                        await _runtime.Router.DismissReviewAsync(review.Id, CurrentCancellation);
+                    }
+                    else
+                    {
+                        await _runtime.Router.RestoreReviewAsync(review, CurrentCancellation);
+                    }
 
+                }, CurrentCancellation);
                 await RefreshAsync(selectFirst: false);
                 SetStatus("Review item removed. The incoming image was not deleted.");
             });
@@ -835,7 +845,7 @@ public partial class MainWindow : Window
         var request = _settingsSaves.Begin();
         var draft = CaptureSettingsDraftOrNull();
         ShowSettingsNotice("Settings changes are pending; destinations below show the saved settings.", isWarning: false);
-        _ = AsyncCommandRunner.RunAsync(() => AutoSaveSettingsAsync(request, draft),
+        _pendingSettingsSave = AsyncCommandRunner.RunAsync(() => AutoSaveSettingsAsync(request, draft),
             exception => _settingsSaves.IsCurrent(request)
                 ? ReportSettingsAutoSaveFailureAsync(exception, request) : Task.CompletedTask);
     }
@@ -857,6 +867,7 @@ public partial class MainWindow : Window
 
         var stateApplied = false;
         var workersOnly = false;
+        var outputChanged = false;
         var applied = await _settingsSaves.SaveAsync(request, () => Task.FromResult(draft),
             async action =>
             {
@@ -871,6 +882,8 @@ public partial class MainWindow : Window
                     if (captured.DescribeBlockingProblem(state.Settings) is { } blocking)
                         throw new InvalidOperationException(blocking);
                     workersOnly = captured.ChangesOnlyScanWorkers(state.Settings);
+                    outputChanged = !string.Equals(PathBoundary.Normalize(state.Settings.OutputRootPath),
+                        PathBoundary.Normalize(captured.OutputRootPath), StringComparison.OrdinalIgnoreCase);
                     if (workersOnly) state.Settings.ScanWorkers = captured.ScanWorkers;
                     else captured.ApplyTo(state);
                     return true;
@@ -902,8 +915,9 @@ public partial class MainWindow : Window
         UpdateStartupStatusText();
         var missing = draft.DescribeMissingFolders();
         ShowSettingsNotice(
-            missing ?? $"Settings saved at {DateTime.Now:t}. Old archives stay in place; use 'Move them into my archive' to move them.",
+            missing ?? $"Settings saved at {DateTime.Now:t}.",
             isWarning: missing is not null);
+        if (outputChanged) await ShowArchiveMoveDialogAsync();
     }
 
     /// <summary>
@@ -930,7 +944,7 @@ public partial class MainWindow : Window
                     if (currentState.ReviewDecisions.Count > 0)
                         throw new InvalidOperationException("Finish the pending review decision with Retry remaining before moving archives.");
                     ArchiveRelocation.EnsurePlanMatchesSettings(currentState.Settings, relocation);
-                    result = await ArchiveRelocation.RelocateAsync(relocation, progress, CurrentCancellation);
+                    result = await ArchiveRelocation.RelocateAsync(_runtime.StateStore, relocation, progress, CurrentCancellation);
                     var emptied = await Task.Run(() => relocation.Where(step => ArchiveRelocation.IsVerifiedEmpty(step.From)).ToArray());
                     // Completed moves must be persisted even when Stop was requested.
                     await _runtime.StateStore.UpdateAsync(
@@ -943,8 +957,7 @@ public partial class MainWindow : Window
                         // A collision or a failure leaves that record where it was, and pointing it
                         // at the destination anyway named a file that had never arrived - or, when
                         // the collision was a different image under the same name, the wrong one.
-                        ArchiveRelocation.RebaseIndex(state, result.Moves);
-                        ArchiveRelocation.ForgetRelocated(state.Settings, emptied);
+                        if (state.RelocationJournal.Count == 0) ArchiveRelocation.ForgetRelocated(state.Settings, emptied);
                         return true;
                     }, CancellationToken.None);
                 }, CurrentCancellation);
@@ -1001,13 +1014,18 @@ public partial class MainWindow : Window
             })
             .ToArray();
 
-        RetainedArchivesPanel.Visibility = steps.Count == 0
-            ? Visibility.Collapsed
-            : Visibility.Visible;
+        RetainedArchivesPanel.Visibility = _archiveMoveDialog is null ? Visibility.Collapsed : Visibility.Visible;
+        MoveRetainedArchivesButton.IsEnabled = steps.Count > 0;
+        RetainedArchivesSummary.Text = steps.Count == 0
+            ? "No images remain in the previous archive folders. New images will use your selected output folder."
+            : "These images are still in previous archive folders. Move them to your selected output folder, or close this window to leave them in place.";
     }
 
     private async void MoveRetainedArchives(object sender, RoutedEventArgs e)
     {
+        if (_busy) return;
+        await PrepareArchiveFoldersAsync();
+        await RefreshRetainedArchivesAsync();
         var relocation = _retainedArchives;
         if (relocation.Count == 0)
         {
@@ -1132,7 +1150,10 @@ public partial class MainWindow : Window
             CustomSimilarityLimits.IsChecked == true
                 ? new SimilarityThresholds(ParseSimilarityPercent(MinimumSimilarity.Text), ParseSimilarityPercent(MaximumSimilarity.Text))
                 : null,
-            ScanWorkers: Math.Max(0, ScanWorkersCombo.SelectedIndex));
+            ScanWorkers: Math.Max(0, ScanWorkersCombo.SelectedIndex),
+            RemovePrintFrame: RemovePrintFrameCheck.IsChecked == true,
+            RemoveMyImages: RemoveMyImagesCheck.IsChecked == true,
+            PlayerName: PlayerNameField.Text);
     }
 
     private static double ParseSimilarityPercent(string text) =>
@@ -1253,10 +1274,10 @@ public partial class MainWindow : Window
             "Retrying recoverable file operations...",
             async () =>
             {
-                var decisions = await _runtime.Router.RecoverPendingOperationsAsync(CurrentCancellation);
+                await new RecoveryActions(_runtime.Scanner, _runtime.StateStore, _runtime.Router).RetryAsync(CurrentCancellation);
                 await RefreshAsync(selectFirst: false);
                 var unresolved = (await _runtime.StateStore.LoadAsync()).OperationJournal.Count;
-                SetStatus($"Recovery checked {decisions.Count} operation(s); {unresolved} still need attention.");
+                SetStatus($"Recovery checked pending operations; {unresolved} still need attention.");
             });
     }
 
@@ -1277,7 +1298,7 @@ public partial class MainWindow : Window
             "Dismissing ambiguous operations...",
             async () =>
             {
-                var dismissed = await _runtime.Router.DismissNeedsAttentionOperationsAsync();
+                var dismissed = await new RecoveryActions(_runtime.Scanner, _runtime.StateStore, _runtime.Router).DismissAsync(CurrentCancellation);
                 await RefreshAsync(selectFirst: false);
                 SetStatus($"Dismissed {dismissed} operation(s) without changing files.");
             });
@@ -1324,6 +1345,7 @@ public partial class MainWindow : Window
         }
 
         _busy = true;
+        RescanFiltersButton.IsEnabled = false;
         _operationCancellation = new CancellationTokenSource();
         ScanButton.IsEnabled = false;
         ScanAnotherButton.IsEnabled = false;
@@ -1361,6 +1383,7 @@ public partial class MainWindow : Window
         {
             EndScanProgress();
             _busy = false;
+            RescanFiltersButton.IsEnabled = true;
             _operationCancellation?.Dispose();
             _operationCancellation = null;
             StopButton.IsEnabled = false;
@@ -1524,7 +1547,7 @@ public partial class MainWindow : Window
         var warnings = results.SelectMany(result => result.Errors).ToArray();
         await Dispatcher.InvokeAsync(() => SetStatus(
             $"Background scan complete: {queued} queued for review, "
-                + $"{archiveDuplicatesRemoved} archive duplicates recycled, {warnings.Length} warning(s)."));
+                + $"{archiveDuplicatesRemoved} archive duplicates recycled, {results.Sum(result => result.FilterRecycled)} recycled by filters, {warnings.Length} warning(s)."));
         if (warnings.Length > 0)
         {
             var reportTask = await Dispatcher.InvokeAsync(() => ReportScanErrorsAsync(warnings));

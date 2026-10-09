@@ -17,10 +17,12 @@ public partial class MainWindow
 {
     private readonly ComparisonPlayback _comparisonPlayback = new();
     private System.Windows.Controls.Image? _activeMatchPreview;
+    private readonly List<MatchViewer> _matchViewers = [];
     private GroupFileCard[] _groupFiles = [];
+    private bool _missingFilterDismissible;
     private bool _groupLoading;
     private bool _groupPending;
-    private bool _anyPendingGroups;
+    private bool _anyDismissibleReviews;
     private int _groupRemaining;
     private Point? _panStart;
     private Point _panOrigin;
@@ -60,22 +62,30 @@ public partial class MainWindow
         ClearGroupReview();
         var review = SelectedReview;
         if (review is null) { ShowEmptyReview(); return; }
+        SetFilterReviewLayout(review);
         _groupLoading = true;
         UpdateGroupAvailability();
         ReviewTitle.Text = Path.GetFileName(review.IncomingOriginalPath);
         ReviewTitle.ToolTip = review.IncomingOriginalPath;
-        ReviewSubtitle.Text = $"{review.Category} | Incoming + {review.Candidates.Count} archived match(es)";
+        ReviewSubtitle.Text = review.FilterReview is { } filter
+            ? $"{review.Category} | {(filter.IsArchive ? "Archive" : "Incoming")} filter review"
+            : $"{review.Category} | Incoming + {review.Candidates.Count} archived match(es)";
         IncomingAvailabilityText.Text = "Checking incoming file…";
         try
         {
             var state = await _runtime.StateStore.LoadAsync();
             var current = await IsIncomingCurrentAsync(review);
+            var dismissal = await _runtime.Router.GetReviewDismissalEligibilityAsync(review.Id);
             if (!_reviewDisplayRequests.IsCurrent(request) || SelectedReview?.Id != review.Id) return;
+            _missingFilterDismissible = review.FilterReview is not null && dismissal.CanDismiss;
             _validatedIncomingReviewId = review.Id;
             _validatedIncomingCurrent = current;
             var pending = state.ReviewDecisions.FirstOrDefault(d => d.ReviewId == review.Id);
             _groupPending = pending is not null;
-            _anyPendingGroups = state.ReviewDecisions.Count > 0;
+            _anyDismissibleReviews = false;
+            foreach (var queued in state.ReviewQueue)
+                if ((await _runtime.Router.GetReviewDismissalEligibilityAsync(queued.Id)).CanDismiss)
+                { _anyDismissibleReviews = true; break; }
             _groupRemaining = pending?.Steps.Count(step => !step.Completed) ?? 0;
             var indexed = state.ArchiveIndex.Categories.SelectMany(c => c.Images).GroupBy(i => i.Id).ToDictionary(g => g.Key, g => g.First());
             var cards = await Task.Run(() =>
@@ -83,7 +93,7 @@ public partial class MainWindow
                 var loadedCards = new List<GroupFileCard>
             {
                 new() { CandidateId = null, Path = review.HeldFilePath, Fingerprint = review.IncomingFingerprint,
-                    Label = "Incoming • reference", Details = FileDetails(review.HeldFilePath, review.IncomingImageFingerprint) }
+                    Label = review.FilterReview?.IsArchive == true ? "Archive • filter review" : "Incoming • reference", Details = FileDetails(review.HeldFilePath, review.IncomingImageFingerprint) }
             };
                 foreach (var candidate in review.Candidates)
                 {
@@ -125,6 +135,12 @@ public partial class MainWindow
             }
             IncomingAvailabilityText.Text = current ? "Incoming file available and unchanged." : "Incoming file missing or changed; refresh by scanning its folder.";
             CandidateHint.Text = "Keep incoming only recycles remaining matches. Keep all preserves incoming and remaining matches.";
+            if (review.FilterReview is { } filterInfo)
+            {
+                IncomingAvailabilityText.Text = current ? "File available and unchanged." : "File missing or changed; rescan before deciding.";
+                if (!current) IncomingAvailabilityText.Text = dismissal.CanDismiss ? "File confirmed absent. Remove review clears only its metadata." : dismissal.Reason;
+                CandidateHint.Text = $"Review removal filter: {string.Join(", ", filterInfo.Reasons.Select(FilterReasonText))}. Keep remembers an exception; Remove recycles this image.";
+            }
             _groupLoading = false;
             UpdateGroupAvailability();
             await _comparisonPlayback.ShowAsync(IncomingPreview, review.HeldFilePath);
@@ -158,11 +174,13 @@ public partial class MainWindow
         _comparisonPlayback.Clear();
         _activeMatchPreview = null;
         _previewService.Stop(IncomingPreview);
+        _missingFilterDismissible = false;
         _groupFiles = [];
         _groupPending = false;
         _groupLoading = false;
         CandidateList.ItemsSource = null;
         IncomingCard.Content = null;
+        SetFilterReviewLayout(null);
         ComparisonLabel.Text = "Select a comparison image";
         ZoomSlider.Value = 1;
         IncomingPan.X = IncomingPan.Y = ComparisonPan.X = ComparisonPan.Y = 0;
@@ -174,6 +192,17 @@ public partial class MainWindow
         if (ApplyGroupButton is null) return;
         var ready = SelectedReview is not null && _groupFiles.Length > 0 && !_busy && !_groupLoading;
         var editable = ready && !_groupPending && _validatedIncomingCurrent;
+        DismissFilterReviewButton.IsEnabled = ready && !_groupPending && _missingFilterDismissible;
+        KeepFilterButton.IsEnabled = RemoveFilterButton.IsEnabled = editable && SelectedReview?.FilterReview is not null;
+        if (SelectedReview?.FilterReview is not null)
+        {
+            foreach (var card in _groupFiles) card.Editable = false;
+            ApplyGroupButton.IsEnabled = KeepAllButton.IsEnabled = DeleteIncomingButton.IsEnabled = false;
+            RetryGroupButton.IsEnabled = CancelGroupButton.IsEnabled = RemoveReviewButton.IsEnabled = MoveUniqueButton.IsEnabled = false;
+            RemoveReviewButton.IsEnabled = ready && !_groupPending && _missingFilterDismissible;
+            ClearQueueButton.IsEnabled = !_busy && !_groupLoading && _anyDismissibleReviews;
+            return;
+        }
         foreach (var card in _groupFiles) card.Editable = editable;
         CandidateList.IsEnabled = !_busy && !_groupLoading;
         DeleteIncomingButton.IsEnabled = editable;
@@ -183,7 +212,7 @@ public partial class MainWindow
         CancelGroupButton.Visibility = _groupPending ? Visibility.Visible : Visibility.Collapsed;
         RemoveReviewButton.IsEnabled = !_busy && !_groupLoading && !_groupPending && SelectedReview is not null;
         MoveUniqueButton.IsEnabled = false;
-        ClearQueueButton.IsEnabled = !_busy && !_anyPendingGroups && QueueList.Items.Count > 0;
+        ClearQueueButton.IsEnabled = !_busy && !_groupLoading && _anyDismissibleReviews;
         ApplyGroupButton.IsEnabled = false;
         KeepAllButton.IsEnabled = editable;
         if (_groupPending)
@@ -256,6 +285,7 @@ public partial class MainWindow
             try
             {
                 await _runtime.Scanner.ApplyReviewDecisionAsync(request, CurrentCancellation);
+                CloseMatchViewers();
                 await RefreshAsync(request.ReviewId);
                 SetStatus(choice == ReviewFileAction.Keep ? "Match kept in the archive and removed from this review." : "Match sent to the Recycle Bin.");
             }
@@ -266,6 +296,22 @@ public partial class MainWindow
                 SetStatus($"Match action interrupted: {error.Message} Use Retry remaining if available.");
             }
         });
+    }
+
+    private void EnlargeMatch(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { DataContext: GroupFileCard { CandidateId: not null } card })
+        {
+            var viewer = new MatchViewer(card.Path) { Owner = this };
+            _matchViewers.Add(viewer);
+            viewer.Closed += (_, _) => _matchViewers.Remove(viewer);
+            viewer.Show();
+        }
+    }
+
+    private void CloseMatchViewers()
+    {
+        foreach (var viewer in _matchViewers.ToArray()) viewer.Close();
     }
 
     private void ReviewWindowResized(object sender, SizeChangedEventArgs e) => UpdateReviewDensity();
@@ -303,7 +349,7 @@ public partial class MainWindow
 
     private async Task ExecuteGroupDecisionAsync(bool deleteIncoming, bool retry, bool keepAll = false)
     {
-        if (_busy || _groupLoading || SelectedReview is not { } review || _groupFiles.Length == 0 || (_groupPending && !retry)) return;
+        if (_busy || _groupLoading || SelectedReview is not { } review || review.FilterReview is not null || _groupFiles.Length == 0 || (_groupPending && !retry)) return;
         var request = retry ? null : CreateGroupRequest(deleteIncoming, keepAll);
         try { request?.Validate(); }
         catch (InvalidOperationException e) { SetStatus(e.Message); return; }
@@ -314,6 +360,7 @@ public partial class MainWindow
                 var result = retry
                     ? await _runtime.Scanner.RetryReviewDecisionAsync(review.Id, CurrentCancellation)
                     : await _runtime.Scanner.ApplyReviewDecisionAsync(request!, CurrentCancellation);
+                CloseMatchViewers();
                 await RefreshAsync(result.ReviewResolved ? null : review.Id);
                 SetStatus(result.ReviewResolved ? "Review completed." : $"{result.CompletedOperations} operation(s) completed; {result.RemainingOperations} remaining.");
             }

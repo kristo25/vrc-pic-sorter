@@ -9,6 +9,11 @@ public sealed class WatchService : IDisposable
     private readonly ScanCoordinator _scanner;
     private readonly ArchiveIndexer _indexer;
     private readonly TimeSpan _debounce;
+    private readonly TimeProvider _timeProvider;
+    private readonly Dictionary<VrcImageCategory, int> _retryAttempts = [];
+    private readonly Dictionary<VrcImageCategory, PendingCategory> _processing = [];
+    private long _generation;
+    internal Func<VrcImageCategory, bool, string[], CancellationToken, Task<CategoryScanResult>>? ScanOverride { get; set; }
     private readonly TimeSpan _retryInterval;
     private readonly SemaphoreSlim _scanGate = new(1, 1);
     private readonly object _sync = new();
@@ -32,11 +37,13 @@ public sealed class WatchService : IDisposable
         ScanCoordinator scanner,
         ArchiveIndexer indexer,
         TimeSpan? debounce = null,
-        TimeSpan? retryInterval = null)
+        TimeSpan? retryInterval = null,
+        TimeProvider? timeProvider = null)
     {
         _scanner = scanner ?? throw new ArgumentNullException(nameof(scanner));
         _indexer = indexer ?? throw new ArgumentNullException(nameof(indexer));
         _debounce = debounce ?? TimeSpan.FromSeconds(1.5);
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _retryInterval = retryInterval ?? TimeSpan.FromSeconds(15);
     }
 
@@ -63,6 +70,7 @@ public sealed class WatchService : IDisposable
     {
         lock (_sync)
         {
+            ClearPending();
             foreach (var cancellation in _activeScanCancellations.ToArray())
             {
                 cancellation.Cancel();
@@ -111,6 +119,10 @@ public sealed class WatchService : IDisposable
         {
             lock (_sync)
             {
+                _generation++;
+                ClearPending();
+                _retryAttempts.Clear();
+                _processing.Clear();
                 _runCancellation.Cancel();
                 _runCancellation = new CancellationTokenSource();
                 DisposeWatchers(_watchers);
@@ -132,8 +144,9 @@ public sealed class WatchService : IDisposable
                 }
 
                 _retryTimer?.Dispose();
+                var generation = _generation;
                 _retryTimer = _isRunning
-                    ? new System.Threading.Timer(_ => RetryAttachNewlyAvailableFolders(), null, _retryInterval, _retryInterval)
+                    ? new System.Threading.Timer(_ => InSession(generation, RetryAttachNewlyAvailableFolders), null, _retryInterval, _retryInterval)
                     : null;
 
                 // Periodic safety net: filesystem notifications can be dropped, so sweep the
@@ -142,7 +155,7 @@ public sealed class WatchService : IDisposable
                 var categories = enabledMappings.Select(item => item.Category).ToArray();
                 _sweepTimer = _isRunning && sweepInterval is { } interval && interval > TimeSpan.Zero
                     ? new System.Threading.Timer(
-                        _ => RequestPeriodicSweep(categories),
+                        _ => InSession(generation, () => RequestPeriodicSweep(categories)),
                         null,
                         interval,
                         interval)
@@ -172,13 +185,11 @@ public sealed class WatchService : IDisposable
         lock (_sync)
         {
             _isRunning = false;
+            _generation++;
+            _retryAttempts.Clear();
+            _processing.Clear();
             _runCancellation.Cancel();
-            foreach (var pending in _pending.Values)
-            {
-                pending.Timer.Dispose();
-            }
-
-            _pending.Clear();
+            ClearPending();
             foreach (var cancellation in _activeScanCancellations.ToArray())
             {
                 cancellation.Cancel();
@@ -242,9 +253,16 @@ public sealed class WatchService : IDisposable
             Filter = "*.*",
             EnableRaisingEvents = false,
         };
-        FileSystemEventHandler changed = (_, e) => Queue(category, archive, e.FullPath);
-        FileSystemEventHandler removed = (_, _) => Queue(category, archive, path: null);
-        RenamedEventHandler renamed = (_, e) => Queue(category, archive, e.FullPath);
+        void QueueIfCurrent(string? filePath)
+        {
+            lock (_sync)
+            {
+                if (_watchers.Contains(watcher)) Queue(category, archive, filePath);
+            }
+        }
+        FileSystemEventHandler changed = (_, e) => QueueIfCurrent(e.FullPath);
+        FileSystemEventHandler removed = (_, _) => QueueIfCurrent(null);
+        RenamedEventHandler renamed = (_, e) => QueueIfCurrent(e.FullPath);
         ErrorEventHandler error = (_, _) => HandleWatcherError(watcher, category, archive);
         watcher.Created += changed;
         watcher.Changed += changed;
@@ -259,10 +277,8 @@ public sealed class WatchService : IDisposable
     {
         lock (_sync)
         {
-            if (_watchers.Remove(watcher))
-            {
-                DisposeWatchers([watcher]);
-            }
+            if (!_watchers.Remove(watcher)) return;
+            DisposeWatchers([watcher]);
 
             // The watcher buffer overflowed or the handle died, so individual change
             // notifications were lost. A full sweep is the only safe recovery.
@@ -270,7 +286,7 @@ public sealed class WatchService : IDisposable
         }
     }
 
-    private void Queue(
+    internal void Queue(
         VrcImageCategory category,
         bool archive,
         string? path,
@@ -287,17 +303,13 @@ public sealed class WatchService : IDisposable
             if (_pending.TryGetValue(category, out var existing))
             {
                 announced = Accumulate(existing, archive, path, requestFullScan);
-                existing.Timer.Change(_debounce, Timeout.InfiniteTimeSpan);
+                if (!existing.IsRetry) existing.Timer.Change(_debounce, Timeout.InfiniteTimeSpan);
             }
             else
             {
-                var pending = new PendingCategory(archive);
+                var pending = CreatePending(category, archive);
                 announced = Accumulate(pending, archive, path, requestFullScan);
-                pending.Timer = new System.Threading.Timer(
-                    _ => _ = ProcessAsync(category),
-                    null,
-                    _debounce,
-                    Timeout.InfiniteTimeSpan);
+                pending.Timer.Change(_debounce, Timeout.InfiniteTimeSpan);
                 _pending[category] = pending;
             }
         }
@@ -320,9 +332,11 @@ public sealed class WatchService : IDisposable
     {
         pending.ArchiveChanged |= archive;
         pending.FullScanRequested |= requestFullScan;
-        return !archive
-            && !string.IsNullOrWhiteSpace(path)
-            && pending.SourcePaths.Add(path);
+        var announced = !archive && !string.IsNullOrWhiteSpace(path)
+            && !pending.FullScanRequested && pending.SourcePaths.Add(path);
+        if (pending.SourcePaths.Count > 1024) pending.FullScanRequested = true;
+        if (pending.FullScanRequested) pending.SourcePaths.Clear();
+        return announced;
     }
 
     private void RequestPeriodicSweep(IReadOnlyList<VrcImageCategory> categories)
@@ -415,7 +429,7 @@ public sealed class WatchService : IDisposable
         }
     }
 
-    private async Task ProcessAsync(VrcImageCategory category)
+    private async Task ProcessAsync(VrcImageCategory category, PendingCategory expected, long generation)
     {
         bool fullScanRequested;
         string[] scanSourcePaths;
@@ -423,11 +437,13 @@ public sealed class WatchService : IDisposable
         CancellationToken cancellationToken;
         lock (_sync)
         {
-            if (!_pending.Remove(category, out var pending))
+            if (!_isRunning || generation != _generation || _processing.ContainsKey(category)
+                || !_pending.TryGetValue(category, out var pending) || !ReferenceEquals(pending, expected))
             {
                 return;
             }
 
+            _pending.Remove(category);
             pending.Timer.Dispose();
             fullScanRequested = pending.FullScanRequested;
 
@@ -438,6 +454,7 @@ public sealed class WatchService : IDisposable
                 return;
             }
 
+            _processing[category] = pending;
             // Linked so Stop cancels this scan while watching itself keeps running. Not disposed
             // here if it belongs to another in-flight category; each run disposes its own.
             scanCancellation = CancellationTokenSource.CreateLinkedTokenSource(_runCancellation.Token);
@@ -446,6 +463,8 @@ public sealed class WatchService : IDisposable
         }
 
         var enteredScanGate = false;
+        var retryRequired = false;
+        var succeeded = false;
         try
         {
             await _scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -453,7 +472,11 @@ public sealed class WatchService : IDisposable
             // Watching analyzes only images that arrived while it was running. A full sweep
             // happens on demand from Scan now, or here when a watcher error lost events.
             CategoryScanResult result;
-            if (fullScanRequested)
+            if (ScanOverride is { } scan)
+            {
+                result = await scan(category, fullScanRequested, scanSourcePaths, cancellationToken).ConfigureAwait(false);
+            }
+            else if (fullScanRequested)
             {
                 result = await _scanner.ScanCategoryAsync(category, cancellationToken).ConfigureAwait(false);
             }
@@ -475,9 +498,12 @@ public sealed class WatchService : IDisposable
                     0,
                     0,
                     cleanup.Warnings,
-                    ArchiveDuplicatesRemoved: cleanup.Removed);
+                    ArchiveDuplicatesRemoved: cleanup.Removed,
+                    RetryRequired: cleanup.RetryRequired);
             }
 
+            retryRequired = result.RetryRequired;
+            succeeded = !retryRequired && result.Errors.Count == 0;
             ScanCompleted?.Invoke(this, result);
         }
         catch (OperationCanceledException)
@@ -486,6 +512,7 @@ public sealed class WatchService : IDisposable
         }
         catch (Exception exception)
         {
+            retryRequired = ScanRetry.IsTransient(exception);
             if (!_disposed)
             {
                 Exception failure = exception;
@@ -519,10 +546,65 @@ public sealed class WatchService : IDisposable
             lock (_sync)
             {
                 _activeScanCancellations.Remove(scanCancellation);
+                if (generation == _generation && _processing.TryGetValue(category, out var current) && ReferenceEquals(current, expected))
+                {
+                    _processing.Remove(category);
+                    if (!cancellationToken.IsCancellationRequested && _isRunning && !_disposed)
+                    {
+                        if (succeeded) _retryAttempts.Remove(category);
+                        if (retryRequired) ScheduleRetry(category, _analyzeOnDetection || fullScanRequested);
+                        else if (_pending.TryGetValue(category, out var next)) next.Timer.Change(_debounce, Timeout.InfiniteTimeSpan);
+                    }
+                    else if (_isRunning && _pending.TryGetValue(category, out var next))
+                        next.Timer.Change(_debounce, Timeout.InfiniteTimeSpan);
+                }
             }
 
             scanCancellation.Dispose();
         }
+    }
+
+    // All scheduling state is guarded by _sync. Timer identity and generation reject callbacks
+    // already queued when a timer was disposed or a watch session was replaced.
+    private PendingCategory CreatePending(VrcImageCategory category, bool archive)
+    {
+        var pending = new PendingCategory(archive);
+        var generation = _generation;
+        pending.Timer = _timeProvider.CreateTimer(_ => _ = ProcessAsync(category, pending, generation),
+            null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        return pending;
+    }
+
+    private void ClearPending()
+    {
+        foreach (var pending in _pending.Values) pending.Timer.Dispose();
+        _pending.Clear();
+    }
+
+    private void InSession(long generation, Action callback)
+    {
+        lock (_sync)
+        {
+            if (_isRunning && generation == _generation) callback();
+        }
+    }
+
+    private void ScheduleRetry(VrcImageCategory category, bool fullScan)
+    {
+        if (!_pending.TryGetValue(category, out var pending))
+        {
+            pending = CreatePending(category, archive: true);
+            _pending[category] = pending;
+        }
+        // An archive-only failure in OnInterval mode must not start source analysis early.
+        pending.FullScanRequested |= fullScan;
+        pending.ArchiveChanged = true;
+        pending.SourcePaths.Clear();
+        pending.IsRetry = true;
+        var attempt = _retryAttempts.GetValueOrDefault(category);
+        int[] seconds = [2, 5, 15, 30, 60];
+        _retryAttempts[category] = Math.Min(attempt + 1, seconds.Length - 1);
+        pending.Timer.Change(TimeSpan.FromSeconds(seconds[attempt]), Timeout.InfiniteTimeSpan);
     }
 
     private sealed class PendingCategory(bool archiveChanged)
@@ -534,7 +616,8 @@ public sealed class WatchService : IDisposable
         /// <summary>Source files the watcher reported since the last debounce window.</summary>
         public HashSet<string> SourcePaths { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-        public System.Threading.Timer Timer { get; set; } = null!;
+        public ITimer Timer { get; set; } = null!;
+        public bool IsRetry { get; set; }
     }
 
     private sealed record WatchTarget(string Path, VrcImageCategory Category, bool Archive);

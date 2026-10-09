@@ -14,6 +14,7 @@ public static class ManualKeepRules
 
     public static void Repoint(AppStateDocument state, string source, string destination)
     {
+        FilterKeepRules.Repoint(state, source, destination);
         for (var i = 0; i < state.ManualKeeps.Count; i++)
         {
             if (SamePath(state.ManualKeeps[i].Path, source))

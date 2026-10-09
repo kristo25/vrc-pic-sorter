@@ -96,7 +96,9 @@ public sealed class AppRuntime : IDisposable
             await RepairMigratedPathsAsync(previousDirectory, cancellationToken).ConfigureAwait(false);
         }
 
-        _ = await Router.RecoverPendingOperationsAsync(cancellationToken).ConfigureAwait(false);
+        _ = await ArchiveRelocation.RecoverAsync(StateStore, cancellationToken).ConfigureAwait(false);
+        if ((await StateStore.LoadAsync(cancellationToken).ConfigureAwait(false)).RelocationJournal.Count == 0)
+            _ = await Router.RecoverPendingOperationsAsync(cancellationToken).ConfigureAwait(false);
 
         // A start-with-Windows registration made under the old name would otherwise keep launching
         // whatever now sits at the old executable's path, while Settings reported the option as

@@ -1,4 +1,5 @@
 using VrcPicSorter.Core.Models;
+using VrcPicSorter.Core.FileSystem;
 
 namespace VrcPicSorter.Core.Scanning;
 
@@ -11,7 +12,8 @@ public sealed record ArchiveDuplicateSnapshot(
 
 public sealed record ArchiveDuplicateCleanupResult(
     int Removed,
-    IReadOnlyList<string> Warnings)
+    IReadOnlyList<string> Warnings,
+    bool RetryRequired = false)
 {
     public bool IsComplete => Warnings.Count == 0;
 }
@@ -77,9 +79,10 @@ public sealed partial class ScanCoordinator
         await _scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await _indexer.RefreshAsync(category, cancellationToken).ConfigureAwait(false);
-            return await CleanIndexedArchiveDuplicatesCoreAsync([category], cancellationToken)
+            var refreshed = await _indexer.RefreshAsync(category, cancellationToken).ConfigureAwait(false);
+            var cleanup = await CleanIndexedArchiveDuplicatesCoreAsync([category], cancellationToken)
                 .ConfigureAwait(false);
+            return cleanup with { RetryRequired = cleanup.RetryRequired || refreshed.RetryRequired };
         }
         finally
         {
@@ -92,8 +95,11 @@ public sealed partial class ScanCoordinator
         CancellationToken cancellationToken)
     {
         var state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        if (state.RelocationJournal.Count > 0)
+            return new ArchiveDuplicateCleanupResult(0, [ArchiveRelocation.PendingMessage]);
         var groups = new List<ArchiveDuplicateGroup>();
         var warnings = new List<string>();
+        var retryRequired = false;
         foreach (var category in categories.Distinct())
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -113,6 +119,7 @@ public sealed partial class ScanCoordinator
             var missing = roots.Where(path => !Directory.Exists(path)).ToArray();
             if (missing.Length > 0)
             {
+                retryRequired = true;
                 warnings.AddRange(missing.Select(path => $"{category}: archive folder is unavailable: {path}"));
                 continue;
             }
@@ -130,7 +137,7 @@ public sealed partial class ScanCoordinator
         // a partial-coverage decision without a person explicitly accepting that risk.
         if (warnings.Count > 0)
         {
-            return new ArchiveDuplicateCleanupResult(0, warnings);
+            return new ArchiveDuplicateCleanupResult(0, warnings, retryRequired);
         }
 
         var removed = 0;
@@ -154,11 +161,12 @@ public sealed partial class ScanCoordinator
                         or UnauthorizedAccessException)
                 {
                     warnings.Add($"{extra.Path}: {exception.Message}");
+                    retryRequired |= ScanRetry.IsTransient(exception);
                 }
             }
         }
 
-        return new ArchiveDuplicateCleanupResult(removed, warnings);
+        return new ArchiveDuplicateCleanupResult(removed, warnings, retryRequired);
     }
 
     private async Task<ArchiveDuplicateSnapshot> RefreshArchiveDuplicatesCoreAsync(

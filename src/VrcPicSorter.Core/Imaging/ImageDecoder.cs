@@ -47,7 +47,16 @@ public sealed class ImageDecoder
         using var lease = await budget.AcquireAsync(estimate, token).ConfigureAwait(false);
         stream.Position = 0;
         var decoded = await DecodeCoreAsync(stream, path, info, token).ConfigureAwait(false);
-        if (!decoded.IsSuccess) throw new InvalidDataException(decoded.Failure!.Message);
+        if (!decoded.IsSuccess)
+        {
+            var failure = decoded.Failure!;
+            throw failure.Kind switch
+            {
+                ImageDecodeFailureKind.AccessDenied => new UnauthorizedAccessException(failure.Message),
+                ImageDecodeFailureKind.InputOutput or ImageDecodeFailureKind.FileNotFound => new IOException(failure.Message),
+                _ => new InvalidDataException(failure.Message),
+            };
+        }
         token.ThrowIfCancellationRequested();
         return ImageFingerprint.Create(decoded.Image!);
     }

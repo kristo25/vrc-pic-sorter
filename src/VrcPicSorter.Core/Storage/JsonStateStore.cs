@@ -82,6 +82,7 @@ public sealed class JsonStateStore : IDisposable
     private readonly Func<AppStateDocument> _defaultStateFactory;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _disposed;
+    internal Action<AppStateDocument>? BeforeStateWrite { get; set; }
 
     public JsonStateStore(string stateDirectory, Func<AppStateDocument>? defaultStateFactory = null)
     {
@@ -198,6 +199,7 @@ public sealed class JsonStateStore : IDisposable
                 var pendingOperations = state.OperationJournal
                     .Where(entry => entry.Phase is not JournalPhase.Completed)
                     .Select(entry => entry.Id)
+                    .Concat(state.RelocationJournal.Select(entry => entry.Id))
                     .ToArray();
 
                 if (pendingOperations.Length > 0)
@@ -500,6 +502,7 @@ public sealed class JsonStateStore : IDisposable
         bool requireCurrentRevision,
         CancellationToken cancellationToken)
     {
+        BeforeStateWrite?.Invoke(state);
         AppStateCompactor.Compact(state);
         AppStateValidator.Validate(state);
         Directory.CreateDirectory(StateDirectory);

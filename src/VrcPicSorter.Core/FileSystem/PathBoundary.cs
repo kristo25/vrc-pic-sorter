@@ -2,7 +2,9 @@ namespace VrcPicSorter.Core.FileSystem;
 
 public static class PathBoundary
 {
-    public static bool IsConfirmedMissingDirectory(string path)
+    public static bool IsConfirmedMissingDirectory(string path) => IsConfirmedMissingPath(path);
+
+    public static bool IsConfirmedMissingPath(string path)
     {
         var normalized = Normalize(path);
         try

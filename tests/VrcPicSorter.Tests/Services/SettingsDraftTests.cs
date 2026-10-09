@@ -6,6 +6,38 @@ namespace VrcPicSorter.Tests.Services;
 public sealed class SettingsDraftTests
 {
     [Fact]
+    public void RemovalFiltersDefaultOffAndRequireName()
+    {
+        using var directory = new TestDirectory();
+        var state = AppStateDefaults.Create(directory.GetPath("profile"), directory.GetPath("local"));
+        var draft = Draft(directory.GetPath("output"), VrcImageCategory.Prints, directory.GetPath("incoming"));
+        Assert.False(draft.RemovePrintFrame);
+        Assert.False(draft.RemoveMyImages);
+        Assert.NotNull((draft with { RemoveMyImages = true }).DescribeBlockingProblem(state.Settings));
+        draft = draft with { RemoveMyImages = true, PlayerName = " Player_Name雪 " };
+        Assert.Null(draft.DescribeBlockingProblem(state.Settings));
+        draft.ApplyTo(state);
+        Assert.Equal(" Player_Name雪 ", state.Settings.PlayerName);
+        Assert.True(state.Settings.RemoveMyImages);
+        (draft with { PlayerName = "" }).ApplyTo(state);
+        Assert.False(state.Settings.RemoveMyImages);
+    }
+
+    [Fact]
+    public void FilterChangeCannotBeSavedAsWorkerOnlyChange()
+    {
+        using var directory = new TestDirectory();
+        var state = AppStateDefaults.Create(directory.GetPath("profile"), directory.GetPath("local"));
+        var draft = Draft(directory.GetPath("output"), VrcImageCategory.Prints, directory.GetPath("incoming"));
+        draft.ApplyTo(state);
+        var workers = draft with { ScanWorkers = 2 };
+        Assert.True(workers.ChangesOnlyScanWorkers(state.Settings));
+        Assert.False((workers with { RemovePrintFrame = true }).ChangesOnlyScanWorkers(state.Settings));
+        Assert.False((workers with { PlayerName = "Player" }).ChangesOnlyScanWorkers(state.Settings));
+        Assert.False((workers with { RemoveMyImages = true }).ChangesOnlyScanWorkers(state.Settings));
+    }
+
+    [Fact]
     public void PendingGroupPreventsChangingOutputFolder()
     {
         using var directory = new TestDirectory();

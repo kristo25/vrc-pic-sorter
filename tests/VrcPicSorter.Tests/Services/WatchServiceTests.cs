@@ -175,6 +175,58 @@ public sealed class WatchServiceTests
         Assert.Empty(Directory.GetFiles(archive));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LockedArchiveRecoversWithoutAnotherFileEvent(bool cancel)
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("source");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(archive);
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        var state = await store.LoadAsync();
+        var decoder = new ImageDecoder();
+        var indexer = new ArchiveIndexer(store, decoder);
+        var scanner = new ScanCoordinator(store, indexer, decoder,
+            new FileRouter(store, decoder, new FileRouterTests.FakeRecycleBinService()), TimeSpan.Zero);
+        var archived = Path.Combine(archive, "existing.png");
+        using (var image = ImageFixtureFactory.CreatePattern(301)) await image.SaveAsPngAsync(archived);
+        using var watcher = new WatchService(scanner, indexer, TimeSpan.FromMilliseconds(50));
+        var failed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var recovered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        watcher.ScanCompleted += (_, result) =>
+        {
+            if (result.Errors.Count > 0) failed.TrySetResult();
+            if (result.MovedUnique > 0) recovered.TrySetResult();
+        };
+        watcher.Start(state.Settings.CategoryMappings);
+        var incoming = Path.Combine(source, "incoming.png");
+        using (var locked = new FileStream(archived, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            using var image = ImageFixtureFactory.CreatePattern(302);
+            await image.SaveAsPngAsync(incoming);
+            await failed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(File.Exists(incoming));
+            if (cancel) watcher.CancelActiveScan();
+        }
+        // Releasing a read handle creates no filesystem event. Only retained work can recover.
+        if (cancel)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2.5));
+            await watcher.StopAsync();
+            Assert.False(recovered.Task.IsCompleted);
+            Assert.True(File.Exists(incoming));
+            Assert.Single(Directory.GetFiles(archive, "*.png", SearchOption.AllDirectories));
+            return;
+        }
+        await recovered.Task.WaitAsync(TimeSpan.FromSeconds(8));
+        await watcher.StopAsync();
+        Assert.False(File.Exists(incoming));
+        Assert.Equal(2, Directory.GetFiles(archive, "*.png", SearchOption.AllDirectories).Length);
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;

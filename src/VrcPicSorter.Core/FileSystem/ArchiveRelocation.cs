@@ -1,4 +1,5 @@
 using VrcPicSorter.Core.Models;
+using VrcPicSorter.Core.Storage;
 
 namespace VrcPicSorter.Core.FileSystem;
 
@@ -57,8 +58,79 @@ public sealed record ArchiveRelocationProgress(int Moved, int Total, string File
 /// is exactly as stranded as the one abandoned a moment ago.
 /// </para>
 /// </remarks>
-public static class ArchiveRelocation
+public static partial class ArchiveRelocation
 {
+    /// <summary>Creates missing category folders only when their immediate parent is accessible.</summary>
+    /// <remarks>Explicit preparation, separate from the read-only inventory. An unavailable
+    /// drive, parent, or share must remain an inventory error rather than an empty archive.</remarks>
+    public static IReadOnlyList<string> PrepareMissingArchiveFolders(AppSettings settings, string? newOutputRoot = null)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        newOutputRoot ??= settings.OutputRootPath;
+        var errors = new List<string>();
+        if (!string.IsNullOrWhiteSpace(newOutputRoot))
+        {
+            try
+            {
+                var destination = PathBoundary.Normalize(newOutputRoot);
+                PathBoundary.EnsureNoReparsePoints(destination, "Archive destination");
+                var ancestor = destination;
+                while (true)
+                {
+                    try
+                    {
+                        if ((File.GetAttributes(ancestor) & FileAttributes.Directory) == 0)
+                            throw new IOException($"Archive destination parent is not a folder: {ancestor}");
+                        _ = Directory.GetFileSystemEntries(ancestor);
+                        break;
+                    }
+                    catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+                    {
+                        ancestor = Path.GetDirectoryName(ancestor)
+                            ?? throw new IOException($"Archive destination storage is unavailable: {destination}");
+                    }
+                }
+                Directory.CreateDirectory(destination);
+                PathBoundary.EnsureNoReparsePoints(destination, "Archive destination");
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                or InvalidOperationException or ArgumentException or NotSupportedException)
+            {
+                errors.Add($"Could not prepare archive destination {newOutputRoot}: {exception.Message}");
+            }
+        }
+        var enabled = settings.CategoryMappings.Where(item => item.IsEnabled).ToArray();
+        var roots = enabled.Select(item => item.ArchivePath)
+            .Concat(settings.LegacyArchiveMappings
+                .Where(item => enabled.Any(mapping => mapping.Category == item.Category))
+                .Select(item => item.ArchivePath))
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+        foreach (var root in roots)
+        {
+            try
+            {
+                var normalized = PathBoundary.Normalize(root);
+                PathBoundary.EnsureNoReparsePoints(normalized, "Archive folder");
+                if (PathBoundary.IsConfirmedMissingDirectory(normalized))
+                {
+                    Directory.CreateDirectory(normalized);
+                    PathBoundary.EnsureNoReparsePoints(normalized, "Archive folder");
+                }
+                // GetAttributes preserves missing/offline/access-denied failures instead of
+                // Directory.Exists silently translating them into an empty inventory.
+                if ((File.GetAttributes(normalized) & FileAttributes.Directory) == 0)
+                    throw new IOException($"Archive path is not a folder: {normalized}");
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                or InvalidOperationException or ArgumentException or NotSupportedException)
+            {
+                errors.Add($"Could not prepare archive folder {root}: {exception.Message}");
+            }
+        }
+        return errors;
+    }
+
     public static void EnsurePlanMatchesSettings(AppSettings settings, IEnumerable<ArchiveRelocationStep> steps)
     {
         foreach (var step in steps)
@@ -155,7 +227,8 @@ public static class ArchiveRelocation
     private static ArchiveRelocationResult RelocateCore(
         IEnumerable<ArchiveRelocationStep> steps,
         IProgress<ArchiveRelocationProgress>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        JsonStateStore? store = null)
     {
         ArgumentNullException.ThrowIfNull(steps);
         var planned = steps.ToArray();
@@ -213,7 +286,9 @@ public static class ArchiveRelocation
                     var sourceInfo = new FileInfo(file);
                     sourceSize = sourceInfo.Length;
                     sourceStamp = sourceInfo.LastWriteTimeUtc;
-                    destination = VerifiedArchiveTransfer.Move(file, step.To, destination);
+                    destination = store is null
+                        ? VerifiedArchiveTransfer.Move(file, step.To, destination)
+                        : MoveDurably(store, step, file, destination);
                 }
                 catch (Exception exception) when (
                     exception is IOException
@@ -307,6 +382,12 @@ public static class ArchiveRelocation
                         && keep.FileSize == size && keep.LastWriteUtc == stamp)
                         state.ManualKeeps[i] = keep with { LastWriteUtc = destinationStamp };
                 }
+                for (var i = 0; i < state.FilterKeeps.Count; i++)
+                {
+                    var keep = state.FilterKeeps[i];
+                    if (SameRoot(keep.Path, move.From) && keep.FileSize == size && keep.LastWriteUtc == stamp)
+                        state.FilterKeeps[i] = keep with { LastWriteUtc = destinationStamp };
+                }
             }
         }
 
@@ -346,8 +427,12 @@ public static class ArchiveRelocation
             }
         }
 
-        foreach (var review in state.ReviewQueue.Where(item => item.Status != ReviewStatus.Resolved))
+        var journalEntries = state.OperationJournal.Concat(state.ReviewDecisions.SelectMany(group => group.Steps)
+            .Select(step => step.Operation)).ToArray();
+        foreach (var review in state.ReviewQueue.Concat(journalEntries
+            .Where(entry => entry.ReviewItemAfterCommit is not null).Select(entry => entry.ReviewItemAfterCommit!)))
         {
+            if (TryFollow(landed, review.IncomingOriginalPath, out var originalPath)) review.IncomingOriginalPath = originalPath;
             if (TryFollow(landed, review.HeldFilePath, out var heldPath))
             {
                 review.HeldFilePath = heldPath;
@@ -370,8 +455,11 @@ public static class ArchiveRelocation
             }
         }
 
-        foreach (var entry in state.OperationJournal.Where(item => item.Phase != JournalPhase.Completed))
+        foreach (var entry in journalEntries)
         {
+            if (TryFollow(landed, entry.DestinationPath, out var destinationPath)) entry.DestinationPath = destinationPath;
+            if (entry.IndexedImageAfterCommit is { } payload && TryFollow(landed, payload.Path, out var payloadPath))
+                payload.Path = payloadPath;
             if (TryFollow(landed, entry.SourcePath, out var sourcePath))
             {
                 entry.SourcePath = sourcePath;
@@ -382,6 +470,10 @@ public static class ArchiveRelocation
                 entry.SurvivingPath = survivingPath;
             }
         }
+
+        foreach (var decision in state.ReviewDecisions)
+            decision.Files = decision.Files.Select(file => TryFollow(landed, file.Path, out var path)
+                ? file with { Path = path } : file).ToList();
 
         return rebased;
     }
@@ -445,6 +537,7 @@ public static class ArchiveRelocation
     /// <summary>Explicit user acknowledgement only: forget metadata, never move or delete files.</summary>
     public static int ForgetUnavailable(AppStateDocument state, string root)
     {
+        EnsureResolved(state);
         root = PathBoundary.Normalize(root);
         if (!state.Settings.LegacyArchiveMappings.Any(item => SameRoot(item.ArchivePath, root)))
             throw new InvalidOperationException("That folder is no longer a retained archive. Refresh the list.");

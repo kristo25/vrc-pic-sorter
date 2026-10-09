@@ -42,7 +42,7 @@ public sealed class GroupReviewTests
             f.Request(_ => ReviewFileAction.Unchanged, ReviewFileAction.Remove, true)));
         await Assert.ThrowsAsync<InvalidOperationException>(() => f.Router.DismissReviewAsync(f.Review.Id));
         await Assert.ThrowsAsync<InvalidOperationException>(() => f.Router.RestoreReviewAsync(f.Review));
-        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Router.RestoreReviewsAsync([f.Review]));
+        Assert.Single((await f.Router.RestoreReviewsAsync([f.Review])).Failures);
         var state = await f.Store.LoadAsync();
         Assert.Single(state.ReviewQueue); Assert.Single(state.ReviewDecisions);
         Assert.True(File.Exists(f.Incoming)); Assert.Empty(f.Recycler.Removed);
@@ -427,6 +427,90 @@ public sealed class GroupReviewTests
         Assert.Empty(f.Recycler.Removed);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FilterMetadataDismissalRequiresAccessibleParentAndAbsentFile(bool unavailable)
+    {
+        using var f = await Fixture.Create(0);
+        await f.Store.UpdateAsync(s => { s.ReviewQueue[0].FilterReview = new(); return true; });
+        if (unavailable) Directory.Move(Path.GetDirectoryName(f.Incoming)!, f.Directory.GetPath("offline"));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Router.DismissReviewAsync(f.Review.Id));
+        Assert.NotEqual(ReviewStatus.Resolved, Assert.Single((await f.Store.LoadAsync()).ReviewQueue).Status);
+        Assert.Empty(f.Recycler.Removed);
+    }
+
+    [Fact]
+    public async Task MissingFilterReviewDismissalChangesOnlyMetadata()
+    {
+        using var f = await Fixture.Create(0);
+        await f.Store.UpdateAsync(s => { s.ReviewQueue[0].FilterReview = new(); return true; });
+        File.Delete(f.Incoming);
+        await f.Router.DismissReviewAsync(f.Review.Id);
+        Assert.Empty((await f.Store.LoadAsync()).ReviewQueue);
+        Assert.Empty(f.Recycler.Removed);
+    }
+    [Theory]
+    [InlineData("source")]
+    [InlineData("destination")]
+    [InlineData("survivor")]
+    [InlineData("payload")]
+    [InlineData("group")]
+    [InlineData("relocation")]
+    public async Task MissingFilterDismissalRespectsAllOperationOwners(string owner)
+    {
+        using var f = await Fixture.Create(0);
+        File.Delete(f.Incoming);
+        await f.Store.UpdateAsync(s =>
+        {
+            s.ReviewQueue[0].FilterReview = new();
+            var journal = new JournalEntry { Id = Guid.NewGuid(), SourcePath = f.Directory.GetPath("other.png") };
+            if (owner == "source") journal.SourcePath = f.Incoming;
+            if (owner == "destination") journal.DestinationPath = f.Incoming;
+            if (owner == "survivor") journal.SurvivingPath = f.Incoming;
+            if (owner == "payload") journal.ReviewItemAfterCommit = new() { HeldFilePath = f.Incoming };
+            if (owner == "group") s.ReviewDecisions.Add(new() { ReviewId = Guid.NewGuid(), Files = [new(null, f.Incoming, "identity", ReviewFileAction.Keep)] });
+            else if (owner == "relocation") s.RelocationJournal.Add(new() { SourcePath = f.Incoming, DestinationPath = f.Directory.GetPath("moved.png") });
+            else s.OperationJournal.Add(journal);
+            return true;
+        });
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Router.DismissReviewAsync(f.Review.Id));
+        Assert.Single((await f.Store.LoadAsync()).ReviewQueue);
+        Assert.Empty(f.Recycler.Removed);
+    }
+
+    [Fact]
+    public async Task MissingFilterDismissalRechecksReappearingFile()
+    {
+        using var f = await Fixture.Create(0);
+        await f.Store.UpdateAsync(s => { s.ReviewQueue[0].FilterReview = new(); return true; });
+        File.Delete(f.Incoming);
+        Assert.True((await f.Router.GetReviewDismissalEligibilityAsync(f.Review.Id)).CanDismiss);
+        await File.WriteAllTextAsync(f.Incoming, "replacement");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Router.DismissReviewAsync(f.Review.Id));
+        Assert.Equal("replacement", await File.ReadAllTextAsync(f.Incoming));
+        Assert.Single((await f.Store.LoadAsync()).ReviewQueue);
+    }
+
+    [Fact]
+    public async Task ClearMixedFilterQueueRetainsPresentUnavailableAndOwnedReviews()
+    {
+        using var f = await Fixture.Create(0);
+        var paths = new[] { f.Directory.GetPath("missing.png"), f.Incoming, f.Directory.GetPath("offline", "missing.png"), f.Directory.GetPath("owned.png") };
+        var reviews = paths.Select(p => new ReviewItem { Id = Guid.NewGuid(), HeldFilePath = p, IncomingOriginalPath = p, FilterReview = new() }).ToArray();
+        await f.Store.UpdateAsync(s =>
+        {
+            s.ReviewQueue = reviews.ToList();
+            s.OperationJournal.Add(new() { Id = Guid.NewGuid(), SourcePath = paths[3] });
+            return true;
+        });
+        var result = await f.Router.RestoreReviewsAsync(reviews);
+        Assert.Equal(1, result.Restored);
+        Assert.Equal(3, result.Failures.Count);
+        Assert.Equal(reviews.Skip(1).Select(r => r.Id).Order(), (await f.Store.LoadAsync()).ReviewQueue.Select(r => r.Id).Order());
+        Assert.True(File.Exists(f.Incoming));
+        Assert.Empty(f.Recycler.Removed);
+    }
     private sealed class Fixture : IDisposable
     {
         public TestDirectory Directory { get; }

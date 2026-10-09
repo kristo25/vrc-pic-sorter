@@ -17,7 +17,8 @@ public sealed record ArchiveIndexResult(
     long Generation,
     int IndexedFiles,
     IReadOnlyList<string> Errors,
-    IReadOnlyList<string> SkippedFiles);
+    IReadOnlyList<string> SkippedFiles,
+    bool RetryRequired = false);
 
 public sealed class ArchiveIndexer
 {
@@ -82,7 +83,7 @@ public sealed class ArchiveIndexer
                 0,
                 0,
                 ["Archive folder is unavailable."],
-                []);
+                [], RetryRequired: true);
         }
 
         if (!reuseUnchanged)
@@ -117,16 +118,17 @@ public sealed class ArchiveIndexer
                 0,
                 0,
                 [exception.Message],
-                []);
+                [], RetryRequired: ScanRetry.IsTransient(exception));
         }
 
         await Concurrency.PrepareAsync(state.Settings, paths, null, cancellationToken).ConfigureAwait(false);
         var session = await Concurrency.StartAsync("Archive", cancellationToken).ConfigureAwait(false);
         using var readers = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var pending = new Queue<Task<(IndexedImageRecord? Record, string? Error)>>();
+        var retryRequired = false;
+        var pending = new Queue<Task<(IndexedImageRecord? Record, string? Error, bool Retry)>>();
         using var iterator = paths.GetEnumerator();
         var exhausted = false;
-        async Task<(IndexedImageRecord? Record, string? Error)> PrepareRecord(string path)
+        async Task<(IndexedImageRecord? Record, string? Error, bool Retry)> PrepareRecord(string path)
         {
             try
             {
@@ -135,7 +137,7 @@ public sealed class ArchiveIndexer
                 var length = info.Length; var written = info.LastWriteTimeUtc;
                 if (reuseUnchanged && previousRecords.TryGetValue(path, out var previous)
                     && previous.Fingerprint!.HasCurrentFeatures && previous.FileSize == length && previous.LastWriteUtc == written)
-                    return (previous, null);
+                    return (previous, null, false);
                 var fingerprint = await Concurrency.ReadAsync(path, readers.Token).ConfigureAwait(false);
                 var after = new FileInfo(path);
                 if (length != after.Length || written != after.LastWriteTimeUtc)
@@ -153,11 +155,11 @@ public sealed class ArchiveIndexer
                     ExactFingerprint = fingerprint.ExactIdentity,
                     PerceptualFingerprint = fingerprint.PerceptualFrames[0].DifferenceHash,
                     Fingerprint = fingerprint,
-                }, null);
+                }, null, false);
             }
             catch (Exception error) when (ScanConcurrencyController.IsReadFailure(error))
             {
-                return (null, $"{path}: {error.Message}");
+                return (null, $"{path}: {error.Message}", ScanRetry.IsTransient(error));
             }
         }
         try
@@ -173,6 +175,7 @@ public sealed class ArchiveIndexer
                 if (pending.Count == 0) break;
                 var prepared = await pending.Dequeue().ConfigureAwait(false);
                 session.Completed(prepared.Error is null, !exhausted);
+                retryRequired |= prepared.Retry;
                 if (prepared.Record is not null) indexed.Add(prepared.Record);
                 else skipped.Add(prepared.Error!);
             }
@@ -186,7 +189,7 @@ public sealed class ArchiveIndexer
                 + string.Join(Environment.NewLine, skipped.Take(10));
             await PublishUnavailableAsync(category, error, cancellationToken).ConfigureAwait(false);
             return new ArchiveIndexResult(category, IndexStatus.Unavailable, previousIndex.Generation,
-                previousIndex.Images.Count, [error], skipped);
+                previousIndex.Images.Count, [error], skipped, retryRequired);
         }
 
         if (reuseUnchanged
