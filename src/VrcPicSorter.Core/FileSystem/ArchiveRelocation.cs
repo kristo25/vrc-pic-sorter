@@ -276,6 +276,8 @@ public static partial class ArchiveRelocation
 
                 var relative = Path.GetRelativePath(step.From, file);
                 var destination = Path.Combine(step.To, relative);
+                if (VrcPicSorter.Core.Atlas.EmojiAtlasName.TryParse(file, out _))
+                    destination = VrcPicSorter.Core.Atlas.AtlasAnimationWriter.BuildReferenceDestination(destination, step.To);
                 long? sourceSize = null;
                 DateTimeOffset? sourceStamp = null;
                 try

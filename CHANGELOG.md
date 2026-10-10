@@ -3,6 +3,27 @@
 All notable changes to VRC Pic Sorter are recorded here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-10-10
+
+### Added
+
+- Multiple-match review with individual keep/recycle actions, recoverable group decisions, and persistent protection for explicitly kept copies.
+- Nonmodal enlarged match previews.
+- Optional print-frame and player-name removal filters, disabled by default.
+
+### Fixed
+
+- Atlas sheets are filed under Animated/Gif Ref independently of GIF generation, including skipped or suppressed animations and archive relocation.
+- Existing misplaced atlases are filed on scan; filename collisions preserve both files.
+- Improved image matching and refreshed scoring of queued reviews.
+- Durable archive relocation preserves explicit Keep decisions through interruption and restart.
+- Recovery actions share scanner locks; missing reviews can be dismissed safely.
+- Failed profile migration stops startup safely; transient watcher failures receive bounded retries.
+
+### Security
+
+- Updated ImageSharp to 4.1.2 to address dependency vulnerability advisories.
+
 ## [1.5.0] - 2026-09-25
 
 ### Added

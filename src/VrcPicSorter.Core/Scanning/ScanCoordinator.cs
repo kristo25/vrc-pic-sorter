@@ -1010,6 +1010,15 @@ public sealed partial class ScanCoordinator
                         {
                             errors.Add($"{archivedPath}: {warning}");
                         }
+                        else if (route.IndexedImageId is { } suppressedSheetId
+                            && EmojiAtlasName.TryParse(archivedPath, out _)
+                            && ManualKeepRules.IsAnimationSuppressed(
+                                await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false), archivedPath))
+                        {
+                            _ = await FileAnimatedSheetAsync(
+                                suppressedSheetId, archivedPath, category, fingerprint,
+                                mapping.ArchivePath, errors, cancellationToken).ConfigureAwait(false);
+                        }
                     }
                 }
                 catch (Exception exception) when (
@@ -1494,17 +1503,10 @@ public sealed partial class ScanCoordinator
                 return null;
             }
 
-            // Two different sheets can carry the same file name - the archive root disambiguates
-            // them, but the first one filed vacates that name, so the second arrives thinking it is
-            // unique. Moving onto an existing file throws inside the journal and leaves an entry
-            // that reconciliation can never settle, so the collision is caught out here instead and
-            // the sheet simply stays where it is.
+            // Preserve both files when a different sheet already uses the reference name.
             if (File.Exists(reference))
             {
-                errors.Add(
-                    $"{archivedPath}: animated, but a different sheet of the same name is already "
-                    + "filed with its animation, so this one was left in place.");
-                return null;
+                reference = FileRouter.CreateCollisionSafePath(reference);
             }
 
             await _router
@@ -1560,6 +1562,24 @@ public sealed partial class ScanCoordinator
         var index = state.ArchiveIndex.Categories.Single(item => item.Category == category);
         var skipped = new HashSet<string>(state.SkippedAnimations, StringComparer.OrdinalIgnoreCase);
 
+        // Filing is independent of animation export, suppression, or skipped layouts.
+        var prefiled = 0;
+        foreach (var image in index.Images.Where(image => EmojiAtlasName.TryParse(image.Path, out _)))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (AtlasAnimationWriter.IsReferenceFolder(image.Path)) continue;
+            if (image.Fingerprint is not { } fingerprint) continue;
+            var filed = await FileAnimatedSheetAsync(
+                image.Id, image.Path, category, fingerprint, archiveRoot, errors, cancellationToken)
+                .ConfigureAwait(false);
+            if (filed is not null) prefiled++;
+        }
+        if (prefiled > 0)
+        {
+            state = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+            index = state.ArchiveIndex.Categories.Single(item => item.Category == category);
+        }
+
         // Which emoji already have an animation, whatever their file happens to be called. Read
         // from the folder rather than from the index, because this is a question about what is on
         // disk and the index can be a scan behind it.
@@ -1574,7 +1594,7 @@ public sealed partial class ScanCoordinator
                 or InvalidOperationException or ArgumentException or NotSupportedException)
             {
                 errors.Add($"{image.Path}: could not resolve archive ownership ({exception.Message})");
-                return new BackfillResult(0, 0);
+                return new BackfillResult(0, prefiled);
             }
         }
         var animatedByRoot = owners.Values.Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1600,7 +1620,15 @@ public sealed partial class ScanCoordinator
             // A skipped sheet is one a person has already looked at and decided against. Without
             // this it would be decoded in full on every single scan forever: a sheet that cannot
             // be animated never produces the file whose absence is what puts it back on the list.
-            if (skipped.Contains(image.ExactFingerprint) || ManualKeepRules.IsAnimationSuppressed(state, image.Path))
+            if (ManualKeepRules.IsAnimationSuppressed(state, image.Path))
+            {
+                // Suppression prevents GIF recreation, not filing the retained source atlas.
+                if (!AtlasAnimationWriter.IsReferenceFolder(image.Path))
+                    strays.Add(image);
+                continue;
+            }
+
+            if (skipped.Contains(image.ExactFingerprint))
             {
                 continue;
             }
@@ -1630,7 +1658,7 @@ public sealed partial class ScanCoordinator
                 $"Stopped before writing {pending.Count} animations into a folder that already holds "
                     + $"{existing}. The animations already there are not being recognised, and writing "
                     + "these would leave two of each. Nothing was written.");
-            return new BackfillResult(0, 0);
+            return new BackfillResult(0, prefiled);
         }
 
         var written = 0;
@@ -1715,11 +1743,11 @@ public sealed partial class ScanCoordinator
             if (filed is not null)
             {
                 caughtUp++;
-                notes.Add($"{stray.Path}: its animation already existed, so the sheet was filed beside it.");
+                notes.Add($"{stray.Path}: the sheet was filed in Animated/Gif Ref.");
             }
         }
 
-        return new BackfillResult(written, caughtUp);
+        return new BackfillResult(written, caughtUp + prefiled);
     }
 
     /// <summary>

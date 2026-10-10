@@ -2,7 +2,7 @@
 
 VRC Pic Sorter includes the following third-party software.
 
-## SixLabors.ImageSharp 3.1.12
+## SixLabors.ImageSharp 4.1.2
 
 Copyright Six Labors.
 

@@ -4,8 +4,13 @@ VRC Pic Sorter is a local Windows tool for reviewing duplicate and similar image
 
 **[Download the latest Windows app](https://github.com/kristo25/vrc-pic-sorter/releases/latest)** · Portable, no installation required · Windows x64
 
-### New in 1.4.0
+### New in 1.6.0
 
+- Keep or recycle individual matches, and open enlarged previews without blocking the main window.
+- Optional print-frame and player-name filters.
+- Atlas sheets always file under Animated/Gif Ref, independently of GIF generation.
+- More reliable archive relocation, restart recovery, and watcher retries.
+- Updated image-decoding dependency with security fixes.
 - Turn animated emoji sheets into GIFs and reuse existing animations across retained archives.
 - Set minimum and maximum similarity limits to control automatic filing, review, and recycling.
 - Detect padded emoji more reliably and check every GIF frame with compact visual summaries.

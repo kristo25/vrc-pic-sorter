@@ -1422,6 +1422,12 @@ public sealed partial class FileRouter
         var destinationFolder = string.IsNullOrWhiteSpace(relativeDirectory) || relativeDirectory == "."
             ? filingRoot
             : Path.Combine(filingRoot, relativeDirectory);
+        if (EmojiAtlasName.TryParse(sourcePath, out _))
+        {
+            // File atlases independently of whether their GIF can or should be generated.
+            destinationFolder = Path.GetDirectoryName(AtlasAnimationWriter.BuildReferenceDestination(
+                Path.Combine(categoryRoot, relativeDirectory, Path.GetFileName(sourcePath)), categoryRoot))!;
+        }
         PathBoundary.EnsureContained(categoryRoot, destinationFolder, "Image destination");
         PathBoundary.EnsureContained(outputRoot, destinationFolder, "Image destination");
         PathBoundary.EnsureNoReparsePoints(destinationFolder, "Image destination");
@@ -1524,7 +1530,7 @@ public sealed partial class FileRouter
         };
     }
 
-    private static string CreateCollisionSafePath(string requestedPath)
+    internal static string CreateCollisionSafePath(string requestedPath)
     {
         if (!File.Exists(requestedPath))
         {

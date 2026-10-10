@@ -14,6 +14,77 @@ namespace VrcPicSorter.Tests.Scanning;
 
 public sealed class ScanCoordinatorTests
 {
+    [Fact]
+    public async Task SkippedAtlasWithOccupiedReferenceNameIsFiledWithoutOverwriting()
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        const string name = "player_x_4frames_10fps_linearloopStyle.png";
+        var sheet = Path.Combine(archive, name);
+        var occupied = Path.Combine(archive, "Animated", "Gif Ref", name);
+        WriteSheet(sheet);
+        Directory.CreateDirectory(Path.GetDirectoryName(occupied)!);
+        using (var image = ImageFixtureFactory.CreatePattern(33))
+            await image.SaveAsPngAsync(occupied);
+        var original = await File.ReadAllBytesAsync(sheet);
+        var existing = await File.ReadAllBytesAsync(occupied);
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        await new ArchiveIndexer(store, new ImageDecoder()).RefreshAsync(VrcImageCategory.Emoji);
+        await store.UpdateAsync(state =>
+        {
+            foreach (var image in state.ArchiveIndex.Categories.Single(c => c.Category == VrcImageCategory.Emoji).Images)
+                state.SkippedAnimations.Add(image.ExactFingerprint);
+            return true;
+        });
+
+        var result = await CreateCoordinator(store).ScanCategoryAsync(VrcImageCategory.Emoji);
+
+        Assert.Empty(result.Errors);
+        Assert.Equal(0, result.Animated);
+        Assert.False(File.Exists(sheet));
+        Assert.Equal(existing, await File.ReadAllBytesAsync(occupied));
+        var moved = Assert.Single(Directory.GetFiles(Path.GetDirectoryName(occupied)!, "*.png"),
+            p => p != occupied);
+        Assert.Equal(original, await File.ReadAllBytesAsync(moved));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SuppressedAtlasIsFiledWithoutRecreatingAnimation(bool incoming)
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(archive);
+        const string name = "player_x_4frames_10fps_linearloopStyle.png";
+        var sheet = Path.Combine(incoming ? source : archive, name);
+        WriteSheet(sheet);
+        var bytes = await File.ReadAllBytesAsync(sheet);
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        var key = ManualKeepRules.AnimationKey(sheet)!;
+        await store.UpdateAsync(state => { state.SuppressedAnimations.Add(key); return true; });
+        var coordinator = CreateCoordinator(store);
+
+        var result = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+
+        Assert.Empty(result.Errors);
+        Assert.Equal(0, result.Animated);
+        var filed = Path.Combine(archive, "Animated", "Gif Ref", name);
+        Assert.True(File.Exists(filed));
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(filed));
+        Assert.False(File.Exists(sheet));
+        Assert.Empty(Directory.GetFiles(archive, "*.gif", SearchOption.AllDirectories));
+        Assert.Contains(key, (await store.LoadAsync()).SuppressedAnimations);
+        var second = await coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Empty(second.Errors);
+        Assert.Equal(0, second.Animated);
+        Assert.Single(Directory.GetFiles(archive, "*.png", SearchOption.AllDirectories));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -1556,12 +1627,9 @@ public sealed class ScanCoordinatorTests
     }
 
     [Fact]
-    public async Task ASheetThatCouldNotBeAnimatedStaysWhereItCanBeSeen()
+    public async Task ASheetThatCouldNotBeAnimatedStillGoesToTheReferenceFolder()
     {
-        // Twenty frames need an 8x8 grid, and 1020 pixels do not divide into eight whole cells, so
-        // there is no layout to animate at all. That is a real failure rather than a disagreement
-        // about frame count, and the sheet stays among the stills where it can be seen instead of
-        // being filed away as finished work.
+        // A layout that cannot be animated still belongs in the atlas reference folder.
         using var directory = new TestDirectory();
         var sourceRoot = directory.GetPath("incoming");
         var archiveRoot = directory.GetPath("archive", "Emoji");
@@ -1581,8 +1649,8 @@ public sealed class ScanCoordinatorTests
 
         Assert.Equal(1, result.MovedUnique);
         Assert.Equal(0, result.Animated);
-        Assert.True(File.Exists(Path.Combine(archiveRoot, name)));
-        Assert.False(Directory.Exists(Path.Combine(archiveRoot, "Animated", "Gif Ref")));
+        Assert.False(File.Exists(Path.Combine(archiveRoot, name)));
+        Assert.True(File.Exists(Path.Combine(archiveRoot, "Animated", "Gif Ref", name)));
     }
 
 
