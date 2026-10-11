@@ -9,6 +9,7 @@
 - Only copied fixtures and an isolated profile were used. The real archive and normal application profile were untouched. The test application was closed after verification.
 - Rebuilt portable after CI timing fixes: fresh valid copied-fixture profile scanned 23 files, moved 18, exported 5 animations, resolved 5 exact duplicates, with zero queued/skipped/failed. Final executable SHA256: `7DD0EA589B6B1C083EC58CBB5E0CF85D5FB4C8BCCEB481C5CF315BCBF2BC882C`.
 - All 651 tests passed again in `foss-ci-timing-final.trx`, with formatting clean. Fixed-delay test assumptions were replaced with bounded preview-readiness checks and a deterministic settle timer. Production uses its existing injected clock; the default system timer behavior is unchanged.
+- Final watcher correction: all 651 tests pass in `foss-watcher-final.trx`; formatting and independent follow-up review pass. Rebuilt portable resolved 23 of 23 disposable incoming duplicates, preserving the archive, with zero failures/skips. Latest executable SHA256: `25FFA76947750C25F224A6908E0AFF84273538745458D202BB6DC5A6DFDB54C7`.
 
 Local evidence is under `C:\Users\krist\Documents\Codex\2026-09-10\e\outputs`: `foss-comparison`, `foss-baseline`, `foss-review`, `foss-portable-profile`, and `VrcPicSorter-foss-1.6.0`. Image fixtures are excluded from publication.
 

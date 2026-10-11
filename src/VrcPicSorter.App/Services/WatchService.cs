@@ -469,6 +469,9 @@ public sealed class WatchService : IDisposable
         {
             await _scanGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             enteredScanGate = true;
+            // CancelActiveScan cancels every category under this lock. Releasing the
+            // first scan's gate must not start a waiter before its token is canceled.
+            lock (_sync) cancellationToken.ThrowIfCancellationRequested();
             // Watching analyzes only images that arrived while it was running. A full sweep
             // happens on demand from Scan now, or here when a watcher error lost events.
             CategoryScanResult result;
