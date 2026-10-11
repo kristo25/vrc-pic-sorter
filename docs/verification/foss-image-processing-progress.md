@@ -35,3 +35,8 @@ Close final review receipt against the persisted portable proof, commit, fast-fo
 - Fresh final portable UI scan completed with 0 failures; 18 moved, 5 GIF exports, 5 exact duplicates resolved, 5 reviews queued.
 - Evidence, benchmark limitations, executable hash and fixture boundaries persisted in foss-image-processing-results.md.
 - Remaining: final review gate closure, commit, main merge, GitHub release and asset verification.
+
+## Publication checkpoint
+- Independent final review: Ready to merge. Migration committed as 5b2b018, fast-forwarded and pushed to main.
+- GitHub release initially stopped at formatting: Windows Roslyn expected CRLF on three expression-member lines while Git normalizes C# to LF. Added a C# end_of_line editor setting matching .gitattributes; no runtime change.
+- Next: verify formatting with the repository setting, commit correction, update the unpublished v1.6.0 tag and rerun gated publication.

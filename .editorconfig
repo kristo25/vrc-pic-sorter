@@ -1,0 +1,3 @@
+[*.cs]
+# Match the repository's Git normalization on every operating system.
+end_of_line = lf
