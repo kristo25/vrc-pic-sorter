@@ -1,5 +1,3 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Processing;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Imaging;
 using VrcPicSorter.Core.Models;

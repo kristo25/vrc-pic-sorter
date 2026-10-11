@@ -1,7 +1,4 @@
 using System.Text.Json;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 using VrcPicSorter.Core.Imaging;
 using VrcPicSorter.Core.Models;
 
@@ -13,8 +10,8 @@ public sealed class ImageMatcherTests
     public void TransparentPaddingIsRecognizedWithoutBecomingExact()
     {
         using var source = ImageFixtureFactory.CreatePattern(811);
-        using var padded = new Image<Rgba32>(source.Width * 2, source.Height * 2);
-        padded.Mutate(context => context.DrawImage(source, new Point(19, 21), 1));
+        using var padded = new FixtureImage(source.Width * 2, source.Height * 2);
+        padded.Mutate(context => context.DrawImage(source, 19, 21));
         var first = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(source));
         var second = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(padded));
         var match = Assert.Single(ImageMatcher.RankCandidates(first, [new("padded", second)], SimilarityProfile.Strict));
@@ -26,8 +23,8 @@ public sealed class ImageMatcherTests
     [Fact]
     public void EmptyTransparentImagesRemainValidAndFinite()
     {
-        using var source = new Image<Rgba32>(48, 32);
-        using var other = new Image<Rgba32>(96, 64);
+        using var source = new FixtureImage(48, 32);
+        using var other = new FixtureImage(96, 64);
         var first = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(source));
         var second = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(other));
         Assert.True(first.HasCurrentFeatures);
@@ -103,8 +100,8 @@ public sealed class ImageMatcherTests
     [Fact]
     public void SparseTransparentImagesWithDifferentContentStayBelowBroadThreshold()
     {
-        using var first = CreateSparseGraphic(42, 150, new Rgba32(255, 80, 170, 255));
-        using var second = CreateSparseGraphic(164, 150, new Rgba32(255, 80, 170, 255));
+        using var first = CreateSparseGraphic(42, 150, new FixturePixel(255, 80, 170, 255));
+        using var second = CreateSparseGraphic(164, 150, new FixturePixel(255, 80, 170, 255));
         var incoming = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(first));
         var candidate = new ImageCandidate(
             "different-sparse-graphic",
@@ -121,8 +118,8 @@ public sealed class ImageMatcherTests
         using var background = ImageFixtureFactory.CreatePattern(31, 192, 108);
         using var first = background.Clone();
         using var second = background.Clone();
-        PaintRectangle(first, 30, 54, 20, 14, new Rgba32(235, 45, 70, 255));
-        PaintRectangle(second, 138, 50, 20, 14, new Rgba32(45, 110, 235, 255));
+        PaintRectangle(first, 30, 54, 20, 14, new FixturePixel(235, 45, 70, 255));
+        PaintRectangle(second, 138, 50, 20, 14, new FixturePixel(45, 110, 235, 255));
         var incoming = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(first));
         var candidate = new ImageCandidate(
             "changed-object",
@@ -142,7 +139,7 @@ public sealed class ImageMatcherTests
     [Fact]
     public void ResizedSparseGraphicRemainsAConservativeMatch()
     {
-        using var source = CreateSparseGraphic(82, 96, new Rgba32(120, 70, 245, 255));
+        using var source = CreateSparseGraphic(82, 96, new FixturePixel(120, 70, 245, 255));
         using var resized = source.Clone(context => context.Resize(192, 192));
         var incoming = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(source));
         var candidate = new ImageCandidate(
@@ -158,10 +155,10 @@ public sealed class ImageMatcherTests
     public void UnrelatedAnimationsDoNotMatchByCherryPickingIndividualFrames()
     {
         var firstFrames = Enumerable.Range(0, 8)
-            .Select(index => CreateSparseGraphic(24 + (index * 16), 70, new Rgba32(245, 80, 120, 255)))
+            .Select(index => CreateSparseGraphic(24 + (index * 16), 70, new FixturePixel(245, 80, 120, 255)))
             .ToArray();
         var secondFrames = Enumerable.Range(0, 8)
-            .Select(index => CreateSparseGraphic(160 - (index * 14), 150, new Rgba32(70, 180, 245, 255)))
+            .Select(index => CreateSparseGraphic(160 - (index * 14), 150, new FixturePixel(70, 180, 245, 255)))
             .ToArray();
         try
         {
@@ -185,7 +182,7 @@ public sealed class ImageMatcherTests
     public void ResizedAnimationRemainsAConservativeMatch()
     {
         var frames = Enumerable.Range(0, 8)
-            .Select(index => CreateSparseGraphic(38 + (index * 14), 92, new Rgba32(245, 80, 170, 255)))
+            .Select(index => CreateSparseGraphic(38 + (index * 14), 92, new FixturePixel(245, 80, 170, 255)))
             .ToArray();
         var resizedFrames = frames
             .Select(frame => frame.Clone(context => context.Resize(192, 192)))
@@ -212,10 +209,10 @@ public sealed class ImageMatcherTests
     public void AnimationsWithDifferentFrameCountsCanBeComparedSafely()
     {
         var shortAnimation = Enumerable.Range(0, 3)
-            .Select(index => CreateSparseGraphic(40 + (index * 18), 92, new Rgba32(245, 80, 170, 255)))
+            .Select(index => CreateSparseGraphic(40 + (index * 18), 92, new FixturePixel(245, 80, 170, 255)))
             .ToArray();
         var longAnimation = Enumerable.Range(0, 8)
-            .Select(index => CreateSparseGraphic(40 + (index * 7), 92, new Rgba32(245, 80, 170, 255)))
+            .Select(index => CreateSparseGraphic(40 + (index * 7), 92, new FixturePixel(245, 80, 170, 255)))
             .ToArray();
         try
         {
@@ -244,7 +241,7 @@ public sealed class ImageMatcherTests
     public void EquivalentAnimationTimelinesMatchAcrossDuplicatedFramesAndTiming()
     {
         var frames = Enumerable.Range(0, 3)
-            .Select(index => CreateSparseGraphic(42 + (index * 34), 92, new Rgba32(245, 80, 170, 255)))
+            .Select(index => CreateSparseGraphic(42 + (index * 34), 92, new FixturePixel(245, 80, 170, 255)))
             .ToArray();
         try
         {
@@ -290,10 +287,10 @@ public sealed class ImageMatcherTests
     public void AnimatedCandidateComparisonStaysWithinAllocationBudget()
     {
         var firstFrames = Enumerable.Range(0, 8)
-            .Select(index => CreateSparseGraphic(24 + (index * 16), 70, new Rgba32(245, 80, 120, 255)))
+            .Select(index => CreateSparseGraphic(24 + (index * 16), 70, new FixturePixel(245, 80, 120, 255)))
             .ToArray();
         var secondFrames = Enumerable.Range(0, 8)
-            .Select(index => CreateSparseGraphic(160 - (index * 14), 150, new Rgba32(70, 180, 245, 255)))
+            .Select(index => CreateSparseGraphic(160 - (index * 14), 150, new FixturePixel(70, 180, 245, 255)))
             .ToArray();
         try
         {
@@ -324,10 +321,10 @@ public sealed class ImageMatcherTests
     public void UnrelatedAnimationTimelinesWithDifferentFrameCountsStayRejected()
     {
         var firstFrames = Enumerable.Range(0, 3)
-            .Select(index => CreateSparseGraphic(35 + (index * 24), 65, new Rgba32(245, 75, 120, 255)))
+            .Select(index => CreateSparseGraphic(35 + (index * 24), 65, new FixturePixel(245, 75, 120, 255)))
             .ToArray();
         var secondFrames = Enumerable.Range(0, 6)
-            .Select(index => CreateSparseGraphic(175 - (index * 18), 165, new Rgba32(65, 190, 245, 255)))
+            .Select(index => CreateSparseGraphic(175 - (index * 18), 165, new FixturePixel(65, 190, 245, 255)))
             .ToArray();
         try
         {
@@ -462,21 +459,21 @@ public sealed class ImageMatcherTests
         Assert.True(candidateCounts[p95Index] <= 25, $"P95 candidate count was {candidateCounts[p95Index]}.");
     }
 
-    private static Image<Rgba32> CreateSparseGraphic(int x, int y, Rgba32 color)
+    private static FixtureImage CreateSparseGraphic(int x, int y, FixturePixel color)
     {
-        var image = new Image<Rgba32>(256, 256, new Rgba32(0, 0, 0, 0));
+        var image = new FixtureImage(256, 256, new FixturePixel(0, 0, 0, 0));
         PaintRectangle(image, x, y, 28, 12, color);
         PaintRectangle(image, x + 8, y - 8, 12, 28, color);
         return image;
     }
 
     private static void PaintRectangle(
-        Image<Rgba32> image,
+        FixtureImage image,
         int x,
         int y,
         int width,
         int height,
-        Rgba32 color)
+        FixturePixel color)
     {
         image.ProcessPixelRows(accessor =>
         {
@@ -492,7 +489,7 @@ public sealed class ImageMatcherTests
     }
 
     private static ImageFingerprint CreateAnimationFingerprint(
-        IReadOnlyList<Image<Rgba32>> frames,
+        IReadOnlyList<FixtureImage> frames,
         IReadOnlyList<int>? delays = null)
     {
         var decodedFrames = frames.Select((frame, index) =>
@@ -528,8 +525,8 @@ public sealed class ImageMatcherTests
     [Fact]
     public void ChangedUnsampledFramesLowerScoreAndNeverBecomeExact()
     {
-        var redFrames = CreateHalfDifferingAnimation(new Rgba32(220, 30, 30, 255));
-        var blueFrames = CreateHalfDifferingAnimation(new Rgba32(30, 30, 220, 255));
+        var redFrames = CreateHalfDifferingAnimation(new FixturePixel(220, 30, 30, 255));
+        var blueFrames = CreateHalfDifferingAnimation(new FixturePixel(30, 30, 220, 255));
         try
         {
             var delays = Enumerable.Repeat(80, redFrames.Count).ToArray();
@@ -598,9 +595,9 @@ public sealed class ImageMatcherTests
     /// the odd indices. Building the difference into the even ones is what makes the pair invisible
     /// to the score - which is the whole point of the reproduction.
     /// </remarks>
-    private static IReadOnlyList<Image<Rgba32>> CreateHalfDifferingAnimation(Rgba32 stripe)
+    private static IReadOnlyList<FixtureImage> CreateHalfDifferingAnimation(FixturePixel stripe)
     {
-        var frames = new List<Image<Rgba32>>(16);
+        var frames = new List<FixtureImage>(16);
         for (var index = 0; index < 16; index++)
         {
             var frame = ImageFixtureFactory.CreatePattern(400 + (index % 2 == 0 ? 0 : index));

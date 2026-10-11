@@ -30,6 +30,8 @@
   <ItemGroup>
     <Content Include="..\..\LICENSE" Link="LICENSE" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="..\..\THIRD-PARTY-NOTICES.md" Link="THIRD-PARTY-NOTICES.md" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="$(NuGetPackageRoot)magick.net-q8-x64/14.17.2/Notice.txt" Link="MAGICK-NET-NOTICES.txt" CopyToPublishDirectory="PreserveNewest" />
+    <EmbeddedResource Include="$(NuGetPackageRoot)magick.net-q8-x64/14.17.2/Notice.txt" LogicalName="VrcPicSorter.MagickNotices.txt" />
     <Content Include="..\..\README.md" Link="README.md" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 

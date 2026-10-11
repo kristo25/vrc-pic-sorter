@@ -3,11 +3,6 @@ using System.Diagnostics;
 using System.Windows.Controls;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats;
-using SixLabors.ImageSharp.Formats.Gif;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 using VrcPicSorter.Core.Imaging;
 using ImageControl = System.Windows.Controls.Image;
 
@@ -56,8 +51,8 @@ internal sealed class ComparisonPlayback : IDisposable
             }
             finally { _decodeGate.Release(); }
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or UnknownImageFormatException
-            or InvalidImageContentException or InvalidDataException or OverflowException or NotSupportedException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException
+            or InvalidDataException or OverflowException or NotSupportedException)
         { }
         if (_versions.GetValueOrDefault(target) != version || frames is null) return;
         _loaded[target] = (frames, _independent ? _clock.Elapsed.TotalMilliseconds : 0);
@@ -104,26 +99,23 @@ internal sealed class ComparisonPlayback : IDisposable
     private static Frames Decode(string path)
     {
         ImageResourceLimits.EnsureEncodedSizeSafe(path);
-        var info = SixLabors.ImageSharp.Image.Identify(path);
-        ImageResourceLimits.EnsureSafe(info.Width, info.Height, Math.Max(1, info.FrameMetadataCollection.Count));
-        using var decoded = SixLabors.ImageSharp.Image.Load<Rgba32>(new DecoderOptions { MaxFrames = ImageResourceLimits.MaximumFrames }, path);
-        decoded.Mutate(c => c.AutoOrient());
+        var decoded = RasterCodec.Decode(path);
         var scale = Math.Min(1d, Math.Min(1600d / Math.Max(decoded.Width, decoded.Height),
             Math.Sqrt(64d * 1024 * 1024 / ((double)decoded.Width * decoded.Height * 4 * decoded.Frames.Count))));
-        if (scale < 1) decoded.Mutate(c => c.Resize(Math.Max(1, (int)(decoded.Width * scale)), Math.Max(1, (int)(decoded.Height * scale))));
+        if (scale < 1) decoded = RasterCodec.Resize(decoded, Math.Max(1, (int)(decoded.Width * scale)), Math.Max(1, (int)(decoded.Height * scale)));
         var images = new List<BitmapSource>();
         var ends = new List<double>();
         double duration = 0;
         foreach (var frame in decoded.Frames)
         {
             var bytes = new byte[checked(decoded.Width * decoded.Height * 4)];
-            frame.CopyPixelDataTo(bytes);
+            frame.RgbaPixels.CopyTo(bytes, 0);
             for (var i = 0; i < bytes.Length; i += 4) (bytes[i], bytes[i + 2]) = (bytes[i + 2], bytes[i]);
             var bitmap = BitmapSource.Create(decoded.Width, decoded.Height, 96, 96,
                 System.Windows.Media.PixelFormats.Bgra32, null, bytes, decoded.Width * 4);
             bitmap.Freeze();
             images.Add(bitmap);
-            duration += Math.Max(20, frame.Metadata.GetGifMetadata().FrameDelay * 10);
+            duration += Math.Max(20, frame.DelayMilliseconds);
             ends.Add(duration);
         }
         return new Frames(images, ends, duration);

@@ -1,7 +1,8 @@
-using SixLabors.ImageSharp;
 using VrcPicSorter.Core.Imaging;
 using VrcPicSorter.Core.Models;
 using VrcPicSorter.Core.Scanning;
+using VrcPicSorter.Core.Storage;
+using System.Text.Json.Nodes;
 using VrcPicSorter.Tests.FileSystem;
 using VrcPicSorter.Tests.Imaging;
 
@@ -9,6 +10,72 @@ namespace VrcPicSorter.Tests.Scanning;
 
 public sealed class ArchiveIndexerTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LegacyDecoderMigrationPreservesBackupAndRevalidatesOnlyMatchingKeepIdentities(bool identityMatches)
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(archive);
+        var path = Path.Combine(archive, "protected.png");
+        using (var pixels = ImageFixtureFactory.CreatePattern(309)) await pixels.SaveAsPngAsync(path);
+        string statePath;
+        string fingerprintPath;
+        string stateDirectory;
+        using (var initial = FileRouterTests.CreateStore(directory, source, archive))
+        {
+            var indexer = new ArchiveIndexer(initial, new ImageDecoder());
+            await indexer.RefreshAsync(VrcImageCategory.Emoji);
+            await initial.UpdateAsync(state =>
+            {
+                var image = Assert.Single(state.ArchiveIndex.Categories.Single(c => c.Category == VrcImageCategory.Emoji).Images);
+                var identity = identityMatches ? image.ExactFingerprint : new string('a', 64);
+                state.ManualKeeps.Add(new(path, identity, image.FileSize, image.LastWriteUtc));
+                state.FilterKeeps.Add(new(path, identity, image.FileSize, image.LastWriteUtc, RemovalFilterReason.PrintFrame));
+                image.Fingerprint = image.Fingerprint! with { FeatureVersion = 1 };
+                return true;
+            });
+            statePath = initial.StatePath;
+            fingerprintPath = initial.FingerprintPath;
+            stateDirectory = initial.StateDirectory;
+        }
+
+        var legacyDocument = JsonNode.Parse(await File.ReadAllTextAsync(statePath))!.AsObject();
+        Assert.True(legacyDocument.Remove("decoderBackend"));
+        await File.WriteAllTextAsync(statePath, legacyDocument.ToJsonString());
+        var originalState = await File.ReadAllBytesAsync(statePath);
+        var originalFingerprints = await File.ReadAllBytesAsync(fingerprintPath);
+        using (var migrated = new JsonStateStore(stateDirectory))
+        {
+            var loaded = await migrated.LoadAsync();
+            Assert.Equal(ImageFingerprint.CurrentDecoderBackend, loaded.DecoderBackend);
+            Assert.True(Assert.Single(loaded.ManualKeeps).DecoderMigrationUnresolved);
+            Assert.True(Assert.Single(loaded.FilterKeeps).DecoderMigrationUnresolved);
+            var result = await new ArchiveIndexer(migrated, new ImageDecoder()).RefreshAsync(VrcImageCategory.Emoji);
+            Assert.Equal(IndexStatus.Current, result.Status);
+            var rebuilt = await migrated.LoadAsync();
+            var image = Assert.Single(rebuilt.ArchiveIndex.Categories.Single(c => c.Category == VrcImageCategory.Emoji).Images);
+            Assert.True(image.Fingerprint!.HasCurrentFeatures);
+            Assert.Equal(!identityMatches, Assert.Single(rebuilt.ManualKeeps).DecoderMigrationUnresolved);
+            Assert.Equal(!identityMatches, Assert.Single(rebuilt.FilterKeeps).DecoderMigrationUnresolved);
+            Assert.True(ManualKeepRules.IsProtected(rebuilt, image));
+            Assert.True(FilterKeepRules.IsKept(rebuilt, path, image.ExactFingerprint, RemovalFilterReason.PrintFrame));
+        }
+
+        using (var restarted = new JsonStateStore(stateDirectory))
+        {
+            var state = await restarted.LoadAsync();
+            Assert.Equal(!identityMatches, Assert.Single(state.ManualKeeps).DecoderMigrationUnresolved);
+            Assert.Equal(!identityMatches, Assert.Single(state.FilterKeeps).DecoderMigrationUnresolved);
+        }
+        Assert.Equal(originalState, await File.ReadAllBytesAsync(statePath + ".before-magick"));
+        Assert.Equal(originalFingerprints, await File.ReadAllBytesAsync(fingerprintPath + ".before-magick"));
+        Assert.True(File.Exists(path));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

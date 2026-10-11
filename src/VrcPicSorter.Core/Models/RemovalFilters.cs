@@ -9,7 +9,10 @@ public sealed class FilterReviewInfo
 }
 
 public sealed record FilterKeepException(string Path, string Fingerprint, long FileSize,
-    DateTimeOffset LastWriteUtc, RemovalFilterReason Reason);
+    DateTimeOffset LastWriteUtc, RemovalFilterReason Reason)
+{
+    public bool DecoderMigrationUnresolved { get; init; }
+}
 
 public sealed record FilterScanResult(int Examined, int Recycled, int ReviewNeeded, int Failed,
     IReadOnlyList<string> Errors);
@@ -20,8 +23,8 @@ public static class FilterKeepRules
     {
         var info = new FileInfo(path);
         return info.Exists && state.FilterKeeps.Any(p => string.Equals(p.Path, path, StringComparison.OrdinalIgnoreCase)
-            && p.Fingerprint == fingerprint && p.Reason == reason && p.FileSize == info.Length
-            && p.LastWriteUtc == info.LastWriteTimeUtc);
+            && p.Reason == reason && p.FileSize == info.Length && p.LastWriteUtc == info.LastWriteTimeUtc
+            && (p.DecoderMigrationUnresolved || p.Fingerprint == fingerprint));
     }
 
     public static void Repoint(AppStateDocument state, string source, string destination)

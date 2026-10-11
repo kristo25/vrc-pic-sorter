@@ -1,8 +1,3 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats;
-using SixLabors.ImageSharp.Formats.Gif;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 
 namespace VrcPicSorter.Core.Imaging;
 
@@ -41,9 +36,9 @@ public sealed class ImageDecoder
             FileShare.Read | FileShare.Delete, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
         if (stream.Length > ImageResourceLimits.MaximumEncodedBytes)
             throw new InvalidDataException("The image exceeds the configured encoded-file resource limit.");
-        var info = await Image.IdentifyAsync(stream, token).ConfigureAwait(false)
-            ?? throw new InvalidDataException("The image header could not be read.");
-        var estimate = DecodeMemoryBudget.EstimateBytes(info.Width, info.Height, Math.Max(1, info.FrameMetadataCollection.Count));
+        token.ThrowIfCancellationRequested();
+        var info = RasterCodec.Identify(stream);
+        var estimate = DecodeMemoryBudget.EstimateBytes(info.Width, info.Height, info.FrameCount);
         using var lease = await budget.AcquireAsync(estimate, token).ConfigureAwait(false);
         stream.Position = 0;
         var decoded = await DecodeCoreAsync(stream, path, info, token).ConfigureAwait(false);
@@ -61,8 +56,6 @@ public sealed class ImageDecoder
         return ImageFingerprint.Create(decoded.Image!);
     }
 
-    private static readonly HashSet<string> SupportedFormats =
-        new(StringComparer.OrdinalIgnoreCase) { "PNG", "GIF", "JPEG", "WEBP", "BMP" };
 
     public async Task<ImageDecodeResult> DecodeAsync(
         string path,
@@ -110,8 +103,14 @@ public sealed class ImageDecoder
         CancellationToken cancellationToken = default) =>
         DecodeCoreAsync(stream, sourceName, null, cancellationToken);
 
-    private async Task<ImageDecodeResult> DecodeCoreAsync(
-        Stream stream, string? sourceName, ImageInfo? identifiedInfo, CancellationToken cancellationToken)
+    private Task<ImageDecodeResult> DecodeCoreAsync(
+        Stream stream, string? sourceName, RasterInfo? identifiedInfo, CancellationToken cancellationToken)
+        // Native reads are synchronous. Keep them off WPF callers and await their
+        // completion even when cancellation arrives, so stream/scan locks stay alive.
+        => Task.Run(() => DecodeCore(stream, sourceName, identifiedInfo, cancellationToken));
+
+    private ImageDecodeResult DecodeCore(
+        Stream stream, string? sourceName, RasterInfo? identifiedInfo, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
 
@@ -134,68 +133,16 @@ public sealed class ImageDecoder
             }
 
             var startPosition = stream.Position;
-            var info = identifiedInfo ?? await Image.IdentifyAsync(stream, cancellationToken).ConfigureAwait(false);
-            if (info is null)
-            {
-                return ImageDecodeResult.Failed(
-                    ImageDecodeFailureKind.InvalidContent,
-                    "The image header could not be read.",
-                    sourceName);
-            }
-
-            ImageResourceLimits.EnsureSafe(
-                info.Width,
-                info.Height,
-                Math.Max(1, info.FrameMetadataCollection.Count));
+            cancellationToken.ThrowIfCancellationRequested();
             stream.Position = startPosition;
-            var options = new DecoderOptions { MaxFrames = ImageResourceLimits.MaximumFrames };
-            using var image = await Image.LoadAsync<Rgba32>(options, stream, cancellationToken).ConfigureAwait(false);
-            var formatName = image.Metadata.DecodedImageFormat?.Name;
-            if (formatName is null || !SupportedFormats.Contains(formatName))
-            {
-                return ImageDecodeResult.Failed(
-                    ImageDecodeFailureKind.UnsupportedFormat,
-                    $"The decoded format '{formatName ?? "unknown"}' is not supported.",
-                    sourceName);
-            }
-
-            image.Mutate(context => context.AutoOrient());
-            var frames = new List<DecodedImageFrame>(image.Frames.Count);
-            foreach (var frame in image.Frames)
-            {
-                var pixels = new byte[checked(image.Width * image.Height * 4)];
-                frame.CopyPixelDataTo(pixels);
-                NormalizeTransparentPixels(pixels);
-                var delay = formatName.Equals("GIF", StringComparison.OrdinalIgnoreCase)
-                    ? checked(frame.Metadata.GetGifMetadata().FrameDelay * 10)
-                    : 0;
-                frames.Add(new DecodedImageFrame(pixels, delay));
-            }
-
-            return ImageDecodeResult.Success(new DecodedImage(
-                image.Width,
-                image.Height,
-                formatName,
-                frames));
+            var image = RasterCodec.Decode(stream, knownInfo: identifiedInfo);
+            cancellationToken.ThrowIfCancellationRequested();
+            return ImageDecodeResult.Success(image);
         }
-        catch (UnknownImageFormatException exception)
+        catch (NotSupportedException exception)
         {
             return ImageDecodeResult.Failed(
                 ImageDecodeFailureKind.UnsupportedFormat,
-                exception.Message,
-                sourceName);
-        }
-        catch (InvalidImageContentException exception)
-        {
-            return ImageDecodeResult.Failed(
-                ImageDecodeFailureKind.InvalidContent,
-                exception.Message,
-                sourceName);
-        }
-        catch (ImageFormatException exception)
-        {
-            return ImageDecodeResult.Failed(
-                ImageDecodeFailureKind.InvalidContent,
                 exception.Message,
                 sourceName);
         }

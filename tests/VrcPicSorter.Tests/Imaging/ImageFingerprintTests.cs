@@ -1,4 +1,3 @@
-using SixLabors.ImageSharp.PixelFormats;
 using VrcPicSorter.Core.Imaging;
 
 namespace VrcPicSorter.Tests.Imaging;
@@ -34,7 +33,7 @@ public sealed class ImageFingerprintTests
         using var directory = new TestDirectory();
         using var source = ImageFixtureFactory.CreatePattern(8);
         using var changed = source.Clone();
-        changed[3, 4] = new Rgba32(1, 2, 3, 255);
+        changed[3, 4] = new FixturePixel(1, 2, 3, 255);
         var firstPath = await ImageFixtureFactory.SaveAsync(directory, "first.png", source, FixtureFormat.Png);
         var secondPath = await ImageFixtureFactory.SaveAsync(directory, "second.png", changed, FixtureFormat.Png);
 
@@ -47,8 +46,8 @@ public sealed class ImageFingerprintTests
     [Fact]
     public void DimensionsParticipateInExactIdentity()
     {
-        using var wide = ImageFixtureFactory.CreateSolid(new Rgba32(12, 34, 56), 12, 8);
-        using var tall = ImageFixtureFactory.CreateSolid(new Rgba32(12, 34, 56), 8, 12);
+        using var wide = ImageFixtureFactory.CreateSolid(new FixturePixel(12, 34, 56), 12, 8);
+        using var tall = ImageFixtureFactory.CreateSolid(new FixturePixel(12, 34, 56), 8, 12);
 
         var first = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(wide));
         var second = ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(tall));
@@ -75,9 +74,9 @@ public sealed class ImageFingerprintTests
     public async Task GifFrameOrderAndTimingParticipateInExactIdentity()
     {
         using var directory = new TestDirectory();
-        using var red = ImageFixtureFactory.CreateSolid(new Rgba32(255, 0, 0));
-        using var green = ImageFixtureFactory.CreateSolid(new Rgba32(0, 255, 0));
-        using var blue = ImageFixtureFactory.CreateSolid(new Rgba32(0, 0, 255));
+        using var red = ImageFixtureFactory.CreateSolid(new FixturePixel(255, 0, 0));
+        using var green = ImageFixtureFactory.CreateSolid(new FixturePixel(0, 255, 0));
+        using var blue = ImageFixtureFactory.CreateSolid(new FixturePixel(0, 0, 255));
         var originalPath = await ImageFixtureFactory.SaveGifAsync(directory, "original.gif", [red, green, blue], [100, 200, 300]);
         var copyPath = await ImageFixtureFactory.SaveGifAsync(directory, "copy.gif", [red, green, blue], [100, 200, 300]);
         var reorderedPath = await ImageFixtureFactory.SaveGifAsync(directory, "reordered.gif", [green, red, blue], [100, 200, 300]);

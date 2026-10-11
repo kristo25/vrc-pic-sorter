@@ -2,7 +2,6 @@ using VrcPicSorter.App.Services;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Models;
 using VrcPicSorter.Tests.Imaging;
-using SixLabors.ImageSharp;
 
 namespace VrcPicSorter.Tests.Services;
 

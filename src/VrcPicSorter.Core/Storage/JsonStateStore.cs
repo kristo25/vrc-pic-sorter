@@ -311,6 +311,8 @@ public sealed class JsonStateStore : IDisposable
         bool persistChanges = true)
     {
         var utf8 = await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
+        using var sourceDocument = JsonDocument.Parse(utf8);
+        var legacyDecoder = !sourceDocument.RootElement.TryGetProperty("decoderBackend", out _);
         var legacyFingerprints = TryExtractLegacyFingerprints(utf8);
 
         // A pre-v5 document carries a fingerprint per image that the strict options reject, so
@@ -340,6 +342,23 @@ public sealed class JsonStateStore : IDisposable
         }
 
         var migrated = AppStateMigrator.Migrate(state, _defaultStateFactory());
+        if (legacyDecoder || state.DecoderBackend != ImageFingerprint.CurrentDecoderBackend)
+        {
+            if (persistChanges)
+            {
+                var backup = StatePath + ".before-magick";
+                await BackupDecoderMigrationFileAsync(path, backup, cancellationToken).ConfigureAwait(false);
+                if (File.Exists(FingerprintPath) && !File.Exists(FingerprintPath + ".before-magick"))
+                    await BackupDecoderMigrationFileAsync(FingerprintPath, FingerprintPath + ".before-magick",
+                        cancellationToken).ConfigureAwait(false);
+            }
+            state.ManualKeeps = state.ManualKeeps.Select(keep =>
+                keep with { DecoderMigrationUnresolved = true }).ToList();
+            state.FilterKeeps = state.FilterKeeps.Select(keep =>
+                keep with { DecoderMigrationUnresolved = true }).ToList();
+            state.DecoderBackend = ImageFingerprint.CurrentDecoderBackend;
+            migrated = true;
+        }
         var compacted = AppStateCompactor.Compact(state);
         AppStateValidator.Validate(state);
         if (persistChanges && (migrated || compacted))
@@ -348,6 +367,21 @@ public sealed class JsonStateStore : IDisposable
         }
 
         return state;
+    }
+
+    private static async Task BackupDecoderMigrationFileAsync(string source, string destination, CancellationToken token)
+    {
+        if (File.Exists(destination)) return;
+        var temporary = destination + ".tmp";
+        await using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read))
+        await using (var output = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            await input.CopyToAsync(output, token).ConfigureAwait(false);
+            await output.FlushAsync(token).ConfigureAwait(false);
+            output.Flush(flushToDisk: true);
+        }
+        token.ThrowIfCancellationRequested();
+        File.Move(temporary, destination);
     }
 
     private async Task<AppStateDocument> RecoverUnreadableStateAsync(CancellationToken cancellationToken)

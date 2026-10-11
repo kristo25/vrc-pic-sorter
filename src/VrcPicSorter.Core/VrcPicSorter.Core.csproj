@@ -5,6 +5,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="VrcPicSorter.Tests" />
-    <PackageReference Include="SixLabors.ImageSharp" Version="4.1.2" />
+    <InternalsVisibleTo Include="VrcPicSorter" />
+    <PackageReference Include="Magick.NET-Q8-x64" Version="14.17.2" />
   </ItemGroup>
 </Project>

@@ -6,6 +6,27 @@ namespace VrcPicSorter.Tests.Scanning;
 public sealed class ManualKeepRulesTests
 {
     [Fact]
+    public void UnresolvedDecoderHoldDoesNotProtectAReplacementWithChangedMetadata()
+    {
+        var image = new IndexedImageRecord
+        {
+            Path = @"C:\archive\copy.png",
+            ExactFingerprint = "new-decoder",
+            FileSize = 42,
+            LastWriteUtc = DateTimeOffset.UtcNow
+        };
+        var state = new AppStateDocument();
+        state.ManualKeeps.Add(new ManualKeepProtection(image.Path, "legacy-decoder", image.FileSize, image.LastWriteUtc)
+        { DecoderMigrationUnresolved = true });
+        Assert.True(ManualKeepRules.IsProtected(state, image));
+        image.LastWriteUtc = image.LastWriteUtc.AddSeconds(1);
+        Assert.False(ManualKeepRules.IsProtected(state, image));
+        image.LastWriteUtc = state.ManualKeeps[0].LastWriteUtc;
+        image.FileSize++;
+        Assert.False(ManualKeepRules.IsProtected(state, image));
+    }
+
+    [Fact]
     public async Task ProtectionFollowsVerifiedRelocationWhenIdenticalDestinationHasDifferentTimestamp()
     {
         using var directory = new TestDirectory();

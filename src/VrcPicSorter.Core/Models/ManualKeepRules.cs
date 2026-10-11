@@ -8,9 +8,9 @@ public static class ManualKeepRules
 {
     public static bool IsProtected(AppStateDocument state, IndexedImageRecord image) =>
         state.ManualKeeps.Any(keep => SamePath(keep.Path, image.Path)
-            && !string.IsNullOrWhiteSpace(keep.Fingerprint)
-            && string.Equals(keep.Fingerprint, image.ExactFingerprint, StringComparison.Ordinal)
-            && keep.FileSize == image.FileSize && keep.LastWriteUtc == image.LastWriteUtc);
+            && keep.FileSize == image.FileSize && keep.LastWriteUtc == image.LastWriteUtc
+            && (keep.DecoderMigrationUnresolved || (!string.IsNullOrWhiteSpace(keep.Fingerprint)
+                && string.Equals(keep.Fingerprint, image.ExactFingerprint, StringComparison.Ordinal))));
 
     public static void Repoint(AppStateDocument state, string source, string destination)
     {

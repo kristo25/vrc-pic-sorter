@@ -61,6 +61,13 @@ jobs:
           "$hash  VrcPicSorter.exe" | Out-File publish/VrcPicSorter.exe.sha256 -Encoding ascii
           "SHA256: ``$hash``" >> $env:GITHUB_STEP_SUMMARY
 
+      - name: Package portable app and license notices
+        shell: pwsh
+        run: |
+          Compress-Archive -Path publish/* -DestinationPath VrcPicSorter-win-x64.zip
+          $hash = (Get-FileHash VrcPicSorter-win-x64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  VrcPicSorter-win-x64.zip" | Out-File VrcPicSorter-win-x64.zip.sha256 -Encoding ascii
+
       - name: Build the release notes from the changelog
         shell: pwsh
         run: |
@@ -96,5 +103,9 @@ jobs:
           gh release create $tag `
             publish/VrcPicSorter.exe `
             publish/VrcPicSorter.exe.sha256 `
+            VrcPicSorter-win-x64.zip `
+            VrcPicSorter-win-x64.zip.sha256 `
+            publish/THIRD-PARTY-NOTICES.md `
+            publish/MAGICK-NET-NOTICES.txt `
             --title $tag `
             --notes-file release-notes.md

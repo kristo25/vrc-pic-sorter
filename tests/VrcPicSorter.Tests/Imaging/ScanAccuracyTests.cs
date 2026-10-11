@@ -1,6 +1,3 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 using VrcPicSorter.Core.Imaging;
 using VrcPicSorter.Core.Models;
 
@@ -38,23 +35,23 @@ public sealed class ScanAccuracyTests
         Assert.False(ImageMatcher.IsSamePicture(result, a, b));
     }
 
-    private static ImageFingerprint Fingerprint(Image<Rgba32> image) =>
+    private static ImageFingerprint Fingerprint(FixtureImage image) =>
         ImageFingerprint.Create(ImageFixtureFactory.ToDecodedImage(image));
 
     [Fact]
     public void ChangedLetteringOnSharedTemplateDoesNotPassCustomMinimum()
     {
-        using var source = new Image<Rgba32>(192, 128, new Rgba32(235, 216, 170));
+        using var source = new FixtureImage(192, 128, new FixturePixel(235, 216, 170));
         for (var y = 0; y < source.Height; y++)
             for (var x = 0; x < source.Width; x++)
                 if (x < 10 || x >= 182 || y < 10 || y >= 118)
-                    source[x, y] = new Rgba32(115, 85, 25);
+                    source[x, y] = new FixturePixel(115, 85, 25);
         using var other = source.Clone();
         for (var y = 42; y < 78; y++)
             for (var x = 25; x < 167; x++)
             {
-                if ((x / 5 + y / 6) % 3 == 0) source[x, y] = new Rgba32(25, 20, 15);
-                if ((x / 7 + y / 4) % 4 == 0) other[x, y] = new Rgba32(25, 20, 15);
+                if ((x / 5 + y / 6) % 3 == 0) source[x, y] = new FixturePixel(25, 20, 15);
+                if ((x / 7 + y / 4) % 4 == 0) other[x, y] = new FixturePixel(25, 20, 15);
             }
         Assert.Empty(ImageMatcher.RankCandidates(Fingerprint(source), [new("changed-text", Fingerprint(other))], SimilarityProfile.Conservative, .82));
     }

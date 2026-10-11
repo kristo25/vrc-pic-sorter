@@ -14,4 +14,24 @@
 5. Review, delivery, merge and publication only after all gates pass.
 
 ## Next action
-Checkpoint named files, install Magick.NET and establish bounded codec API.
+Close final review receipt against the persisted portable proof, commit, fast-forward main and publish v1.6.0. See foss-image-processing-results.md for final acceptance evidence.
+
+## Completed implementation and current evidence
+- Starting-state checkpoint c809d46; main untouched.
+- Magick.NET 14.17.2 adapter and all production callers compile; no ImageSharp package references remain in src/tests/tools.
+- Raw fixture helpers replace old test library; 645 Release tests passed, 0 failed/skipped (foss-final.trx).
+- Dependency audit reports no vulnerable packages in Core/App/Tests; normal warnings-as-errors enabled.
+- Formatting verification passed.
+- Legacy decoder migration backs up state/sidecar, invalidates feature cache6, and holds unresolved Keep identities; two focused migration tests pass.
+- Old/new real20-image corpus: identical exact identities, frame hashes/timing, and190 pair scores.
+- Three warm rounds: local old median685ms/new1050ms; K old856ms/new1061ms. Lower new peak memory. Profiling attributes most slowdown to GIF native read/composition; opaque-frame skip experiment gave no repeatable improvement and was removed.
+- Portable output VrcPicSorter-foss-1.6.0 created with native components/notices. Isolated --data-dir process38856 started responsive and was stopped after path verification.
+- Review found synchronous native decoding on UI callers; DecodeCoreAsync now offloads via awaited Task.Run with cancellation checked inside, draining before releasing locks. This last edit needs regression/rebuild.
+- Final review is in progress under outputs/foss-review. No merge/publication until complete.
+
+## Final acceptance checkpoint — 2026-10-11
+- All implementation steps and review fixes complete. Final suite: 651 passed, 0 failed/skipped; formatting and portable publish green.
+- Expanded comparison: 28 real copied files, all 378 pair scores identical.
+- Fresh final portable UI scan completed with 0 failures; 18 moved, 5 GIF exports, 5 exact duplicates resolved, 5 reviews queued.
+- Evidence, benchmark limitations, executable hash and fixture boundaries persisted in foss-image-processing-results.md.
+- Remaining: final review gate closure, commit, main merge, GitHub release and asset verification.

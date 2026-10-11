@@ -1,4 +1,3 @@
-using SixLabors.ImageSharp;
 using VrcPicSorter.App.Services;
 using VrcPicSorter.Tests.Imaging;
 

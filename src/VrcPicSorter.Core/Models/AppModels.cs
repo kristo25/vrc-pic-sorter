@@ -140,6 +140,8 @@ public sealed class AppStateDocument
 
     public long Revision { get; set; }
 
+    public string DecoderBackend { get; set; } = ImageFingerprint.CurrentDecoderBackend;
+
     public AppSettings Settings { get; set; } = new();
 
     public ArchiveIndexState ArchiveIndex { get; set; } = new();

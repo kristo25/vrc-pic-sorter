@@ -4,7 +4,6 @@ using VrcPicSorter.Core.Models;
 using VrcPicSorter.Core.Scanning;
 using VrcPicSorter.Tests.FileSystem;
 using VrcPicSorter.Tests.Imaging;
-using SixLabors.ImageSharp;
 
 namespace VrcPicSorter.Tests.Scanning;
 

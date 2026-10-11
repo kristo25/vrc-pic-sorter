@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using SixLabors.ImageSharp;
 using VrcPicSorter.App.Services;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Imaging;

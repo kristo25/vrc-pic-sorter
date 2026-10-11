@@ -62,4 +62,7 @@ public sealed class ReviewDecisionStep
 }
 
 public sealed record ReviewDecisionResult(bool ReviewResolved, int CompletedOperations, int RemainingOperations);
-public sealed record ManualKeepProtection(string Path, string Fingerprint, long FileSize, DateTimeOffset LastWriteUtc);
+public sealed record ManualKeepProtection(string Path, string Fingerprint, long FileSize, DateTimeOffset LastWriteUtc)
+{
+    public bool DecoderMigrationUnresolved { get; init; }
+}

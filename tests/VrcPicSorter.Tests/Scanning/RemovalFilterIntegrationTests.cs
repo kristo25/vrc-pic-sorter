@@ -1,6 +1,4 @@
 using System.Security.Cryptography;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Imaging;
 using VrcPicSorter.Core.Models;
@@ -307,7 +305,7 @@ public sealed class RemovalFilterIntegrationTests
         {
             var decoded = RemovalDetectorTests.Frame(false, uncertain ? "02/40/2024" : "12/11/2024");
             var path = Path.Combine(archive ? Archive(category) : Source(category), Name);
-            using var image = Image.LoadPixelData<Rgba32>(decoded.Frames[0].RgbaPixels, decoded.Width, decoded.Height);
+            using var image = FixtureImage.FromPixels(decoded.Frames[0].RgbaPixels, decoded.Width, decoded.Height);
             await image.SaveAsPngAsync(path);
             return path;
         }

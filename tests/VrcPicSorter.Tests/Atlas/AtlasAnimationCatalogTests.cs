@@ -3,7 +3,6 @@ using VrcPicSorter.Core.Models;
 using VrcPicSorter.Core.Storage;
 using VrcPicSorter.Tests.FileSystem;
 using VrcPicSorter.Tests.Imaging;
-using SixLabors.ImageSharp;
 
 namespace VrcPicSorter.Tests.Atlas;
 

@@ -1,6 +1,3 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 using VrcPicSorter.Core.Atlas;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Imaging;
@@ -1636,9 +1633,9 @@ public sealed class ScanCoordinatorTests
         Directory.CreateDirectory(sourceRoot);
         Directory.CreateDirectory(archiveRoot);
         const string name = "player_x_20frames_10fps_linearloopStyle.png";
-        using (var image = new Image<Rgba32>(1020, 1020))
+        using (var image = new FixtureImage(1020, 1020))
         {
-            image.Mutate(context => context.BackgroundColor(Color.FromRgb(30, 90, 160)));
+            image.Mutate(context => context.BackgroundColor(new FixturePixel(30, 90, 160)));
             await image.SaveAsPngAsync(Path.Combine(sourceRoot, name));
         }
 
@@ -1816,13 +1813,13 @@ public sealed class ScanCoordinatorTests
     private static void WriteGif(string path, int frames)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using var image = new Image<Rgba32>(32, 32);
-        image.Mutate(context => context.BackgroundColor(Color.FromRgb(10, 60, 120)));
+        using var image = new FixtureImage(32, 32);
+        image.Mutate(context => context.BackgroundColor(new FixturePixel(10, 60, 120)));
         for (var index = 1; index < frames; index++)
         {
-            using var frame = new Image<Rgba32>(32, 32);
+            using var frame = new FixtureImage(32, 32);
             frame.Mutate(context => context.BackgroundColor(
-                Color.FromRgb((byte)(10 + (index * 40)), 60, 120)));
+                new FixturePixel((byte)(10 + (index * 40)), 60, 120)));
             image.Frames.AddFrame(frame.Frames.RootFrame);
         }
 
@@ -1988,16 +1985,16 @@ public sealed class ScanCoordinatorTests
     private static async Task WriteUnrelatedLookingAnimationAsync(string destination, int frames)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-        using var animation = new Image<Rgba32>(64, 64, Colour(0));
+        using var animation = new FixtureImage(64, 64, Colour(0));
         for (var index = 1; index < frames; index++)
         {
-            using var frame = new Image<Rgba32>(64, 64, Colour(index));
+            using var frame = new FixtureImage(64, 64, Colour(index));
             animation.Frames.AddFrame(frame.Frames.RootFrame);
         }
 
         await animation.SaveAsGifAsync(destination);
 
-        static Rgba32 Colour(int index) =>
+        static FixturePixel Colour(int index) =>
             new((byte)(30 + (index * 40)), (byte)(200 - (index * 30)), 90, 255);
     }
 
@@ -2096,7 +2093,7 @@ public sealed class ScanCoordinatorTests
     private static void WriteSheet(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using var image = new Image<Rgba32>(128, 128);
+        using var image = new FixtureImage(128, 128);
         image.ProcessPixelRows(accessor =>
         {
             for (var y = 0; y < accessor.Height; y++)
@@ -2106,7 +2103,7 @@ public sealed class ScanCoordinatorTests
                 {
                     var inset = (x % 64) is > 8 and < 56 && (y % 64) is > 8 and < 56;
                     var cell = ((y / 64) * 2) + (x / 64);
-                    span[x] = inset ? new Rgba32((byte)(40 + (cell * 50)), 120, 200, 255) : default;
+                    span[x] = inset ? new FixturePixel((byte)(40 + (cell * 50)), 120, 200, 255) : default;
                 }
             }
         });

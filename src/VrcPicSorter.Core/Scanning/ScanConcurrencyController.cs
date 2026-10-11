@@ -147,9 +147,9 @@ public sealed class ScanConcurrencyController(JsonStateStore store, ImageDecoder
             try
             {
                 if (new FileInfo(path).Length > 1024 * 1024) continue;
-                var info = SixLabors.ImageSharp.Image.Identify(path);
+                var info = RasterCodec.Identify(path);
                 if (info is null || DecodeMemoryBudget.EstimateBytes(info.Width, info.Height,
-                    Math.Max(1, info.FrameMetadataCollection.Count)) > 48L * 1024 * 1024) continue;
+                    info.FrameCount) > 48L * 1024 * 1024) continue;
                 result.Add(path);
                 if (result.Count == 32) break;
             }
@@ -215,7 +215,7 @@ public sealed class ScanConcurrencyController(JsonStateStore store, ImageDecoder
 
     internal static bool IsReadFailure(Exception e) => e is IOException or UnauthorizedAccessException
         or InvalidDataException or InvalidOperationException or NotSupportedException
-        or SixLabors.ImageSharp.UnknownImageFormatException or SixLabors.ImageSharp.ImageFormatException;
+        or InvalidDataException;
 
     private static async Task<double> ProbeAsync(string root, CancellationToken token)
     {

@@ -1940,8 +1940,7 @@ public sealed partial class ScanCoordinator
                 or InvalidDataException
                 or NotSupportedException
                 or InvalidOperationException
-                or SixLabors.ImageSharp.UnknownImageFormatException
-                or SixLabors.ImageSharp.ImageFormatException)
+                or InvalidDataException)
         {
             return new PreparedImage(null, exception.Message, ScanRetry.IsTransient(exception));
         }

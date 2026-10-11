@@ -1,6 +1,3 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats.Gif;
-using SixLabors.ImageSharp.PixelFormats;
 using VrcPicSorter.Core.Atlas;
 using VrcPicSorter.Core.Imaging;
 
@@ -39,14 +36,14 @@ public sealed class AtlasGifExporterTests
         Assert.Equal(10, result.FrameDelayCentiseconds);
         Assert.Equal(10, result.EffectiveFramesPerSecond);
 
-        using var gif = await Image.LoadAsync<Rgba32>(destination);
-        Assert.Equal(16, gif.Frames.Count);
+        var gif = FixtureCodec.GifMetadata(destination);
+        Assert.Equal(16, gif.Delays.Length);
         Assert.Equal(128, gif.Width);
         Assert.Equal(128, gif.Height);
-        Assert.Equal(0, (int)gif.Metadata.GetGifMetadata().RepeatCount);
-        foreach (var frame in gif.Frames)
+        Assert.Equal(0, (int)gif.RepeatCount);
+        foreach (var delay in gif.Delays)
         {
-            Assert.Equal(10, frame.Metadata.GetGifMetadata().FrameDelay);
+            Assert.Equal(10U, delay);
         }
     }
 
@@ -114,7 +111,7 @@ public sealed class AtlasGifExporterTests
         using var directory = new TestDirectory();
         var path = directory.GetPath("sheets", "x_a_4frames_10fps_linearloopStyle.gif");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var animated = new Image<Rgba32>(64, 64))
+        using (var animated = new FixtureImage(64, 64))
         {
             animated.Frames.AddFrame(animated.Frames.RootFrame);
             animated.SaveAsGif(path);
@@ -140,7 +137,7 @@ public sealed class AtlasGifExporterTests
         const string name = "x_a_3frames_10fps_linearloopStyle.png";
         var path = directory.GetPath("sheets", name);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var image = new Image<Rgba32>(128, 128))
+        using (var image = new FixtureImage(128, 128))
         {
             image.ProcessPixelRows(accessor =>
             {
@@ -151,7 +148,7 @@ public sealed class AtlasGifExporterTests
                     {
                         var inset = (x % 64) is > 8 and < 56 && (y % 64) is > 8 and < 56;
                         var cell = ((y / 64) * 2) + (x / 64);
-                        span[x] = inset ? new Rgba32((byte)(40 + (cell * 50)), 120, 200, 255) : default;
+                        span[x] = inset ? new FixturePixel((byte)(40 + (cell * 50)), 120, 200, 255) : default;
                     }
                 }
             });
@@ -193,9 +190,9 @@ public sealed class AtlasGifExporterTests
         const string name = "x_a_3frames_10fps_linearloopStyle.png";
         var path = directory.GetPath("sheets", name);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var image = new Image<Rgba32>(128, 128))
+        using (var image = new FixtureImage(128, 128))
         {
-            var background = new Rgba32(18, 18, 24, 255);
+            var background = new FixturePixel(18, 18, 24, 255);
             image.ProcessPixelRows(accessor =>
             {
                 for (var y = 0; y < accessor.Height; y++)
@@ -205,7 +202,7 @@ public sealed class AtlasGifExporterTests
                     {
                         var cell = ((y / 64) * 2) + (x / 64);
                         span[x] = cell < 3
-                            ? new Rgba32((byte)(60 + (cell * 60)), 120, 200, 255)
+                            ? new FixturePixel((byte)(60 + (cell * 60)), 120, 200, 255)
                             : background;
                     }
                 }
@@ -232,7 +229,7 @@ public sealed class AtlasGifExporterTests
         const string name = "x_a_3frames_10fps_linearloopStyle.png";
         var path = directory.GetPath("sheets", name);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var image = new Image<Rgba32>(128, 128))
+        using (var image = new FixtureImage(128, 128))
         {
             image.ProcessPixelRows(accessor =>
             {
@@ -244,7 +241,7 @@ public sealed class AtlasGifExporterTests
                         var cell = ((y / 64) * 2) + (x / 64);
                         var spill = cell == 3 && y == 64 && x < 104;
                         span[x] = cell < 3 || spill
-                            ? new Rgba32((byte)(40 + (cell * 50)), 120, 200, 255)
+                            ? new FixturePixel((byte)(40 + (cell * 50)), 120, 200, 255)
                             : default;
                     }
                 }
@@ -269,7 +266,7 @@ public sealed class AtlasGifExporterTests
         const string name = "x_a_3frames_10fps_linearloopStyle.png";
         var path = directory.GetPath("sheets", name);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var image = new Image<Rgba32>(128, 128))
+        using (var image = new FixtureImage(128, 128))
         {
             image.ProcessPixelRows(accessor =>
             {
@@ -280,7 +277,7 @@ public sealed class AtlasGifExporterTests
                     {
                         var inset = (x % 64) is > 8 and < 56 && (y % 64) is > 8 and < 56;
                         var cell = ((y / 64) * 2) + (x / 64);
-                        span[x] = inset ? new Rgba32((byte)(40 + (cell * 50)), 120, 200, 255) : default;
+                        span[x] = inset ? new FixturePixel((byte)(40 + (cell * 50)), 120, 200, 255) : default;
                     }
                 }
             });
@@ -308,7 +305,7 @@ public sealed class AtlasGifExporterTests
         const string name = "x_a_3frames_10fps_linearloopStyle.png";
         var path = directory.GetPath("sheets", name);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var image = new Image<Rgba32>(128, 128))
+        using (var image = new FixtureImage(128, 128))
         {
             image.ProcessPixelRows(accessor =>
             {
@@ -321,7 +318,7 @@ public sealed class AtlasGifExporterTests
                         var cell = ((y / 64) * 2) + (x / 64);
                         // Cells 0, 1 and 3 are drawn on; cell 2 is a blank frame, which is ordinary.
                         span[x] = inset && cell != 2
-                            ? new Rgba32((byte)(40 + (cell * 50)), 120, 200, 255)
+                            ? new FixturePixel((byte)(40 + (cell * 50)), 120, 200, 255)
                             : default;
                     }
                 }
@@ -350,7 +347,7 @@ public sealed class AtlasGifExporterTests
         const string name = "x_a_4frames_10fps_linearloopStyle.png";
         var path = directory.GetPath("sheets", name);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var image = new Image<Rgba32>(128, 128))
+        using (var image = new FixtureImage(128, 128))
         {
             image.ProcessPixelRows(accessor =>
             {
@@ -363,7 +360,7 @@ public sealed class AtlasGifExporterTests
                         var cell = ((y / 64) * 2) + (x / 64);
                         // Only cells 0 and 1 are drawn on; 2 and 3 are blank.
                         span[x] = inset && cell < 2
-                            ? new Rgba32((byte)(40 + (cell * 50)), 120, 200, 255)
+                            ? new FixturePixel((byte)(40 + (cell * 50)), 120, 200, 255)
                             : default;
                     }
                 }
@@ -393,7 +390,7 @@ public sealed class AtlasGifExporterTests
         const string name = "x_a_4frames_10fps_linearloopStyle.png";
         var path = directory.GetPath("sheets", name);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var image = new Image<Rgba32>(128, 128))
+        using (var image = new FixtureImage(128, 128))
         {
             image.ProcessPixelRows(accessor =>
             {
@@ -406,7 +403,7 @@ public sealed class AtlasGifExporterTests
                         var cell = ((y / 64) * 2) + (x / 64);
                         // Cells 0, 1 and 2 drawn; only cell 3 is blank.
                         span[x] = inset && cell < 3
-                            ? new Rgba32((byte)(40 + (cell * 50)), 120, 200, 255)
+                            ? new FixturePixel((byte)(40 + (cell * 50)), 120, 200, 255)
                             : default;
                     }
                 }
@@ -552,7 +549,7 @@ public sealed class AtlasGifExporterTests
         using var directory = new TestDirectory();
         var path = directory.GetPath("sheets", "x_a_4frames_10fps_linearloopStyle.png");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var wide = new Image<Rgba32>(ImageResourceLimits.MaximumWidth + 8, 1))
+        using (var wide = new FixtureImage(ImageResourceLimits.MaximumWidth + 8, 1))
         {
             await wide.SaveAsPngAsync(path);
         }
@@ -581,7 +578,7 @@ public sealed class AtlasGifExporterTests
         using var directory = new TestDirectory();
         var path = directory.GetPath("sheets", "ordinary.png");
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        using (var small = new Image<Rgba32>(8, 8))
+        using (var small = new FixtureImage(8, 8))
         {
             await small.SaveAsPngAsync(path);
         }
@@ -604,12 +601,12 @@ public sealed class AtlasGifExporterTests
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var side = AtlasLayout.SideFor(frames);
         var cell = canvas / side;
-        using var image = new Image<Rgba32>(canvas, canvas);
+        using var image = new FixtureImage(canvas, canvas);
         for (var index = 0; index < frames; index++)
         {
             var row = index / side;
             var column = index % side;
-            var colour = new Rgba32((byte)(20 + (index * 11 % 220)), (byte)(40 + (index * 37 % 200)), 90, 255);
+            var colour = new FixturePixel((byte)(20 + (index * 11 % 220)), (byte)(40 + (index * 37 % 200)), 90, 255);
             image.ProcessPixelRows(accessor =>
             {
                 for (var y = row * cell; y < (row + 1) * cell; y++)

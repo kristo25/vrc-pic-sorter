@@ -1,4 +1,3 @@
-using SixLabors.ImageSharp;
 using VrcPicSorter.Core.FileSystem;
 
 namespace VrcPicSorter.Core.Atlas;
@@ -271,7 +270,7 @@ public sealed class AtlasAnimationWriter
                 or InvalidOperationException
                 or NotSupportedException
                 or ArgumentException
-                or ImageFormatException)
+                or InvalidDataException)
         {
             return new AtlasAnimationResult(false, null, $"could not be animated ({exception.Message})");
         }

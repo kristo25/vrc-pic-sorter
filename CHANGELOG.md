@@ -3,7 +3,7 @@
 All notable changes to VRC Pic Sorter are recorded here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.6.0] - 2026-10-10
+## [1.6.0] - 2026-10-11
 
 ### Added
 
@@ -22,7 +22,12 @@ All notable changes to VRC Pic Sorter are recorded here. This project follows
 
 ### Security
 
-- Updated ImageSharp to 4.1.2 to address dependency vulnerability advisories.
+- Replaced ImageSharp with Magick.NET FOSS image processing, with no build-time license key.
+
+### Verification
+
+- 651 tests passed. All 378 comparison scores across 28 copied real images matched the previous decoder; the isolated portable scan completed without failures.
+- Small-corpus warm benchmarks showed slower GIF decoding (local 685 → 1050 ms; K: 856 → 1061 ms) and lower peak memory. See `docs/verification/foss-image-processing-results.md` for evidence and limits.
 
 ## [1.5.0] - 2026-09-25
 

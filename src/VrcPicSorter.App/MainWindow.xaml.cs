@@ -1882,7 +1882,7 @@ public partial class MainWindow : Window
         catch (Exception exception) when (
             exception is IOException
                 or UnauthorizedAccessException
-                or SixLabors.ImageSharp.ImageFormatException
+                or InvalidDataException
                 or InvalidOperationException
                 or NotSupportedException
                 or OutOfMemoryException)

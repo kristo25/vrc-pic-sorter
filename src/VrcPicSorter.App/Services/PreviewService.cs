@@ -2,11 +2,6 @@ using System.IO;
 using System.Runtime.CompilerServices;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats;
-using SixLabors.ImageSharp.Formats.Gif;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
 using VrcPicSorter.Core.Imaging;
 
 namespace VrcPicSorter.App.Services;
@@ -17,7 +12,6 @@ public sealed class PreviewService : IDisposable
     /// What every preview decode is allowed to cost. The header checks refuse an image that says
     /// it is too big; this refuses one whose header understated it.
     /// </summary>
-    private static readonly DecoderOptions BoundedOptions = new() { MaxFrames = ImageResourceLimits.MaximumFrames };
 
     private readonly Dictionary<System.Windows.Controls.Image, PreviewAnimation> _animations = [];
     private readonly SemaphoreSlim _thumbnailGate = new(1, 1);
@@ -39,22 +33,17 @@ public sealed class PreviewService : IDisposable
         try
         {
             ImageResourceLimits.EnsureEncodedSizeSafe(path);
-            var info = SixLabors.ImageSharp.Image.Identify(path);
-            ImageResourceLimits.EnsureSafe(info.Width, info.Height, Math.Max(1, info.FrameMetadataCollection.Count));
-            using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(new DecoderOptions { MaxFrames = 1 }, path);
-            image.Mutate(context => context.AutoOrient());
+            var image = RasterCodec.Decode(path, firstFrameOnly: true);
             if (image.Width > decodeWidth)
             {
-                image.Mutate(context => context.Resize(decodeWidth, 0));
+                image = RasterCodec.Resize(image, decodeWidth, Math.Max(1, image.Height * decodeWidth / image.Width));
             }
 
-            return CreateBitmapSource(image.Frames.RootFrame, image.Width, image.Height);
+            return CreateBitmapSource(image.Frames[0], image.Width, image.Height);
         }
         catch (Exception exception) when (
             exception is IOException
                 or UnauthorizedAccessException
-                or UnknownImageFormatException
-                or InvalidImageContentException
                 or InvalidDataException
                 or OverflowException
                 or NotSupportedException)
@@ -120,8 +109,7 @@ public sealed class PreviewService : IDisposable
         catch (Exception exception) when (
             exception is IOException
                 or UnauthorizedAccessException
-                or UnknownImageFormatException
-                or InvalidImageContentException
+                or NotSupportedException
                 or InvalidDataException
                 or OverflowException)
         {
@@ -138,13 +126,10 @@ public sealed class PreviewService : IDisposable
         int decodeWidth)
     {
         ImageResourceLimits.EnsureEncodedSizeSafe(path);
-        var info = SixLabors.ImageSharp.Image.Identify(path);
-        ImageResourceLimits.EnsureSafe(info.Width, info.Height, Math.Max(1, info.FrameMetadataCollection.Count));
-        using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(BoundedOptions, path);
-        image.Mutate(context => context.AutoOrient());
+        var image = RasterCodec.Decode(path);
         if (image.Width > decodeWidth)
         {
-            image.Mutate(context => context.Resize(decodeWidth, 0));
+            image = RasterCodec.Resize(image, decodeWidth, Math.Max(1, image.Height * decodeWidth / image.Width));
         }
 
         var frames = new List<BitmapSource>(image.Frames.Count);
@@ -152,7 +137,7 @@ public sealed class PreviewService : IDisposable
         foreach (var frame in image.Frames)
         {
             frames.Add(CreateBitmapSource(frame, image.Width, image.Height));
-            var milliseconds = Math.Max(20, frame.Metadata.GetGifMetadata().FrameDelay * 10);
+            var milliseconds = Math.Max(20, frame.DelayMilliseconds);
             delays.Add(TimeSpan.FromMilliseconds(milliseconds));
         }
 
@@ -169,10 +154,10 @@ public sealed class PreviewService : IDisposable
     private int CurrentVersion(System.Windows.Controls.Image target) =>
         _versions.TryGetValue(target, out var box) ? box.Value : 0;
 
-    private static BitmapSource CreateBitmapSource(ImageFrame<Rgba32> frame, int width, int height)
+    private static BitmapSource CreateBitmapSource(DecodedImageFrame frame, int width, int height)
     {
         var rgba = new byte[checked(width * height * 4)];
-        frame.CopyPixelDataTo(rgba);
+        frame.RgbaPixels.CopyTo(rgba, 0);
         for (var offset = 0; offset < rgba.Length; offset += 4)
         {
             (rgba[offset], rgba[offset + 2]) = (rgba[offset + 2], rgba[offset]);

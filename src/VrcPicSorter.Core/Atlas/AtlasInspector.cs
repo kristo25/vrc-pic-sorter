@@ -1,6 +1,3 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats;
-using SixLabors.ImageSharp.PixelFormats;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Imaging;
 
@@ -108,18 +105,18 @@ public static class AtlasInspector
         // be decoded whole on a thread-pool thread with nothing to stop it.
         PathBoundary.EnsureNoReparsePoints(atlasPath, "Sheet");
         ImageResourceLimits.EnsureEncodedSizeSafe(atlasPath);
-        var info = Image.Identify(atlasPath);
+        var info = RasterCodec.Identify(atlasPath);
         ImageResourceLimits.EnsureSafe(info.Width, info.Height, 1);
 
         // A sheet is a still, so one frame is all that is ever wanted from it. Without the bound a
         // file that is really an animation would be decoded whole before anything noticed.
-        using var atlas = Image.Load<Rgba32>(new DecoderOptions { MaxFrames = 1 }, atlasPath);
+        var atlas = RasterCodec.Decode(atlasPath, firstFrameOnly: true);
         return AtlasLayout.TryCreate(name.FrameCount, atlas.Width, atlas.Height, out var layout)
             ? Inspect(atlas, layout)
             : null;
     }
 
-    public static AtlasInspection Inspect(Image<Rgba32> atlas, AtlasLayout layout)
+    public static AtlasInspection Inspect(DecodedImage atlas, AtlasLayout layout)
     {
         ArgumentNullException.ThrowIfNull(atlas);
         ArgumentNullException.ThrowIfNull(layout);
@@ -135,44 +132,41 @@ public static class AtlasInspector
         // sheet reads as full; that is a corner this deliberately does not guess at, and it costs
         // nothing now that the answer is a note rather than a refusal.
         var transparent = HasTransparency(atlas);
-        var background = transparent ? default : atlas[atlas.Width - 1, atlas.Height - 1];
+        var pixels = atlas.Frames[0].RgbaPixels;
+        var background = pixels.Length - 4;
         var used = new long[cells];
 
         // One pass over the sheet rather than one per cell: the accessor is entered once and every
         // row is attributed to whichever cell it falls in.
-        atlas.ProcessPixelRows(accessor =>
+        for (var line = 0; line < atlas.Height; line++)
         {
-            for (var line = 0; line < atlas.Height; line++)
+            var row = line / layout.CellHeight;
+            if (row >= layout.Rows)
             {
-                var row = line / layout.CellHeight;
-                if (row >= layout.Rows)
+                break;
+            }
+
+            for (var pixel = 0; pixel < atlas.Width; pixel++)
+            {
+                var column = pixel / layout.CellWidth;
+                if (column >= layout.Columns)
                 {
                     break;
                 }
 
-                var span = accessor.GetRowSpan(line);
-                for (var pixel = 0; pixel < atlas.Width; pixel++)
+                var offset = (line * atlas.Width + pixel) * 4;
+                var occupied = transparent
+                    ? pixels[offset + 3] > AlphaThreshold
+                    : Math.Max(
+                        Math.Abs(pixels[offset] - pixels[background]),
+                        Math.Max(Math.Abs(pixels[offset + 1] - pixels[background + 1]), Math.Abs(pixels[offset + 2] - pixels[background + 2])))
+                        > ColourTolerance;
+                if (occupied)
                 {
-                    var column = pixel / layout.CellWidth;
-                    if (column >= layout.Columns)
-                    {
-                        break;
-                    }
-
-                    var colour = span[pixel];
-                    var occupied = transparent
-                        ? colour.A > AlphaThreshold
-                        : Math.Max(
-                            Math.Abs(colour.R - background.R),
-                            Math.Max(Math.Abs(colour.G - background.G), Math.Abs(colour.B - background.B)))
-                            > ColourTolerance;
-                    if (occupied)
-                    {
-                        used[(row * layout.Columns) + column]++;
-                    }
+                    used[(row * layout.Columns) + column]++;
                 }
             }
-        });
+        }
 
         var report = new AtlasCell[cells];
         var withContent = 0;
@@ -196,25 +190,11 @@ public static class AtlasInspector
     }
 
     /// <summary>True when the alpha channel carries usable information at all.</summary>
-    private static bool HasTransparency(Image<Rgba32> atlas)
+    private static bool HasTransparency(DecodedImage atlas)
     {
-        var transparent = false;
-        atlas.ProcessPixelRows(accessor =>
-        {
-            for (var line = 0; line < accessor.Height && !transparent; line++)
-            {
-                var span = accessor.GetRowSpan(line);
-                for (var pixel = 0; pixel < span.Length; pixel++)
-                {
-                    if (span[pixel].A <= AlphaThreshold)
-                    {
-                        transparent = true;
-                        break;
-                    }
-                }
-            }
-        });
-
-        return transparent;
+        var pixels = atlas.Frames[0].RgbaPixels;
+        for (var offset = 3; offset < pixels.Length; offset += 4)
+            if (pixels[offset] <= AlphaThreshold) return true;
+        return false;
     }
 }

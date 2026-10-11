@@ -1,9 +1,3 @@
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats;
-using SixLabors.ImageSharp.Formats.Gif;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
-using SixLabors.ImageSharp.Processing.Processors.Quantization;
 using VrcPicSorter.Core.FileSystem;
 using VrcPicSorter.Core.Imaging;
 using System.Security.Cryptography;
@@ -32,10 +26,6 @@ public sealed class AtlasGifExporter
 
     public const string GifExtension = ".gif";
 
-    private static readonly GifEncoder Encoder = new()
-    {
-        Quantizer = new WuQuantizer(new QuantizerOptions { Dither = KnownDitherings.FloydSteinberg }),
-    };
 
     /// <summary>Highest rate a GIF can express without being rewritten by the viewer.</summary>
     public static int MaximumRepresentableFramesPerSecond => 100 / MinimumFrameDelayCentiseconds;
@@ -103,13 +93,14 @@ public sealed class AtlasGifExporter
             bufferSize: 64 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan))
         {
-            var info = await Image.IdentifyAsync(probe, cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            var info = RasterCodec.Identify(probe);
             if (info is null)
             {
                 throw new InvalidDataException("The image header could not be read.");
             }
 
-            if (info.FrameMetadataCollection.Count > 1)
+            if (info.FrameCount > 1)
             {
                 throw new InvalidOperationException(
                     "This image is already animated. A sprite sheet has to be a single still image.");
@@ -118,10 +109,8 @@ public sealed class AtlasGifExporter
             ImageResourceLimits.EnsureSafe(info.Width, info.Height, 1);
         }
 
-        var options = new DecoderOptions { MaxFrames = 1 };
-        using var atlas = await Image
-            .LoadAsync<Rgba32>(options, sourcePath, cancellationToken)
-            .ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        var atlas = RasterCodec.Decode(sourcePath, firstFrameOnly: true);
         ImageResourceLimits.EnsureSafe(atlas.Width, atlas.Height, 1);
 
         if (!AtlasLayout.TryCreate(name.FrameCount, atlas.Width, atlas.Height, out var layout))
@@ -171,67 +160,49 @@ public sealed class AtlasGifExporter
         }
 
         var delay = FrameDelayFor(name.FramesPerSecond);
-        Image<Rgba32>? animation = null;
-        try
+        var frames = new List<DecodedImageFrame>();
+        foreach (var index in order)
         {
-            foreach (var index in order)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var (x, y, width, height) = layout.GetFrame(index);
-                using var cell = atlas.Clone(context => context.Crop(new Rectangle(x, y, width, height)));
-                if (animation is null)
-                {
-                    animation = cell.Clone();
-                }
-                else
-                {
-                    animation.Frames.AddFrame(cell.Frames.RootFrame);
-                }
-            }
-
-            if (animation is null)
-            {
-                throw new InvalidOperationException("The sheet produced no frames.");
-            }
-
-            animation.Metadata.GetGifMetadata().RepeatCount = 0;
-            foreach (var frame in animation.Frames)
-            {
-                var metadata = frame.Metadata.GetGifMetadata();
-                metadata.FrameDelay = delay;
-
-                // Each cell is drawn whole and carries its own transparency. Without clearing
-                // between frames a transparent pixel keeps whatever the previous frame left
-                // there, which smears the animation instead of replacing it.
-                metadata.DisposalMethod = GifDisposalMethod.RestoreToBackground;
-            }
-
-            var directory = Path.GetDirectoryName(Path.GetFullPath(destinationPath));
-            if (!string.IsNullOrEmpty(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
-
-            // Checked again now the folder exists. The first check proved no link stood between
-            // here and the nearest folder that did exist; this one covers anything that appeared
-            // while the frames were being cut, including a folder created for us.
-            EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
-            EnsureDestinationIsSafe(temporaryPath, allowedDestinationRoot);
-            await animation.SaveAsync(temporaryPath, Encoder, cancellationToken).ConfigureAwait(false);
-            EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
-            await VerifyDestinationAsync(destinationPath, expectedDestinationHash, cancellationToken).ConfigureAwait(false);
-            File.Move(temporaryPath, destinationPath, overwrite);
-            return new AtlasExportResult(
-                destinationPath,
-                order.Count,
-                delay,
-                EffectiveFramesPerSecondFor(name.FramesPerSecond),
-                note);
+            cancellationToken.ThrowIfCancellationRequested();
+            var (x, y, width, height) = layout.GetFrame(index);
+            var cell = RasterCodec.Crop(atlas, x, y, width, height);
+            frames.Add(new DecodedImageFrame(cell.Frames[0].RgbaPixels, delay * 10));
         }
-        finally
+
+        if (frames.Count == 0)
         {
-            animation?.Dispose();
+            throw new InvalidOperationException("The sheet produced no frames.");
         }
+
+        var animation = new DecodedImage(layout.CellWidth, layout.CellHeight, "GIF", frames);
+
+        var directory = Path.GetDirectoryName(Path.GetFullPath(destinationPath));
+        if (!string.IsNullOrEmpty(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        // Checked again now the folder exists. The first check proved no link stood between
+        // here and the nearest folder that did exist; this one covers anything that appeared
+        // while the frames were being cut, including a folder created for us.
+        EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
+        EnsureDestinationIsSafe(temporaryPath, allowedDestinationRoot);
+        await using (var output = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            RasterCodec.WriteGif(animation, output);
+            await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureDestinationIsSafe(destinationPath, allowedDestinationRoot);
+        await VerifyDestinationAsync(destinationPath, expectedDestinationHash, cancellationToken).ConfigureAwait(false);
+        File.Move(temporaryPath, destinationPath, overwrite);
+        return new AtlasExportResult(
+            destinationPath,
+            order.Count,
+            delay,
+            EffectiveFramesPerSecondFor(name.FramesPerSecond),
+            note);
     }
 
     internal static async Task<string> ReadContentHashAsync(string path, CancellationToken cancellationToken)

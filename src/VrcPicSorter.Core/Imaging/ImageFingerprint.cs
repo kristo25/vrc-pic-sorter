@@ -95,7 +95,9 @@ public sealed record ImageFingerprint(
     int FeatureVersion = 1,
     IReadOnlyList<byte[]>? AnimationFrameSummaries = null)
 {
-    public const int CurrentFeatureVersion = 5;
+    // Version 6 requires canonical pixels from the Magick.NET backend.
+    public const int CurrentFeatureVersion = 6;
+    public const string CurrentDecoderBackend = "Magick.NET-Q8-v1";
     internal const int AnimationSummarySize = 6;
     private const int AnimationSampleCount = 8;
     private const int DifferenceHashWidth = 17;

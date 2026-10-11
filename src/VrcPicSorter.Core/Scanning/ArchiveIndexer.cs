@@ -236,6 +236,18 @@ public sealed class ArchiveIndexer
                     }
 
                     index.Images = indexed;
+                    // Equal decoded identities revalidate legacy choices. A disagreement keeps
+                    // the migration hold until the user makes a new explicit decision.
+                    current.ManualKeeps = current.ManualKeeps.Select(keep =>
+                        indexed.Any(image => string.Equals(image.Path, keep.Path, StringComparison.OrdinalIgnoreCase)
+                            && image.ExactFingerprint == keep.Fingerprint && image.FileSize == keep.FileSize
+                            && image.LastWriteUtc == keep.LastWriteUtc)
+                            ? keep with { DecoderMigrationUnresolved = false } : keep).ToList();
+                    current.FilterKeeps = current.FilterKeeps.Select(keep =>
+                        indexed.Any(image => string.Equals(image.Path, keep.Path, StringComparison.OrdinalIgnoreCase)
+                            && image.ExactFingerprint == keep.Fingerprint && image.FileSize == keep.FileSize
+                            && image.LastWriteUtc == keep.LastWriteUtc)
+                            ? keep with { DecoderMigrationUnresolved = false } : keep).ToList();
                     current.Settings.CategoryMappings.Single(item => item.Category == category).ArchivePathKnownMissing = false;
                     index.Status = IndexStatus.Current;
                     index.LastCompletedUtc = _timeProvider.GetUtcNow();
