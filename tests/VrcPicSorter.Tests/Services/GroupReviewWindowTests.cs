@@ -132,8 +132,13 @@ public sealed class GroupReviewWindowTests
                         content.UpdateLayout();
                         foreach (var thumbnail in Descendants(cards).OfType<System.Windows.Controls.Image>().Where(i => i.Tag is string))
                             thumbnail.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent));
-                        await Task.Delay(200);
                         var active = (System.Windows.Controls.Image?)typeof(MainWindow).GetField("_activeMatchPreview", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window);
+                        for (var attempt = 0; attempt < 1000
+                            && (active?.Source is null || !ReferenceEquals(active.DataContext, cards.SelectedItem)); attempt++)
+                        {
+                            await Task.Delay(10);
+                            active = (System.Windows.Controls.Image?)typeof(MainWindow).GetField("_activeMatchPreview", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window);
+                        }
                         Assert.NotNull(active);
                         Assert.Same(cards.SelectedItem, active.DataContext);
                         Assert.NotNull(active.Source);
@@ -219,7 +224,7 @@ public sealed class GroupReviewWindowTests
         })
         { IsBackground = true };
         thread.SetApartmentState(ApartmentState.STA); thread.Start();
-        await completion.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await completion.Task.WaitAsync(TimeSpan.FromSeconds(90));
     }
 
     private static ReviewFileAction Action(object card) => (ReviewFileAction)card.GetType().GetProperty("Action")!.GetValue(card)!;

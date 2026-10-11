@@ -1963,7 +1963,7 @@ public sealed partial class ScanCoordinator
 
         if (first.Count > 0 && _settleDelay > TimeSpan.Zero)
         {
-            await Task.Delay(_settleDelay, cancellationToken).ConfigureAwait(false);
+            await Task.Delay(_settleDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
         }
 
         var settled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

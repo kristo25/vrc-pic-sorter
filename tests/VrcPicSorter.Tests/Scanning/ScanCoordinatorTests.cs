@@ -275,16 +275,18 @@ public sealed class ScanCoordinatorTests
 
         using var store = FileRouterTests.CreateStore(directory, sourceRoot, archiveRoot);
         var decoder = new ImageDecoder();
+        var settleClock = new SettleClock();
         var coordinator = new ScanCoordinator(
             store,
             new ArchiveIndexer(store, decoder),
             decoder,
             new FileRouter(store, decoder, new FileRouterTests.FakeRecycleBinService()),
-            TimeSpan.FromMilliseconds(400));
+            TimeSpan.FromMilliseconds(400), settleClock);
 
         var scan = coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
-        await Task.Delay(150);
+        var timer = await settleClock.TimerCreated.Task.WaitAsync(TimeSpan.FromSeconds(15));
         File.SetLastWriteTimeUtc(incoming, DateTime.UtcNow.AddSeconds(1));
+        timer.Fire();
         var result = await scan;
 
         Assert.Contains(result.Errors, error => error.Contains("still being written", StringComparison.Ordinal));
@@ -2221,5 +2223,22 @@ public sealed class ScanCoordinatorTests
         Assert.True(File.Exists(first));
         Assert.True(File.Exists(second));
         Assert.Equal(2, (await store.LoadAsync()).ReviewQueue.Count);
+    }
+    private sealed class SettleClock : TimeProvider
+    {
+        public TaskCompletionSource<SettleTimer> TimerCreated { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new SettleTimer(callback, state);
+            TimerCreated.TrySetResult(timer);
+            return timer;
+        }
+        public sealed class SettleTimer(TimerCallback callback, object? state) : ITimer
+        {
+            public void Fire() => callback(state);
+            public bool Change(TimeSpan dueTime, TimeSpan period) => true;
+            public void Dispose() { }
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
     }
 }

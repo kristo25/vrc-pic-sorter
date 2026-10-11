@@ -40,3 +40,6 @@ Close final review receipt against the persisted portable proof, commit, fast-fo
 - Independent final review: Ready to merge. Migration committed as 5b2b018, fast-forwarded and pushed to main.
 - GitHub release initially stopped at formatting: Windows Roslyn expected CRLF on three expression-member lines while Git normalizes C# to LF. Added a C# end_of_line editor setting matching .gitattributes; no runtime change.
 - Next: verify formatting with the repository setting, commit correction, update the unpublished v1.6.0 tag and rerun gated publication.
+- Formatting passed on GitHub after f28fce0. The second run passed build but exposed two fixed-delay test races (preview decoding and mutation before scan preflight).
+- Preview assertions now await readiness; settle test uses the existing injected clock to change the file strictly between observations. System-clock runtime behavior is unchanged. Both focused regressions passed; full suite and review follow-up in progress.
+- Follow-up review Ready; all651 tests and formatting pass. Rebuilt portable fresh fixture scan:23 examined,18 moved,5 animated,5 exact resolved,0 failed/skipped. Final hash in results document. Next: commit correction and rerun release gates.
