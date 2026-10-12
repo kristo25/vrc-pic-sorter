@@ -70,7 +70,12 @@ public partial class MainWindow : Window
     private ReviewItem? SelectedReview => QueueList.SelectedItem as ReviewItem;
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
+        => await InitializeWindowAsync();
+
+    private async Task InitializeWindowAsync()
     {
+        // Show persisted settings/defaults before storage recovery or indexing can stall.
+        LoadSettings((await _runtime.StateStore.LoadAsync()).Settings);
         await _runtime.Router.RestorePendingReviewVisibilityAsync();
         var duplicateCleanup = await _runtime.Scanner.CleanArchiveDuplicatesAsync();
         await RefreshAsync(selectFirst: false, refreshSettings: true);

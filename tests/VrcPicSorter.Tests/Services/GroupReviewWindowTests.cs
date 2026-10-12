@@ -57,6 +57,7 @@ public sealed class GroupReviewWindowTests
                     }
                     await runtime.StateStore.UpdateAsync(s => { s.ReviewQueue.Add(review); return true; });
                     window = new MainWindow(runtime) { Width = 920, Height = 640 };
+                    await VerifyDefaultsDuringStartupAsync(window, runtime);
                     var queue = (ListBox)window.FindName("QueueList");
                     queue.ItemsSource = new[] { review };
                     queue.SelectedItem = review;
@@ -225,6 +226,39 @@ public sealed class GroupReviewWindowTests
         { IsBackground = true };
         thread.SetApartmentState(ApartmentState.STA); thread.Start();
         await completion.Task.WaitAsync(TimeSpan.FromSeconds(90));
+    }
+
+    private static async Task VerifyDefaultsDuringStartupAsync(MainWindow window, AppRuntime runtime)
+    {
+        var settings = (await runtime.StateStore.LoadAsync()).Settings;
+        foreach (var mapping in settings.CategoryMappings) Directory.CreateDirectory(mapping.ArchivePath);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var maintenance = runtime.Scanner.RunExclusiveAsync(async () => { entered.SetResult(); await release.Task; });
+        await entered.Task;
+        var startup = (Task)Invoke(window, "InitializeWindowAsync")!;
+        try
+        {
+            var output = (TextBox)window.FindName("OutputRoot");
+            for (var attempt = 0; attempt < 200 && output.Text.Length == 0; attempt++) await Task.Delay(10);
+            Assert.Equal(settings.OutputRootPath, output.Text);
+            Assert.Equal(settings.CategoryMappings.Single(m => m.Category == VrcImageCategory.Emoji).SourcePath,
+                ((TextBox)window.FindName("EmojiSource")).Text);
+            Assert.Equal(0, ((ComboBox)window.FindName("ScanWorkersCombo")).SelectedIndex);
+            Assert.Equal(SimilarityProfile.Conservative, ((ComboBox)window.FindName("SimilarityCombo")).SelectedItem);
+            Assert.Equal("82", ((TextBox)window.FindName("MinimumSimilarity")).Text);
+            Assert.Equal("99", ((TextBox)window.FindName("MaximumSimilarity")).Text);
+            Assert.Equal("60", ((TextBox)window.FindName("WatchScanSeconds")).Text);
+            Assert.False(((CheckBox)window.FindName("RemovePrintFrameCheck")).IsChecked);
+            Assert.False(((CheckBox)window.FindName("RemoveMyImagesCheck")).IsChecked);
+            Assert.False(startup.IsCompleted);
+        }
+        finally
+        {
+            release.TrySetResult();
+            await maintenance;
+            await startup.WaitAsync(TimeSpan.FromSeconds(15));
+        }
     }
 
     private static ReviewFileAction Action(object card) => (ReviewFileAction)card.GetType().GetProperty("Action")!.GetValue(card)!;
