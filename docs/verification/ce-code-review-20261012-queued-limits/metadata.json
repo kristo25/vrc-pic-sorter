@@ -1,0 +1,57 @@
+{
+  "branch": "fix/queued-similarity-limits",
+  "completed_at": "2026-10-12T20:18:54.9656105Z",
+  "cost": {
+    "host": "codex",
+    "scope": {
+      "changed_lines": 202,
+      "depth": "focused",
+      "exec_nontest_lines": 67,
+      "size_band": "small",
+      "unclassified_lines": {}
+    },
+    "stages": [
+      {
+        "elapsed_seconds": 0.115,
+        "ended_at": "2026-10-12T20:17:12.259282+00:00",
+        "facts": {
+          "changed_lines": 202,
+          "depth": "focused",
+          "exec_nontest_lines": 67,
+          "size_band": "small",
+          "unclassified_lines": {}
+        },
+        "stage": "scope",
+        "started_at": "2026-10-12T20:17:12.144569+00:00"
+      },
+      {
+        "candidates": 0,
+        "elapsed_seconds": 93.562,
+        "ended_at": "2026-10-12T20:18:45.821244+00:00",
+        "reviewers": 2,
+        "stage": "review",
+        "started_at": "2026-10-12T20:17:12.259282+00:00"
+      },
+      {
+        "elapsed_seconds": 0.083,
+        "ended_at": "2026-10-12T20:18:45.904173+00:00",
+        "stage": "receipt",
+        "started_at": "2026-10-12T20:18:45.821244+00:00"
+      }
+    ],
+    "status": "complete",
+    "totals": {
+      "artifact_bytes": 5624,
+      "candidates": 0,
+      "elapsed_seconds": 93.76,
+      "reviewers": 2
+    },
+    "truncated_events": 0
+  },
+  "depth": "focused",
+  "external_review": "prohibited by caller; local adversarial fallback completed",
+  "findings_count": 0,
+  "head_sha": "986b6c1bb08cc6f0bc61402505879f251f53df63",
+  "run_id": "20261012-queued-limits",
+  "verdict": "Ready to merge"
+}

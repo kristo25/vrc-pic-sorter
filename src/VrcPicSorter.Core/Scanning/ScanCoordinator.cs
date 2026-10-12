@@ -560,6 +560,8 @@ public sealed partial class ScanCoordinator
         var resolvedQueuedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var requestedPaths = sourceSnapshot.Paths.Select(PathBoundary.Normalize)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        await ReleaseQueuedReviewsOutsideCustomLimitsAsync(category, requestedPaths, errors, cancellationToken)
+            .ConfigureAwait(false);
         await RefreshQueuedScoresAsync(category, requestedPaths, reconcileAllPending, errors, cancellationToken)
             .ConfigureAwait(false);
         var refreshed = await _stateStore.LoadAsync(cancellationToken).ConfigureAwait(false);
@@ -829,16 +831,10 @@ public sealed partial class ScanCoordinator
                         current.Settings.SimilarityProfile,
                         thresholds?.MinimumPercent / 100);
 
-                    // VRChat hands over its own ready-made GIF for an emoji this app has already
-                    // animated. The two are the same animation encoded twice, so they are not the same
-                    // bytes and their score can land under any threshold - and the copy was then filed
-                    // as a brand new image, which is where a folder full of "x" beside "x (2)" came
-                    // from. Being the same emoji, with the same frame count, rate and loop direction in
-                    // its name, is not a resemblance to be scored: it is VRChat's own metadata about
-                    // its own inventory item. So it always earns a review card, however the score came
-                    // out. It never resolves one: discarding a file still needs the decoded content to
-                    // match exactly, and these do not.
-                    matches = WithSameEmojiAnimations(matches, comparable, path, fingerprint);
+                    // Presets also suggest animations with matching VRChat inventory metadata,
+                    // even below their visual threshold. Explicit custom limits take precedence.
+                    if (thresholds is null)
+                        matches = WithSameEmojiAnimations(matches, comparable, path, fingerprint);
 
                     if (matches.Count > 0)
                     {

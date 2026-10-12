@@ -11,6 +11,45 @@ namespace VrcPicSorter.Tests.Scanning;
 public sealed class SimilarityThresholdTests
 {
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CustomMinimumOverridesAnimationNameFallback(bool initiallyQueued)
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("incoming");
+        var archive = directory.GetPath("archive", "Emoji");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(Path.Combine(archive, "Animated"));
+        const string name = "player_inv_f0fdf2cf-2371-42f2-90ae-8432ecda1d39_stopanimationStyle_4frames_10fps_linearloopStyle.gif";
+        var keeper = Path.Combine(archive, "Animated", name);
+        var incoming = Path.Combine(source, name);
+        using var keeperImage = ImageFixtureFactory.CreatePattern(21);
+        using var incomingImage = ImageFixtureFactory.CreatePattern(99);
+        await keeperImage.SaveAsGifAsync(keeper);
+        await incomingImage.SaveAsGifAsync(incoming);
+        var keeperBytes = await File.ReadAllBytesAsync(keeper);
+        using var store = FileRouterTests.CreateStore(directory, source, archive);
+        var decoder = new ImageDecoder();
+        var recycler = new FileRouterTests.FakeRecycleBinService();
+        var scanner = new ScanCoordinator(store, new ArchiveIndexer(store, decoder), decoder,
+            new FileRouter(store, decoder, recycler), TimeSpan.Zero);
+        if (initiallyQueued)
+        {
+            var first = await scanner.ScanCategoryAsync(VrcImageCategory.Emoji);
+            Assert.Equal(1, first.HeldForReview);
+        }
+        await store.UpdateAsync(state => { state.Settings.CustomSimilarityThresholds = new(100, 100); return true; });
+        var result = await scanner.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Empty(result.Errors);
+        Assert.Equal(1, result.MovedUnique);
+        Assert.Equal(0, result.HeldForReview);
+        Assert.Empty((await store.LoadAsync()).ReviewQueue);
+        Assert.False(File.Exists(incoming));
+        Assert.Equal(keeperBytes, await File.ReadAllBytesAsync(keeper));
+        Assert.Empty(recycler.RecycledPaths);
+    }
+
+    [Theory]
     [InlineData(100, 100, true, "unique")]
     [InlineData(0, 100, true, "review")]
     [InlineData(0, 0, true, "auto")]

@@ -10,6 +10,96 @@ namespace VrcPicSorter.Tests.Scanning;
 
 public sealed class QueuedScoringRefreshTests
 {
+    [Theory]
+    [InlineData(0, 0, "auto")]
+    [InlineData(100, 100, "unique")]
+    [InlineData(0, 100, "review")]
+    [InlineData(82, 90, "auto")]
+    public async Task CurrentQueuedReviewsUseCustomLimits(double minimum, double maximum, string expected)
+    {
+        using var fixture = await Fixture.CreateAsync();
+        await fixture.Store.UpdateAsync(state =>
+        {
+            state.Settings.CustomSimilarityThresholds = new(minimum, maximum);
+            state.ReviewQueue[0].ScoringVersion = ImageMatcher.CurrentScoringVersion;
+            state.ReviewQueue[0].Candidates[0].SimilarityScore = 0.99;
+            return true;
+        });
+        var result = await fixture.Coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Empty(result.Errors);
+        Assert.Equal(expected == "auto" ? 1 : 0, result.AutoKeptArchived);
+        Assert.Equal(expected == "unique" ? 1 : 0, result.MovedUnique);
+        Assert.Equal(expected == "auto" ? 1 : 0, fixture.Recycle.RecycledPaths.Count);
+        Assert.Equal(expected == "review", File.Exists(fixture.Incoming));
+        Assert.True(File.Exists(fixture.Archived));
+        if (expected == "review") Assert.Single((await fixture.Store.LoadAsync()).ReviewQueue);
+        else Assert.Empty((await fixture.Store.LoadAsync()).ReviewQueue);
+        var repeated = await fixture.Coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Empty(repeated.Errors);
+        Assert.Equal(0, repeated.AutoKeptArchived);
+        Assert.Equal(expected == "auto" ? 1 : 0, fixture.Recycle.RecycledPaths.Count);
+    }
+
+    [Fact]
+    public async Task ChangedQueuedIncomingIsNotAutomaticallyHandledByLimits()
+    {
+        using var fixture = await Fixture.CreateAsync();
+        await fixture.Store.UpdateAsync(state =>
+        {
+            state.Settings.CustomSimilarityThresholds = new(0, 0);
+            state.ReviewQueue[0].ScoringVersion = ImageMatcher.CurrentScoringVersion;
+            return true;
+        });
+        using var replacement = ImageFixtureFactory.CreatePattern(99);
+        await replacement.SaveAsPngAsync(fixture.Incoming);
+        var result = await fixture.Coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Contains(result.Errors, error => error.Contains("custom limits were not applied"));
+        Assert.True(File.Exists(fixture.Incoming));
+        Assert.True(File.Exists(fixture.Archived));
+        Assert.Empty(fixture.Recycle.RecycledPaths);
+        Assert.Single((await fixture.Store.LoadAsync()).ReviewQueue);
+    }
+
+    [Fact]
+    public async Task QueuedLimitRecyclingFailureKeepsIncomingRecoverable()
+    {
+        using var fixture = await Fixture.CreateAsync(canRecycle: false);
+        await fixture.Store.UpdateAsync(state =>
+        {
+            state.Settings.CustomSimilarityThresholds = new(0, 0);
+            state.ReviewQueue[0].ScoringVersion = ImageMatcher.CurrentScoringVersion;
+            return true;
+        });
+        var result = await fixture.Coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        Assert.Equal(0, result.AutoKeptArchived);
+        Assert.Equal(1, result.HeldForReview);
+        Assert.NotEmpty(result.Errors);
+        fixture.AssertFilesUnchanged();
+        Assert.Single((await fixture.Store.LoadAsync()).ReviewQueue);
+    }
+
+    [Theory]
+    [InlineData("selection")]
+    [InlineData("protection")]
+    [InlineData("journal")]
+    public async Task CustomLimitsPreserveExplicitChoicesAndRecovery(string kind)
+    {
+        using var fixture = await Fixture.CreateAsync();
+        await fixture.Store.UpdateAsync(state =>
+        {
+            state.Settings.CustomSimilarityThresholds = new(0, 0);
+            var review = state.ReviewQueue[0];
+            review.ScoringVersion = ImageMatcher.CurrentScoringVersion;
+            if (kind == "selection") review.Candidates[0].IsSelected = true;
+            if (kind == "protection") state.ManualKeeps.Add(new(fixture.Incoming, review.IncomingFingerprint, 0, default));
+            if (kind == "journal") state.OperationJournal.Add(new() { Id = Guid.NewGuid(), SourcePath = fixture.Incoming, Phase = JournalPhase.NeedsAttention });
+            return true;
+        });
+        await fixture.Coordinator.ScanCategoryAsync(VrcImageCategory.Emoji);
+        fixture.AssertFilesUnchanged();
+        Assert.Single((await fixture.Store.LoadAsync()).ReviewQueue);
+    }
+
     [Fact]
     public async Task RefreshUpdatesSuggestionsWithoutMovingFiles()
     {
@@ -94,16 +184,16 @@ public sealed class QueuedScoringRefreshTests
         private readonly TestDirectory _directory = new();
         public JsonStateStore Store { get; private set; } = null!;
         public ScanCoordinator Coordinator { get; private set; } = null!;
-        public FileRouterTests.FakeRecycleBinService Recycle { get; } = new();
+        public FileRouterTests.FakeRecycleBinService Recycle { get; private set; } = new();
         public string Incoming { get; private set; } = "";
         public string Archived { get; private set; } = "";
         public Guid CandidateId { get; } = Guid.NewGuid();
         private byte[] _incomingBytes = [];
         private byte[] _archiveBytes = [];
 
-        public static async Task<Fixture> CreateAsync()
+        public static async Task<Fixture> CreateAsync(bool canRecycle = true)
         {
-            var fixture = new Fixture();
+            var fixture = new Fixture { Recycle = new(canRecycle) };
             var source = fixture._directory.GetPath("incoming");
             var archive = fixture._directory.GetPath("archive", "Emoji");
             Directory.CreateDirectory(source);
