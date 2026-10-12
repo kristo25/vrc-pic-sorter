@@ -94,16 +94,75 @@ public sealed class RemovalDetectorTests
         Assert.Equal(PrintFrameMatch.Uncertain, PrintFrameDetector.Detect(Frame(false, "02/40/2024")));
     }
 
+    [Theory]
+    [InlineData(700)]
+    [InlineData(1273)]
+    [InlineData(1347)]
+    public void WorldFooterCanMoveCalendarAndDateWithoutLosingConfirmation(int calendarX)
+    {
+        var image = Frame(true, calendarX: calendarX);
+        Fill(image.Frames[0].RgbaPixels, calendarX + 235, 1394, 30, 26, 0);
+        Assert.Equal(PrintFrameMatch.Confirmed, PrintFrameDetector.Detect(image));
+    }
+
+    [Fact]
+    public void ShiftedDateCannotSubstituteForPhotographerName()
+    {
+        var image = Frame(true, calendarX: 700);
+        Fill(image.Frames[0].RgbaPixels, 310, 1390, 374, 38, 255);
+        Assert.Equal(PrintFrameMatch.Uncertain, PrintFrameDetector.Detect(image));
+    }
+
+    [Fact]
+    public void CalendarAndDateMustRemainAdjacent()
+    {
+        var image = Frame(true);
+        Fill(image.Frames[0].RgbaPixels, 1760, 1390, 36, 38, 255);
+        Draw(image.Frames[0].RgbaPixels, PrintFrameTemplates.Calendar, 900, 1390, 36, 38);
+        Assert.Equal(PrintFrameMatch.Uncertain, PrintFrameDetector.Detect(image));
+    }
+
+    [Theory]
+    [InlineData('0', 0)]
+    [InlineData('0', 1)]
+    [InlineData('/', 0)]
+    public void NativeSubpixelDateGlyphVariantsRemainRecognizable(char character, int variant)
+    {
+        const int calendarX = 1273;
+        var image = Frame(true, calendarX: calendarX);
+        var index = "12/11/2024".IndexOf(character);
+        var left = calendarX + 40 + index * 18;
+        Fill(image.Frames[0].RgbaPixels, left, 1392, 16, 32, 255);
+        Draw(image.Frames[0].RgbaPixels, PrintFrameTemplates.DateGlyphVariants[character][variant], left, 1392, 16, 32);
+        Assert.Equal(PrintFrameMatch.Confirmed, PrintFrameDetector.Detect(image));
+    }
+
+    [Theory]
+    [InlineData("03/17/2094")]
+    [InlineData("07/19/2034")]
+    public void AllDateDigitsSupportValidDates(string date)
+    {
+        Assert.Equal(PrintFrameMatch.Confirmed, PrintFrameDetector.Detect(Frame(true, date, 1273)));
+    }
+
+    [Theory]
+    [InlineData("03/37/2094")]
+    [InlineData("07/39/2034")]
+    public void InvalidCalendarDatesRequireReview(string date)
+    {
+        Assert.Equal(PrintFrameMatch.Uncertain, PrintFrameDetector.Detect(Frame(true, date, 1273)));
+    }
+
     // Synthetic glyph composition tests the conjunction of required signals. Real-image
     // recognition and frozen held-out families are independently checked by tools/filter-eval.
-    internal static DecodedImage Frame(bool upper, string date = "12/11/2024")
+    internal static DecodedImage Frame(bool upper, string date = "12/11/2024", int calendarX = 1760)
     {
         var pixels = Enumerable.Repeat((byte)255, 2048 * 1440 * 4).ToArray();
         Draw(pixels, upper ? PrintFrameTemplates.CaptionUpper : PrintFrameTemplates.CaptionLower, 64, 1390, 206, 38);
         Draw(pixels, upper ? PrintFrameTemplates.PersonUpper : PrintFrameTemplates.PersonLower, 282, 1390, 23, 38);
-        Draw(pixels, PrintFrameTemplates.Calendar, 1760, 1390, 36, 38);
+        Draw(pixels, PrintFrameTemplates.Calendar, calendarX, 1390, 36, 38);
         Fill(pixels, 318, 1400, 10, 20, 0);
-        for (var i = 0; i < date.Length; i++) Draw(pixels, PrintFrameTemplates.DateGlyphs[date[i]], 1800 + i * 18, 1392, 16, 32);
+        for (var i = 0; i < date.Length; i++) Draw(pixels, PrintFrameTemplates.DateGlyphs[date[i]], calendarX + 40 + i * 18, 1392, 16, 32);
         return new DecodedImage(2048, 1440, "PNG", [new(pixels, 0)]);
     }
 

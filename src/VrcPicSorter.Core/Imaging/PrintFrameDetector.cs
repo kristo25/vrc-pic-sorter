@@ -5,8 +5,8 @@ namespace VrcPicSorter.Core.Imaging;
 public enum PrintFrameMatch { None, Uncertain, Confirmed }
 
 /// <summary>
-/// Conservative recognition of VRChat's fixed Print footer, independent of picture content.
-/// Unknown date glyphs, resized exports and damaged/alternate footers require review.
+/// Conservative recognition of VRChat's Print footer, independent of picture content.
+/// Resized exports and damaged or unrecognized footer signals require review.
 /// </summary>
 public static class PrintFrameDetector
 {
@@ -30,15 +30,30 @@ public static class PrintFrameDetector
         var person = pixels.Mask(282, 1390, 23, 38);
         var personScore = Math.Max(Similarity(person, PrintFrameTemplates.PersonLower),
             Similarity(person, PrintFrameTemplates.PersonUpper));
-        var nameInk = 0;
-        for (var y = 1390; y < 1428; y++)
-            for (var x = 310; x < 1100; x++)
-                if (pixels.Dark(x, y)) nameInk++;
-
-        if (personScore < .98 || nameInk < 8 ||
-            Similarity(pixels.Mask(1760, 1390, 36, 38), PrintFrameTemplates.Calendar) < .98 ||
-            !HasRecognizedDate(pixels)) return PrintFrameMatch.Uncertain;
+        if (personScore < .98 || !HasDatedFooter(pixels)) return PrintFrameMatch.Uncertain;
         return PrintFrameMatch.Confirmed;
+    }
+
+    private static bool HasDatedFooter(FramePixels pixels)
+    {
+        // World metadata moves the date left; the icon and date must still form one block.
+        for (var left = 700; left <= 1760; left++)
+        {
+            if (pixels.CalendarSimilarity(left) < .98 ||
+                !HasPhotographerName(pixels, Math.Min(1100, left - 16)) ||
+                !HasRecognizedDate(pixels, left + 38)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    private static bool HasPhotographerName(FramePixels pixels, int right)
+    {
+        var ink = 0;
+        for (var y = 1390; y < 1428; y++)
+            for (var x = 310; x < right; x++)
+                if (pixels.Dark(x, y) && ++ink >= 8) return true;
+        return false;
     }
 
     private static bool HasFrameGeometry(FramePixels pixels) =>
@@ -46,10 +61,10 @@ public static class PrintFrameDetector
         pixels.White(1988, 60, 60, 1100) && pixels.White(0, 1434, 2048, 6) &&
         pixels.White(64, 1260, 1920, 110);
 
-    private static bool HasRecognizedDate(FramePixels pixels)
+    private static bool HasRecognizedDate(FramePixels pixels, int leftEdge)
     {
         var runs = new List<(int Left, int Right)>();
-        for (var x = 1798; x < 1986; x++)
+        for (var x = leftEdge; x < leftEdge + 188; x++)
         {
             var ink = false;
             for (var y = 1390; y < 1428; y++) ink |= pixels.Dark(x, y);
@@ -75,13 +90,21 @@ public static class PrintFrameDetector
                             top + (int)((y + .5) * (bottom - top) / 32)))
                         Set(glyph, y * 16 + x);
             var scores = PrintFrameTemplates.DateGlyphs
-                .Select(template => (Character: template.Key, Score: Similarity(glyph, template.Value)))
+                .Select(template => (Character: template.Key, Score: DateGlyphScore(glyph, template.Key, template.Value)))
                 .OrderByDescending(result => result.Score).ToArray();
             if (scores[0].Score < .90 || scores[0].Score - scores[1].Score < .06) return false;
             recognized[index] = scores[0].Character;
         }
         return DateOnly.TryParseExact(new string(recognized), "MM/dd/yyyy",
             CultureInfo.InvariantCulture, DateTimeStyles.None, out _);
+    }
+
+    private static double DateGlyphScore(byte[] glyph, char character, byte[] template)
+    {
+        var score = Similarity(glyph, template);
+        if (PrintFrameTemplates.DateGlyphVariants.TryGetValue(character, out var variants))
+            foreach (var variant in variants) score = Math.Max(score, Similarity(glyph, variant));
+        return score;
     }
 
     private static double Similarity(byte[] actual, byte[] expected)
@@ -102,6 +125,7 @@ public static class PrintFrameDetector
     private sealed class FramePixels(DecodedImage image)
     {
         private readonly byte[] data = image.Frames[0].RgbaPixels;
+        private byte[]? calendarStrip;
 
         private int Offset(int x, int y) =>
             ((y * image.Height / 1440) * image.Width + x * image.Width / 2048) * 4;
@@ -111,6 +135,31 @@ public static class PrintFrameDetector
             var offset = Offset(x, y);
             return data[offset + 3] >= 250 &&
                 (299 * data[offset] + 587 * data[offset + 1] + 114 * data[offset + 2]) < 180000;
+        }
+
+        internal double CalendarSimilarity(int left)
+        {
+            const int first = 700;
+            const int stripWidth = 1760 + 36 - first;
+            if (calendarStrip is null)
+            {
+                calendarStrip = new byte[stripWidth * 38];
+                for (var y = 0; y < 38; y++)
+                    for (var x = 0; x < stripWidth; x++)
+                        calendarStrip[y * stripWidth + x] = Dark(first + x, 1390 + y) ? (byte)1 : (byte)0;
+            }
+            var intersection = 0;
+            var count = 0;
+            for (var y = 0; y < 38; y++)
+                for (var x = 0; x < 36; x++)
+                {
+                    var bit = y * 36 + x;
+                    var expected = (PrintFrameTemplates.Calendar[bit / 8] >> (bit % 8)) & 1;
+                    var actual = calendarStrip[y * stripWidth + left - first + x];
+                    intersection += actual & expected;
+                    count += actual + expected;
+                }
+            return count == 0 ? 0 : 2d * intersection / count;
         }
 
         internal byte[] Mask(int left, int top, int width, int height)

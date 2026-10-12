@@ -10,16 +10,26 @@ internal static class PrintFrameTemplates
     internal static readonly byte[] PersonUpper = Convert.FromBase64String("AAAA4A8A+A8A/g8A/w+A/wfA/wPg/wHw/wD4PwD4HwD4BwDwAAAAAAB+AMD/APD/APx/AP5/AP8/gP8f4P8P8P8H+P8D/P8B/v8B//+A/3/g/z/g/x8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
     internal static readonly byte[] Calendar = Convert.FromBase64String("AAAAAADgBz8AAP/wBwD///8H+P///4D///8f+P///4H///8f+P///4H///8fAAAAAID///8f+P///4H///8f+P///4H///8f+P///4H///8f+P///4H///8f+P///4H///8f+P///4H///8f+P///4H///8f+P///4H///8f+P///4H///8PAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
 
-    // Missing digit shapes deliberately stay review-only until independently validated.
+    // Normalized glyphs vary with subpixel placement even at the native Print dimensions.
+    internal static readonly IReadOnlyDictionary<char, byte[][]> DateGlyphVariants = new Dictionary<char, byte[][]>
+    {
+        ['0'] = [Convert.FromBase64String("wAfwH/Af+D88OBxwDnAOcA7gDuAO4A7gBuAG4AfgB+AH4AfgBuAG4A7gDuAO4A7gDuAO4BxwHHh4PPAf8B/gDw=="),
+            Convert.FromBase64String("4Af4H/gf/D8eeA5wB2AHYAfgB+AH4AfgB+AHwAPAA8ADwAPAB8AH4AfgB+AH4AfgB+AH4A5wDnA8PPgf+B/wDw==")],
+        ['/'] = [Convert.FromBase64String("APAAcABwAHgAeAAeAB4AHgAeAA8ADwAPAAeAB4AHgAGAAeAB4AHgAPAA8ADwAHgAeAB4AHgAHgAeAA4ADgAPAA==")],
+    };
+
     internal static readonly IReadOnlyDictionary<char, byte[]> DateGlyphs = new Dictionary<char, byte[]>
     {
         ['0'] = Convert.FromBase64String("4Af4D/gP/B8cOA44DnAOcA5wB2AH4AfgB+AH4AfgB+AH4AfgB+AH4AfgB+AHYAZwDnAOcA5wHDg8Pvgf+B/wBw=="),
         ['1'] = Convert.FromBase64String("APgA/gD+gP/g//D5f/h/+Bz4APgA+AD4APgA+AD4APgA+AD4APgA+AD4APgA+AD4APgA+AD4APgA+AD4APgA+A=="),
         ['2'] = Convert.FromBase64String("4AP8D/wP/j8PPAJ4AHAAcABwAHAAcABwADgAOAAcABwAHAAOAAeAA8ABwAHgAHAAOAA4ABwADgD//////////w=="),
+        ['3'] = Convert.FromBase64String("8Af8H/wf/j8OfAR4AHgAeAB4AHgAOAA4AD7wH/AH8B/wHwA+AHgA8ADwAPAA8ADwAPAA8AB4B3z/P/8f/x/8Bw=="),
         ['4'] = Convert.FromBase64String("AAwADgAOAA4AD4ALgAmACcAJ4AhgCGAIcAgwCBAIGAgYCAwIDAgOCAcIBwj/////ABwAHAAIAAgACAAIAAgACA=="),
         ['5'] = Convert.FromBase64String("/D/8P/w//D8MAAwADgAOAA4ADgAOAA4ADgD+B/4fDD8MPwB4AHAAcADgAOAA4ADgAHAAcABwAXgPPv8f/x/8Bw=="),
         ['6'] = Convert.FromBase64String("AD/gP+A/8D94ADwAHAAcAA4ADgAGAAYABwDnH/c/P3g/eA9wD+AH4AfgB+AH4AfgDuAO4A7wHHA8PPgf+B/gDw=="),
+        ['7'] = Convert.FromBase64String("//////////8AcAB4AHgAeAA4ADwAHAAcAB4ADgAPAA8ADwAHAAcAA4ADgAOAAcABwAHAAeAA4ADwAPAA8ABwAA=="),
         ['8'] = Convert.FromBase64String("4Af4H/gffD4eOA5wDnAOcA5wDnAOOA44HDx4HvAH8AfwB3gfHDwOeAdwB3AH4AfgB+AH4AdgD3AefPw//D/wDw=="),
+        ['9'] = Convert.FromBase64String("4Af4D/gP/B88PB54DnAOcA7wD/AP8A/wDvAO8B74Pv4+/vz/+PfA8QBwAHAAcAB4ADgAOAA8AB/8D/wH/Af8AQ=="),
         ['/'] = Convert.FromBase64String("APAA8ADwAHAAfAB8AB4AHgAeAB6AD4APgA+AA8ADwAPAA8AB8AHwAXAAcAB4AHgAOAA4AD4APgAPAA8ADwAHAA=="),
     };
 }

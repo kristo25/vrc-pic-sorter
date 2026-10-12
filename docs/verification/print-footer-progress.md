@@ -1,0 +1,16 @@
+# Print footer fix progress
+
+- Starting commit55e721d; clean pre-work tree. New branch fix/print-footer-layout preserves GIF compatibility and defaults fix; main untouched.
+- User authorized fixing obvious framed Prints incorrectly queued. No archive/source image writes or destructive real scans.
+- Current normal profile has RemovePrintFrame enabled and7 pending2048x1440 PrintFrame reviews. Observed Darkium footer includes world name and shifts calendar/date left; old detector pins calendar at1760 and date at1798. Glyph templates omit3/7/9.
+- Hypothesis: fixed date/icon location causes Uncertain. Competing cause: damaged/resized caption; lower likelihood because native2048x1440 frame/caption visible. Read-only pixel probe and synthetic red tests will distinguish.
+- Plan: preserve border/caption/person/date requirements; bounded horizontal calendar search with adjacent validated date; complete date templates from real footer pixels; test modern/legacy/white backgrounds and damaged/missing signals; run full suite, independent review, portable build and copied fixtures.
+- Baseline measured all7 real queued images Uncertain; calendar matches0.9829–1.0 at1272–1347, confirming shifted layout. Three independent shifted synthetic cases failed before production changes.
+- Layout-only change fixed1/7. Targeted pixel diagnosis confirmed six remaining failures are normalized0/slash glyph variants (caption/person already>=.98). Added real0/slash masks from one Darkium footer; all7 real cases then Confirmed, without lowering .98/.90/.06 thresholds.
+- Completed digit inventory with3/7/9 normalized Noto Sans rendered templates. Font is a scratch diagnostic fixture only, not packaged or a new dependency. These digits have synthetic valid/invalid-date coverage; the current7 native examples do not independently validate3/7/9. Unrecognized glyphs still remain Uncertain.
+- Three simplification reviews complete: no reuse changes; renamed history-bound tests; cached bounded calendar strip to remove1061 repeated masks and repeated dark-pixel conversion while preserving similarity/search order.
+- Full Release suite682/682 passed, zero skipped/failed. Formatting clean. Dependency audit reports no known vulnerable packages.
+- Portable build created: outputs/VrcPicSorter-print-footer-fix/VrcPicSorter.exe. Actual disposable scan recycled7 framed copies, preserved3 controls (white/captionless archived canonical copies, nameless image pending review), completed/compacted replayed filter review, zero scan failures. Real source hashes unchanged. Fixture result outputs/print-footer-fixtures/result.json.
+- Initial runtime assertion expected resolved review to remain on disk; AppStateCompactor intentionally removes resolved reviews. Corrected assertion checks pending absence plus completed filter-removal history; repeated fixture scan passed.
+- Usage interruption occurred after completed runtime checks; resumed without repeating unchanged tests. Final independent focused review complete, Ready to merge, no actionable findings. Coverage limit: native3/7/9 and broad family-separated negatives independently unverified; recorded in print-footer-results.md.
+- Final evidence saved. Implementation and verification complete; next: local commit and delivery only. No GitHub publication; main and real queue untouched.
