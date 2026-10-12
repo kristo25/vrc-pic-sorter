@@ -1395,6 +1395,10 @@ public partial class MainWindow : Window
             ScanButton.IsEnabled = true;
             ScanAnotherButton.IsEnabled = true;
             WatchButton.IsEnabled = true;
+            var recoveryState = await _runtime.StateStore.LoadAsync();
+            RetryRecoveryButton.IsEnabled = !_busy && (recoveryState.OperationJournal.Any(item => item.Phase != JournalPhase.Completed)
+                || recoveryState.RelocationJournal.Count > 0);
+            DismissRecoveryButton.IsEnabled = !_busy && recoveryState.OperationJournal.Any(item => item.Phase == JournalPhase.NeedsAttention);
             UpdateWatchingDisplay();
             if (SelectedReview is { } currentReview)
             {

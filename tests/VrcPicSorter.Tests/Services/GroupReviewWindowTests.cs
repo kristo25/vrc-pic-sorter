@@ -216,6 +216,7 @@ public sealed class GroupReviewWindowTests
                     Assert.Equal(Visibility.Collapsed, ((Border)window.FindName("RetainedArchivesPanel")).Visibility);
                     window.Close(); window = null;
                     await RemovalFilterWindowTests.VerifyFilterReviewAsync();
+                    await VerifyRecoveryButtonsAfterBusyAsync();
                     completion.SetResult();
                 }
                 catch (Exception error) { completion.TrySetException(error); }
@@ -259,6 +260,55 @@ public sealed class GroupReviewWindowTests
             await maintenance;
             await startup.WaitAsync(TimeSpan.FromSeconds(15));
         }
+    }
+
+    private static async Task VerifyRecoveryButtonsAfterBusyAsync()
+    {
+        using var directory = new TestDirectory();
+        using var runtime = new AppRuntime(directory.GetPath("state"), allowStartupRegistration: false);
+        var window = new MainWindow(runtime);
+        try
+        {
+            var retry = (Button)window.FindName("RetryRecoveryButton");
+            var dismiss = (Button)window.FindName("DismissRecoveryButton");
+            async Task Run(Func<Task> action) => await (Task)Invoke(window, "RunBusyAsync", "Test recovery", action)!;
+            await runtime.StateStore.UpdateAsync(s =>
+            {
+                s.OperationJournal.Add(new JournalEntry { Id = Guid.NewGuid(), Phase = JournalPhase.NeedsAttention });
+                return true;
+            });
+            await (Task)Invoke(window, "RefreshAsync", null!, false, false)!;
+            Assert.True(retry.IsEnabled);
+            Assert.True(dismiss.IsEnabled);
+            await Run(async () =>
+            {
+                Assert.False(retry.IsEnabled);
+                Assert.False(dismiss.IsEnabled);
+                Assert.False((await runtime.StateStore.TryClearLocalDataAsync()).WasCleared);
+            });
+            Assert.True(retry.IsEnabled);
+            Assert.True(dismiss.IsEnabled);
+            await Run(() => throw new OperationCanceledException());
+            Assert.True(retry.IsEnabled);
+            Assert.True(dismiss.IsEnabled);
+            await Run(async () =>
+            {
+                await runtime.StateStore.UpdateAsync(s => { s.OperationJournal[0].Phase = JournalPhase.Completed; return true; });
+            });
+            Assert.False(retry.IsEnabled);
+            Assert.False(dismiss.IsEnabled);
+            await Run(async () =>
+            {
+                await runtime.StateStore.UpdateAsync(s =>
+                {
+                    s.OperationJournal.Add(new JournalEntry { Id = Guid.NewGuid(), Phase = JournalPhase.NeedsAttention });
+                    return true;
+                });
+            });
+            Assert.True(retry.IsEnabled);
+            Assert.True(dismiss.IsEnabled);
+        }
+        finally { window.Close(); }
     }
 
     private static ReviewFileAction Action(object card) => (ReviewFileAction)card.GetType().GetProperty("Action")!.GetValue(card)!;
