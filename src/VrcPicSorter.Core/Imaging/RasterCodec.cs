@@ -47,10 +47,11 @@ internal static class RasterCodec
     {
         var format = Prepare(stream);
         var start = stream.Position;
+        using var compatibility = format == MagickFormat.Gif ? GifPaletteCompatibility.CreateView(stream) : null;
         try
         {
             using var frames = new MagickImageCollection();
-            frames.Ping(stream, new MagickReadSettings { Format = format });
+            frames.Ping(compatibility ?? stream, new MagickReadSettings { Format = format });
             return Validate(frames, FormatName(format));
         }
         finally { stream.Position = start; }
@@ -66,10 +67,11 @@ internal static class RasterCodec
     {
         var format = Prepare(stream);
         var info = knownInfo ?? Identify(stream);
+        using var compatibility = format == MagickFormat.Gif ? GifPaletteCompatibility.CreateView(stream) : null;
         using var frames = new MagickImageCollection();
         var settings = new MagickReadSettings { Format = format };
         if (firstFrameOnly) settings.FrameCount = 1;
-        frames.Read(stream, settings);
+        frames.Read(compatibility ?? stream, settings);
         Validate(frames, info.Format);
         if (frames.Count > 1 || frames.Any(frame => frame.Width != info.Width
             || frame.Height != info.Height || frame.Page.X != 0 || frame.Page.Y != 0))
