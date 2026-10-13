@@ -241,6 +241,8 @@ public sealed class JsonStateStore : IDisposable
             File.Delete(BackupPath);
             File.Delete(FingerprintPath);
             File.Delete(FingerprintTemporaryPath);
+            File.Delete(StatePath + ".before-magick");
+            File.Delete(FingerprintPath + ".before-magick");
             _persistedFingerprints = null;
             _fingerprintStamp = null;
             _deferredFingerprints = null;

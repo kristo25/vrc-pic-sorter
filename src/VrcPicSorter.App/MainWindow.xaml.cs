@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     private readonly PreviewService _previewService = new();
     private readonly LatestRequestGuard _reviewDisplayRequests = new();
     private readonly SettingsSaveCoordinator _settingsSaves = new();
+    private long _lastSavedSettingsRequest;
     private readonly LatestRequestGuard _retainedArchiveRequests = new();
     // Lock order: UI mutation gate, then scanner gate. Watcher restart and prompts hold neither.
     private readonly SemaphoreSlim _uiMutationGate = new(1, 1);
@@ -129,15 +130,7 @@ public partial class MainWindow : Window
             { _anyDismissibleReviews = true; break; }
         ClearQueueButton.IsEnabled = !_busy && _anyDismissibleReviews;
         HistoryList.ItemsSource = state.History.OrderByDescending(item => item.OccurredUtc).ToArray();
-        var pendingOperations = state.OperationJournal.Where(item => item.Phase != JournalPhase.Completed).ToArray();
-        var attentionCount = pendingOperations.Count(item => item.Phase == JournalPhase.NeedsAttention);
-        RecoveryStatusText.Text = state.RelocationJournal.Count > 0
-            ? $"{state.RelocationJournal.Count} interrupted archive relocation(s); retry recovery before cleanup."
-            : pendingOperations.Length == 0
-            ? "No file operations need attention."
-            : $"{pendingOperations.Length} operation(s) pending; {attentionCount} require a decision.";
-        RetryRecoveryButton.IsEnabled = !_busy && (pendingOperations.Length > 0 || state.RelocationJournal.Count > 0);
-        DismissRecoveryButton.IsEnabled = !_busy && attentionCount > 0;
+        UpdateRecoveryAvailability(state);
         if (refreshSettings)
         {
             LoadSettings(state.Settings);
@@ -173,6 +166,28 @@ public partial class MainWindow : Window
         QueueList.SelectedItem = selectReviewId is null
             ? queue[0]
             : queue.FirstOrDefault(item => item.Id == selectReviewId) ?? queue[0];
+    }
+
+    private void UpdateRecoveryAvailability(AppStateDocument state)
+    {
+        var pending = state.OperationJournal.Count(item => item.Phase != JournalPhase.Completed);
+        var attention = state.OperationJournal.Count(item => item.Phase == JournalPhase.NeedsAttention);
+        RecoveryStatusText.Text = state.RelocationJournal.Count > 0
+            ? $"{state.RelocationJournal.Count} interrupted archive relocation(s); retry recovery before cleanup."
+            : pending == 0 ? "No file operations need attention."
+            : $"{pending} operation(s) pending; {attention} require a decision.";
+        RetryRecoveryButton.IsEnabled = !_busy && (pending > 0 || state.RelocationJournal.Count > 0);
+        DismissRecoveryButton.IsEnabled = !_busy && attention > 0;
+    }
+
+    private async Task RefreshRecoveryAvailabilityAsync()
+    {
+        try { UpdateRecoveryAvailability(await _runtime.StateStore.LoadAsync()); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidDataException or InvalidOperationException)
+        {
+            RetryRecoveryButton.IsEnabled = DismissRecoveryButton.IsEnabled = false;
+            RecoveryStatusText.Text = "Local data is temporarily unavailable. Restore access and reopen Settings to refresh recovery.";
+        }
     }
 
     private void LoadSettings(AppSettings settings)
@@ -316,6 +331,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (!await PrepareSettingsForOperationAsync()) return;
         await RunBusyAsync(
             "Scanning enabled categories...",
             async () =>
@@ -369,6 +385,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (!await PrepareSettingsForOperationAsync()) return;
         await RunBusyAsync(
             $"Scanning {picker.FolderName}...",
             async () =>
@@ -408,6 +425,7 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (!await PrepareSettingsForOperationAsync()) return;
         await RunBusyAsync(
             "Starting folder monitoring...",
             async () =>
@@ -855,6 +873,37 @@ public partial class MainWindow : Window
                 ? ReportSettingsAutoSaveFailureAsync(exception, request) : Task.CompletedTask);
     }
 
+    private async Task<bool> PrepareSettingsForOperationAsync()
+    {
+        if (_busy) return false;
+        await WaitForPendingSettingsAsync();
+        if (_busy) return false;
+        if (!(await _runtime.StateStore.LoadAsync()).Settings.OutputRootConfirmed)
+        {
+            SetStatus("Confirm the migrated main output folder in Settings before scanning.");
+            return false;
+        }
+        BeginAutoSaveSettings();
+        await WaitForPendingSettingsAsync();
+        if (_busy) return false;
+        if (_lastSavedSettingsRequest == 0 || !_settingsSaves.IsCurrent(_lastSavedSettingsRequest))
+        {
+            SetStatus("Operation not started. Correct the settings and wait for them to save.");
+            return false;
+        }
+        return true;
+    }
+
+    private async Task WaitForPendingSettingsAsync()
+    {
+        Task save;
+        do
+        {
+            save = _pendingSettingsSave;
+            await save;
+        } while (!ReferenceEquals(save, _pendingSettingsSave));
+    }
+
     /// <summary>
     /// Persists the settings controls as soon as a field is committed. Folder-existence problems
     /// are reported inline rather than refused, because a watched folder is allowed to appear
@@ -895,6 +944,7 @@ public partial class MainWindow : Window
                 });
             });
         if (!applied && !stateApplied) return;
+        _lastSavedSettingsRequest = request;
 
         if (workersOnly)
         {
@@ -1395,15 +1445,9 @@ public partial class MainWindow : Window
             ScanButton.IsEnabled = true;
             ScanAnotherButton.IsEnabled = true;
             WatchButton.IsEnabled = true;
-            var recoveryState = await _runtime.StateStore.LoadAsync();
-            RetryRecoveryButton.IsEnabled = !_busy && (recoveryState.OperationJournal.Any(item => item.Phase != JournalPhase.Completed)
-                || recoveryState.RelocationJournal.Count > 0);
-            DismissRecoveryButton.IsEnabled = !_busy && recoveryState.OperationJournal.Any(item => item.Phase == JournalPhase.NeedsAttention);
             UpdateWatchingDisplay();
-            if (SelectedReview is { } currentReview)
-            {
-                UpdateActionAvailability(currentReview);
-            }
+            UpdateGroupAvailability();
+            await RefreshRecoveryAvailabilityAsync();
         }
     }
 
@@ -1443,9 +1487,10 @@ public partial class MainWindow : Window
 
     private void ShowHistoryPage(object sender, RoutedEventArgs e) => ShowPage(HistoryPage);
 
-    private void ShowSettingsPage(object sender, RoutedEventArgs e)
+    private async void ShowSettingsPage(object sender, RoutedEventArgs e)
     {
         ShowPage(SettingsPage);
+        await RefreshRecoveryAvailabilityAsync();
 
         // Counted when the page is opened rather than held from startup: a scan or a move in the
         // meantime changes what is actually left behind.

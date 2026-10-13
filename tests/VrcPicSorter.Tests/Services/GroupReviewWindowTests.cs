@@ -217,6 +217,7 @@ public sealed class GroupReviewWindowTests
                     window.Close(); window = null;
                     await RemovalFilterWindowTests.VerifyFilterReviewAsync();
                     await VerifyRecoveryButtonsAfterBusyAsync();
+                    await VerifyScanWaitsForSettingsAsync();
                     completion.SetResult();
                 }
                 catch (Exception error) { completion.TrySetException(error); }
@@ -280,6 +281,39 @@ public sealed class GroupReviewWindowTests
             await (Task)Invoke(window, "RefreshAsync", null!, false, false)!;
             Assert.True(retry.IsEnabled);
             Assert.True(dismiss.IsEnabled);
+            await runtime.StateStore.UpdateAsync(s =>
+            {
+                var path = directory.GetPath("missing.png");
+                s.ReviewQueue.Add(new()
+                {
+                    Id = Guid.NewGuid(),
+                    Category = VrcImageCategory.Emoji,
+                    IncomingOriginalPath = path,
+                    HeldFilePath = path
+                });
+                return true;
+            });
+            await (Task)Invoke(window, "RefreshAsync", null!, false, false)!;
+            var clear = (Button)window.FindName("ClearQueueButton");
+            Assert.True(clear.IsEnabled);
+            await Run(async () => await (Task)Invoke(window, "RefreshAsync", null!, false, false)!);
+            Assert.True(clear.IsEnabled);
+            FileStream? stateLock = null;
+            try
+            {
+                await Run(() =>
+                {
+                    stateLock = new FileStream(runtime.StateStore.StatePath, FileMode.Open, FileAccess.Read, FileShare.None);
+                    return Task.CompletedTask;
+                });
+                Assert.False(retry.IsEnabled);
+                Assert.False(dismiss.IsEnabled);
+                Assert.Contains("unavailable", ((TextBlock)window.FindName("RecoveryStatusText")).Text);
+            }
+            finally { stateLock?.Dispose(); }
+            await (Task)Invoke(window, "RefreshRecoveryAvailabilityAsync")!;
+            Assert.True(retry.IsEnabled);
+            Assert.True(dismiss.IsEnabled);
             await Run(async () =>
             {
                 Assert.False(retry.IsEnabled);
@@ -309,6 +343,64 @@ public sealed class GroupReviewWindowTests
             Assert.True(dismiss.IsEnabled);
         }
         finally { window.Close(); }
+    }
+
+    private static async Task VerifyScanWaitsForSettingsAsync()
+    {
+        using var directory = new TestDirectory();
+        using var runtime = new AppRuntime(directory.GetPath("state"), allowStartupRegistration: false);
+        await runtime.StateStore.UpdateAsync(state =>
+        {
+            foreach (var mapping in state.Settings.CategoryMappings)
+            {
+                Directory.CreateDirectory(mapping.SourcePath);
+                Directory.CreateDirectory(mapping.ArchivePath);
+                mapping.IsEnabled = mapping.Category == VrcImageCategory.Emoji;
+            }
+            return true;
+        });
+        var window = new MainWindow(runtime);
+        var pending = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var busy = typeof(MainWindow).GetField("_busy", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        try
+        {
+            Invoke(window, "LoadSettings", (await runtime.StateStore.LoadAsync()).Settings);
+            typeof(MainWindow).GetField("_loadingSettings", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, true);
+            ((CheckBox)window.FindName("CustomSimilarityLimits")).IsChecked = true;
+            ((TextBox)window.FindName("MaximumSimilarity")).Text = "90";
+            typeof(MainWindow).GetField("_loadingSettings", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, false);
+            typeof(MainWindow).GetField("_pendingSettingsSave", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, pending.Task);
+            Invoke(window, "ScanNow", window, new RoutedEventArgs());
+            await Task.Delay(25);
+            Assert.False((bool)busy.GetValue(window)!);
+            var status = (TextBlock)window.FindName("StatusText");
+            Assert.DoesNotContain("Scan complete:", status.Text);
+            pending.SetResult();
+            for (var attempt = 0; attempt < 400 && !status.Text.StartsWith("Scan complete:"); attempt++) await Task.Delay(25);
+            Assert.StartsWith("Scan complete:", status.Text);
+            Assert.Equal(new SimilarityThresholds(82, 90), (await runtime.StateStore.LoadAsync()).Settings.CustomSimilarityThresholds);
+            ((TextBox)window.FindName("MaximumSimilarity")).Text = "50";
+            Invoke(window, "ScanNow", window, new RoutedEventArgs());
+            for (var attempt = 0; attempt < 200 && !status.Text.Contains("not started"); attempt++) await Task.Delay(10);
+            Assert.Contains("not started", status.Text);
+            Assert.False((bool)busy.GetValue(window)!);
+            Assert.Equal(new SimilarityThresholds(82, 90), (await runtime.StateStore.LoadAsync()).Settings.CustomSimilarityThresholds);
+            ((TextBox)window.FindName("MaximumSimilarity")).Text = "90";
+            await runtime.StateStore.UpdateAsync(state =>
+            {
+                state.Settings.OutputRootConfirmed = false;
+                return true;
+            });
+            Assert.False(await (Task<bool>)Invoke(window, "PrepareSettingsForOperationAsync")!);
+            Assert.Contains("Confirm the migrated", status.Text);
+            Assert.False((await runtime.StateStore.LoadAsync()).Settings.OutputRootConfirmed);
+        }
+        finally
+        {
+            pending.TrySetResult();
+            for (var attempt = 0; attempt < 200 && (bool)busy.GetValue(window)!; attempt++) await Task.Delay(10);
+            window.Close();
+        }
     }
 
     private static ReviewFileAction Action(object card) => (ReviewFileAction)card.GetType().GetProperty("Action")!.GetValue(card)!;

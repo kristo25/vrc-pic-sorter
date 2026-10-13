@@ -550,11 +550,18 @@ public sealed class JsonStateStoreTests
         });
         await store.SaveAsync(state);
 
+        var stateMigrationBackup = store.StatePath + ".before-magick";
+        var fingerprintMigrationBackup = store.FingerprintPath + ".before-magick";
+        await File.WriteAllTextAsync(stateMigrationBackup, "state migration backup");
+        await File.WriteAllTextAsync(fingerprintMigrationBackup, "fingerprint migration backup");
+
         var blocked = await store.TryClearLocalDataAsync();
 
         Assert.Equal(ClearLocalDataStatus.BlockedByPendingReview, blocked.Status);
         Assert.Equal([reviewId], blocked.BlockingIds);
         Assert.True(File.Exists(store.StatePath));
+        Assert.Equal("state migration backup", await File.ReadAllTextAsync(stateMigrationBackup));
+        Assert.Equal("fingerprint migration backup", await File.ReadAllTextAsync(fingerprintMigrationBackup));
 
         state.ReviewQueue.Single().Status = ReviewStatus.Resolved;
         await store.SaveAsync(state);
@@ -563,6 +570,8 @@ public sealed class JsonStateStoreTests
         Assert.True(cleared.WasCleared);
         Assert.False(File.Exists(store.StatePath));
         Assert.False(File.Exists(store.TemporaryPath));
+        Assert.False(File.Exists(stateMigrationBackup));
+        Assert.False(File.Exists(fingerprintMigrationBackup));
     }
 
     [Fact]
@@ -574,6 +583,14 @@ public sealed class JsonStateStoreTests
         await store.SaveAsync(state);
         var quarantine = Path.Combine(store.StateDirectory, "state.corrupt-test.json");
         await File.WriteAllTextAsync(quarantine, "corrupt");
+        var stateMigrationBackup = store.StatePath + ".before-magick";
+        var fingerprintMigrationBackup = store.FingerprintPath + ".before-magick";
+        await File.WriteAllTextAsync(stateMigrationBackup, "state migration backup");
+        await File.WriteAllTextAsync(fingerprintMigrationBackup, "fingerprint migration backup");
+        var unrelated = Path.Combine(store.StateDirectory, "notes.before-magick");
+        var similarlyNamed = stateMigrationBackup + ".user-copy";
+        await File.WriteAllTextAsync(unrelated, "unrelated notes");
+        await File.WriteAllTextAsync(similarlyNamed, "user backup");
 
         var result = await store.TryClearLocalDataAsync();
 
@@ -581,6 +598,10 @@ public sealed class JsonStateStoreTests
         Assert.False(File.Exists(store.StatePath));
         Assert.False(File.Exists(store.BackupPath));
         Assert.False(File.Exists(quarantine));
+        Assert.False(File.Exists(stateMigrationBackup));
+        Assert.False(File.Exists(fingerprintMigrationBackup));
+        Assert.Equal("unrelated notes", await File.ReadAllTextAsync(unrelated));
+        Assert.Equal("user backup", await File.ReadAllTextAsync(similarlyNamed));
     }
 
     [Theory]
