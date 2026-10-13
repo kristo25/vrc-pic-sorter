@@ -16,6 +16,7 @@ internal static class PrintFrameTemplates
         ['0'] = [Convert.FromBase64String("wAfwH/Af+D88OBxwDnAOcA7gDuAO4A7gBuAG4AfgB+AH4AfgBuAG4A7gDuAO4A7gDuAO4BxwHHh4PPAf8B/gDw=="),
             Convert.FromBase64String("4Af4H/gf/D8eeA5wB2AHYAfgB+AH4AfgB+AHwAPAA8ADwAPAB8AH4AfgB+AH4AfgB+AH4A5wDnA8PPgf+B/wDw==")],
         ['/'] = [Convert.FromBase64String("APAAcABwAHgAeAAeAB4AHgAeAA8ADwAPAAeAB4AHgAGAAeAB4AHgAPAA8ADwAHgAeAB4AHgAHgAeAA4ADgAPAA==")],
+        ['9'] = [Convert.FromBase64String("4AP4D/gP/B8eOA5wB3AHcAdgB+AH4AfgB+AH4A/wDvgO+Pzv+Ofg4QBgAGAAcABwADgAOAA4ABwAD/wH/Af8AQ==")],
     };
 
     internal static readonly IReadOnlyDictionary<char, byte[]> DateGlyphs = new Dictionary<char, byte[]>

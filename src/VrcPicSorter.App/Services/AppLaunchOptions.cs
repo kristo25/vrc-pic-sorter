@@ -6,6 +6,7 @@ namespace VrcPicSorter.App.Services;
 
 public sealed record AppLaunchOptions(bool Background, string? DataDirectory)
 {
+    public bool VerifyCodec { get; init; }
     public bool IsIsolated => DataDirectory is not null;
 
     public string InstanceName
@@ -24,6 +25,11 @@ public sealed record AppLaunchOptions(bool Background, string? DataDirectory)
 
     public static AppLaunchOptions Parse(IReadOnlyList<string> arguments)
     {
+        if (arguments.Count == 1 && arguments[0].Equals("--verify-codec", StringComparison.OrdinalIgnoreCase))
+        {
+            return new AppLaunchOptions(false, null) { VerifyCodec = true };
+        }
+
         var background = false;
         string? dataDirectory = null;
         for (var index = 0; index < arguments.Count; index++)

@@ -6,6 +6,54 @@ namespace VrcPicSorter.Tests.Atlas;
 public sealed class AtlasGifExporterTests
 {
     [Theory]
+    [InlineData(AtlasLoopStyle.Linear, new int[] { 0, 1, 2, 3 })]
+    [InlineData(AtlasLoopStyle.PingPong, new int[] { 0, 1, 2, 3, 2, 1 })]
+    public async Task ExportedPixelsPreserveOrderTransparencyAndBlankFrames(AtlasLoopStyle style, int[] order)
+    {
+        using var directory = new TestDirectory();
+        var source = directory.GetPath("sheet.png");
+        var destination = directory.GetPath("out", "pixels.gif");
+        FixturePixel[] colors = [new(255, 0, 0), new(0, 255, 0), default, new(0, 0, 255)];
+        using (var sheet = new FixtureImage(16, 16))
+        {
+            // Fixed 2x2 geometry and literal colors: neither comes from exporter helpers.
+            for (var cell = 0; cell < 4; cell++)
+                for (var y = 0; y < 8; y++)
+                    for (var x = 0; x < 8; x++)
+                        sheet[(cell % 2) * 8 + x, (cell / 2) * 8 + y] =
+                            cell == 1 || (x is >= 2 and < 6 && y is >= 2 and < 6) ? colors[cell] : default;
+            sheet.SaveAsPng(source);
+        }
+
+        await new AtlasGifExporter().ExportAsync(source, destination, new EmojiAtlasName(4, 10, style));
+
+        // Decode independently of RasterCodec, including GIF disposal/composition.
+        using var frames = new ImageMagick.MagickImageCollection(destination);
+        frames.Coalesce();
+        Assert.Equal(order.Length, frames.Count);
+        for (var frame = 0; frame < order.Length; frame++)
+        {
+            Assert.Equal(8U, frames[frame].Width);
+            Assert.Equal(8U, frames[frame].Height);
+            Assert.Equal(10U, frames[frame].AnimationDelay);
+            using var pixels = frames[frame].GetPixels();
+            var rgba = pixels.ToByteArray(ImageMagick.PixelMapping.RGBA)!;
+            for (var y = 0; y < 8; y++)
+                for (var x = 0; x < 8; x++)
+                {
+                    var expected = order[frame] == 1 || (x is >= 2 and < 6 && y is >= 2 and < 6)
+                        ? colors[order[frame]] : default;
+                    var offset = (y * 8 + x) * 4;
+                    Assert.Equal(expected.A, rgba[offset + 3]);
+                    if (expected.A == 0) continue;
+                    Assert.Equal(expected.R, rgba[offset]);
+                    Assert.Equal(expected.G, rgba[offset + 1]);
+                    Assert.Equal(expected.B, rgba[offset + 2]);
+                }
+        }
+    }
+
+    [Theory]
     [InlineData(10, 10, 10)]
     [InlineData(25, 4, 25)]
     [InlineData(31, 3, 33)]

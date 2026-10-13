@@ -42,6 +42,10 @@ jobs:
       - name: Publish portable executable
         run: dotnet publish src\VrcPicSorter.App\VrcPicSorter.App.csproj -p:PublishProfile=Portable
 
+      - name: Verify published native codec and single-file extraction
+        shell: pwsh
+        run: ./scripts/portable-decode-smoke.ps1
+
       - name: Check the tag against the assembly version
         shell: pwsh
         run: |

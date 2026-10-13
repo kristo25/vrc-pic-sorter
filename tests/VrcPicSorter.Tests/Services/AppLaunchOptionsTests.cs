@@ -5,6 +5,18 @@ namespace VrcPicSorter.Tests.Services;
 public sealed class AppLaunchOptionsTests
 {
     [Fact]
+    public void CodecVerificationIsAnExplicitStandaloneCommand()
+    {
+        var options = AppLaunchOptions.Parse(["--verify-codec"]);
+        Assert.True(options.VerifyCodec);
+        Assert.False(options.Background);
+        Assert.Null(options.DataDirectory);
+        Assert.False(AppLaunchOptions.Parse([]).VerifyCodec);
+        Assert.Throws<ArgumentException>(() => AppLaunchOptions.Parse(["--verify-codec", "--background"]));
+        Assert.Throws<ArgumentException>(() => AppLaunchOptions.Parse(["--verify-codec", "--data-dir", Path.GetTempPath()]));
+    }
+
+    [Fact]
     public void DataDirectoryIsNormalizedAndUsesAnIsolatedInstanceName()
     {
         using var directory = new TestDirectory();

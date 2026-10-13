@@ -18,10 +18,6 @@ public partial class App : System.Windows.Application
     {
         base.OnStartup(e);
 
-        DispatcherUnhandledException += OnDispatcherUnhandledException;
-        AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
-        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
-
         AppLaunchOptions options;
         try
         {
@@ -33,6 +29,19 @@ public partial class App : System.Windows.Application
             Shutdown(2);
             return;
         }
+
+        // The published-artifact gate must finish before any profile, recovery, watcher,
+        // single-instance activation or diagnostic directory can be touched.
+        if (options.VerifyCodec)
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Shutdown(await PortableDecodeSmoke.RunAsync());
+            return;
+        }
+
+        DispatcherUnhandledException += OnDispatcherUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
+        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
 
         _singleInstance = new SingleInstanceService(options.InstanceName);
         if (!_singleInstance.TryAcquireOwnership())
